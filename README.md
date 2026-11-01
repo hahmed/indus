@@ -3,5 +3,5 @@
 Ruby to metal. Experiments.
 
 ```sh
-ruby experiments/02_registers/indus.rb [file.rb]
+ruby experiments/03_ssa/indus.rb [file.rb]
 ```
