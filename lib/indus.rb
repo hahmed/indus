@@ -5,12 +5,13 @@ require "fiddle"
 
 # ================================================================ IR
 class Inst
-  attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared
+  attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty
   attr_reader :id
   @@n = 0
   def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
   def term? = %i[br condbr ret].include?(op)
-  def call? = %i[call puts_i puts_s anew aset].include?(op)
+  def call? = %i[call puts_i puts_s putc anew aset].include?(op)
+  def float? = ty == :float
   def to_s = "v#{id}"
 end
 
@@ -30,7 +31,7 @@ class Block
 end
 
 class Func
-  attr_accessor :name, :params, :blocks
+  attr_accessor :name, :params, :blocks, :ptypes, :rtype
   def initialize(name, nparams)
     @name, @params, @blocks = name, Array.new(nparams) { Inst.new(:param) }, [Block.new(:entry)]
   end
@@ -51,7 +52,7 @@ class Func
       b.phis.each { |p| s << "  #{p} = phi #{p.args.map { |(bb, v)| "[#{bb.name}: #{v}]" }.join(', ')}\n" }
       b.insts.each do |i|
         a = i.args.map { _1.is_a?(Block) ? _1.name : _1.is_a?(Func) ? _1.name : _1.to_s }.join(", ")
-        s << (i.term? ? "  #{i.op} #{a}\n" : "  #{i} = #{i.op}#{i.cond ? ".#{i.cond}" : ''} #{a}\n")
+        s << (i.term? ? "  #{i.op} #{a}\n" : "  #{i}#{i.ty ? ":#{i.ty}" : ''} = #{i.op}#{i.cond ? ".#{i.cond}" : ''} #{a}\n")
       end
     end
     s
@@ -64,7 +65,7 @@ end
 # merge. Trivial phis are removed afterwards.
 class Lower
   CMP = { :== => :eq, :!= => :ne, :< => :lt, :<= => :le, :> => :gt, :>= => :ge }
-  ARITH = { :+ => :add, :- => :sub, :* => :mul, :& => :and, :| => :or, :^ => :xor, :<< => :shl, :>> => :shr }
+  ARITH = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :& => :and, :| => :or, :^ => :xor, :<< => :shl, :>> => :shr }
 
   def initialize(src) = (@ast, @funcs = Prism.parse(src).value, {})
 
@@ -74,7 +75,19 @@ class Lower
     main = Func.new(:main, 0)
     lower_body(main, [], top)
     defs.each { |d| lower_body(@funcs[d.name], d.parameters&.requireds&.map(&:name) || [], d.body&.body || []) }
-    [main, *@funcs.values]
+    [main, *@funcs.values].each { prune(_1) }
+  end
+
+  # drop blocks unreachable from entry (code after break/return) and the phi
+  # edges that came from them
+  def prune(f)
+    seen = {}; work = [f.entry]
+    until work.empty?
+      b = work.shift; next if seen[b]
+      seen[b] = true; work.concat(b.succs)
+    end
+    f.blocks.select! { seen[_1] }
+    f.blocks.each { |b| b.phis.each { |p| p.args.select! { |(pred, _)| seen[pred] } } }
   end
 
   private
@@ -87,12 +100,31 @@ class Lower
   end
 
   def const(v) = (@cur << Inst.new(:const, [v]))
+  def fconst(v) = (@cur << Inst.new(:fconst, [v]))
 
   def expr(n)
     case n
     when Prism::IntegerNode then const(n.value)
+    when Prism::FloatNode then fconst(n.value)
     when Prism::LocalVariableReadNode then @locals.fetch(n.name) { raise "undefined local #{n.name}" }
     when Prism::LocalVariableWriteNode then @locals[n.name] = expr(n.value)
+    when Prism::LocalVariableOperatorWriteNode
+      l = @locals.fetch(n.name); r = expr(n.value)
+      @locals[n.name] = @cur << Inst.new(ARITH.fetch(n.binary_operator), [l, r])
+    when Prism::MultiWriteNode # a, b = x, y  (evaluate all, then bind)
+      vals = n.value.elements.map { expr(_1) }
+      n.lefts.zip(vals).each { |t, v| @locals[t.name] = v }
+      vals.last
+    when Prism::BreakNode
+      raise "break outside loop" unless @loop
+      @loop[:breaks] << [@cur, @locals.dup]
+      @cur << Inst.new(:br, [@loop[:exit]])
+      @cur = @f.new_block(:dead); const(0)
+    when Prism::ReturnNode
+      v = n.arguments ? expr(n.arguments.arguments[0]) : const(0)
+      @cur << Inst.new(:ret, [v])
+      @cur = @f.new_block(:dead); const(0)
+    when Prism::StatementsNode then n.body.map { expr(_1) }.last
     when Prism::ParenthesesNode then n.body.body.map { expr(_1) }.last
     when Prism::StringNode then n # handled by puts
     when Prism::IfNode then if_expr(n)
@@ -135,6 +167,12 @@ class Lower
     elsif (c = CMP[n.name])
       l = expr(n.receiver); r = expr(args[0])
       @cur << Inst.new(:cmp, [l, r], c)
+    elsif n.name == :to_i && args.empty? then @cur << Inst.new(:to_i, [expr(n.receiver)])
+    elsif n.name == :to_f && args.empty? then @cur << Inst.new(:to_f, [expr(n.receiver)])
+    elsif n.name == :putc
+      a = args[0]
+      if a.is_a?(Prism::StringNode) then @cur << Inst.new(:putc, [const(a.unescaped.ord)])
+      else @cur << Inst.new(:putc, [expr(a)]) end
     elsif n.name == :puts
       a = args[0]
       if a.is_a?(Prism::StringNode) then @cur << Inst.new(:puts_s, [a.unescaped])
@@ -197,14 +235,116 @@ class Lower
     @locals = phis.dup
     @cur = hb
     cond_branch(n.predicate, bb, xb)
+    outer, @loop = @loop, { exit: xb, breaks: [] }
     @cur = bb
     (n.statements&.body || []).each { expr(_1) }
     bend = @cur
     @cur << Inst.new(:br, [hb]) unless @cur.term
     phis.each { |nm, ph| ph.args << [bend, @locals[nm]] }
+    breaks = @loop[:breaks]; @loop = outer
     @cur = xb
-    @locals = phis.dup
+    # exit sees the header's values, or a break site's
+    @locals = breaks.empty? ? phis.dup : merge_locals(xb, [[hb, phis.dup], *breaks])
     const(0)
+  end
+end
+
+# ================================================================ types
+# int / float / iarr / farr, to a fixpoint across functions. Then insert
+# int->float conversions where a float meets an int.
+module Types
+  JOIN = ->(a, b) {
+    return b if a.nil?; return a if b.nil?; return a if a == b
+    return :float if [a, b].sort == %i[float int]
+    return :farr  if [a, b].sort == %i[farr iarr]
+    :float
+  }
+  def self.of(f, v) = v.op == :param ? f.params.index(v).then { f.ptypes[_1] } : v.ty
+
+  def self.run(funcs)
+    funcs.each { |f| f.ptypes = Array.new(f.params.size); f.rtype = nil }
+    loop do
+      changed = false
+      funcs.each do |f|
+        f.all.each do |i|
+          t = infer(f, i)
+          next if t.nil? || t == i.ty
+          i.ty = JOIN.(i.ty, t); changed = true
+          if i.op == :call # arg types -> callee param types
+            callee = i.args[0]
+            i.args[1..].each_with_index do |a, k|
+              at = of(f, a); nt = JOIN.(callee.ptypes[k], at)
+              (callee.ptypes[k] = nt; changed = true) if nt != callee.ptypes[k]
+            end
+          end
+        end
+        f.all.each do |i| # args and arrays also flow on non-call insts
+          case i.op
+          when :call
+            callee = i.args[0]
+            i.args[1..].each_with_index do |a, k|
+              nt = JOIN.(callee.ptypes[k], of(f, a)); (callee.ptypes[k] = nt; changed = true) if nt != callee.ptypes[k]
+            end
+          when :ret
+            nt = JOIN.(f.rtype, of(f, i.args[0])); (f.rtype = nt; changed = true) if nt != f.rtype
+          when :aset # storing a float into an int array promotes the array
+            a, _, v = i.args
+            if of(f, v) == :float && of(f, a) == :iarr
+              a.op == :param ? f.ptypes[f.params.index(a)] = :farr : a.ty = :farr; changed = true
+            end
+          end
+        end
+      end
+      break unless changed
+    end
+    funcs.each { convert(_1) }
+  end
+
+  def self.infer(f, i)
+    a = i.args
+    case i.op
+    when :const then :int
+    when :fconst then :float
+    when :add, :sub, :mul, :div then JOIN.(of(f, a[0]), of(f, a[1]))
+    when :and, :or, :xor, :shl, :shr, :cmp, :to_i then :int
+    when :to_f then :float
+    when :anew then of(f, a[1]) == :float ? :farr : :iarr
+    when :aget then { farr: :float, iarr: :int }[of(f, a[0])]
+    when :aset then of(f, a[0])
+    when :phi then a.map { of(f, _2) }.reduce(nil) { JOIN.(_1, _2) }
+    when :call then a[0].rtype
+    when :itof then :float
+    end
+  end
+
+  # insert itof where an int flows into a float position
+  def self.convert(f)
+    cvt = ->(blk, before, v) {
+      c = Inst.new(:itof, [v]); c.ty = :float; c.block = blk
+      blk.insts.insert(blk.insts.index(before), c); c
+    }
+    f.blocks.each do |b|
+      b.insts.dup.each do |i|
+        case i.op
+        when :add, :sub, :mul, :div, :cmp
+          next unless i.args.any? { of(f, _1) == :float }
+          i.args.map!.with_index { |v, k| of(f, v) == :int ? cvt.(b, i, v) : v }
+          i.cond = :"f#{i.cond}" if i.op == :cmp
+        when :aset
+          a, ix, v = i.args
+          i.args[2] = cvt.(b, i, v) if of(f, a) == :farr && of(f, v) == :int
+        when :call
+          callee = i.args[0]
+          i.args[1..].each_with_index { |v, k| i.args[k + 1] = cvt.(b, i, v) if callee.ptypes[k] == :float && of(f, v) == :int }
+        when :ret
+          i.args[0] = cvt.(b, i, i.args[0]) if f.rtype == :float && of(f, i.args[0]) == :int
+        end
+      end
+      b.phis.each do |p|
+        next unless p.ty == :float
+        p.args.map! { |(pred, v)| of(f, v) == :int ? [pred, cvt.(pred, pred.term, v)] : [pred, v] }
+      end
+    end
   end
 end
 
@@ -238,6 +378,7 @@ module Passes
     rets = f.blocks.map(&:term).select { _1&.op == :ret }
     tail = rets.find { |r| (v = r.args[0]).op == :add && v.args.any? { |a| a.op == :call && a.args[0] == f } }
     return false unless tail
+    return false if f.rtype == :float
     add = tail.args[0]
     self_call = add.args.reverse.find { |a| a.op == :call && a.args[0] == f }
     other = add.args.find { _1 != self_call }
@@ -308,6 +449,44 @@ class Asm
   def ldur(rt, rn, off) = emit(0xF8400000 | ((off & 0x1FF) << 12) | (rn << 5) | rt) # ldr rt,[rn,#simm9]
   def stur(rt, rn, off) = emit(0xF8000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt)
   def bhs(n) = (fix(n, :b19); emit(0x54000002))   # b.hs (unsigned >=): index out of range
+  # floats (d registers)
+  def fadd(rd, rn, rm) = emit(0x1E602800 | (rm << 16) | (rn << 5) | rd)
+  def fsub(rd, rn, rm) = emit(0x1E603800 | (rm << 16) | (rn << 5) | rd)
+  def fmul(rd, rn, rm) = emit(0x1E600800 | (rm << 16) | (rn << 5) | rd)
+  def fdiv(rd, rn, rm) = emit(0x1E601800 | (rm << 16) | (rn << 5) | rd)
+  def fcmp(rn, rm) = emit(0x1E602000 | (rm << 16) | (rn << 5))
+  def scvtf(rd, rn) = emit(0x9E620000 | (rn << 5) | rd)      # d <- x
+  def fcvtzs(rd, rn) = emit(0x9E780000 | (rn << 5) | rd)     # x <- d (truncate)
+  def fmov_dx(rd, rn) = emit(0x9E670000 | (rn << 5) | rd)
+  def fmov(rd, rn) = (emit(0x1E604000 | (rn << 5) | rd) unless rd == rn)
+  def fldr_idx(rt, rn, rm) = emit(0xFC607800 | (rm << 16) | (rn << 5) | rt)
+  def fstr_idx(rt, rn, rm) = emit(0xFC207800 | (rm << 16) | (rn << 5) | rt)
+  def fstr(t, off) = emit(0xFD000000 | ((off / 8) << 10) | (31 << 5) | t)
+  def fldr(t, off) = emit(0xFD400000 | ((off / 8) << 10) | (31 << 5) | t)
+  def fstp(t1, t2, off) = t2 ? emit(0x6D000000 | ((off / 8) << 15) | (t2 << 10) | (31 << 5) | t1) : fstr(t1, off)
+  def fldp(t1, t2, off) = t2 ? emit(0x6D400000 | ((off / 8) << 15) | (t2 << 10) | (31 << 5) | t1) : fldr(t1, off)
+  def fmov_imm(rd, v) = (mov_imm(8, [v].pack("E").unpack1("Q")); fmov_dx(rd, 8))
+  # integer division, Ruby semantics (floor): q = a/b; if r != 0 && (r^b) < 0 then q -= 1
+  def sdiv_floor(rd, rn, rm)
+    emit(0x9AC00C00 | (rm << 16) | (rn << 5) | rd)                 # sdiv rd, rn, rm
+    emit(0x9B008000 | (rm << 16) | (rn << 10) | (rd << 5) | 8)     # msub x8, rd, rm, rn   (r)
+    emit(0xCA000000 | (rm << 16) | (8 << 5) | 9)                   # eor x9, x8, rm
+    emit(0xF100011F)                                               # cmp x8, #0
+    emit(0xFA401924)                                               # ccmp x9, #0, #4, ne
+    cset(9, :lt)
+    emit(0xCB090000 | (rd << 5) | rd)                              # sub rd, rd, x9
+  end
+  # putc: x0 = char. strb to stack, write(1, sp+15, 1)
+  def emit_putc
+    label(:__putc)
+    stp_pre(29, 30, 32); mov_fp_sp
+    emit 0x390043E0                 # strb w0, [sp, #16]   (above the saved fp/lr pair)
+    emit 0x910003E1 | (16 << 10)    # add x1, sp, #16
+    emit 0xD2800022                 # mov x2, #1
+    emit 0xD2800020                 # mov x0, #1
+    call_write
+    ldp_post(29, 30, 32); ret
+  end
   def uniq = (@u = (@u || 0) + 1; :"L#{@u}")
 
   HEAP = 28 # bump pointer, reserved; arrays: [cap][len][elems...], handle -> elems
@@ -379,8 +558,12 @@ class Asm
   def subi(rd, rn, i) = emit(0xD1000000 | (i << 10) | (rn << 5) | rd)
   def cmp(rn, rm) = emit(0xEB00001F | (rm << 16) | (rn << 5))
   def cmpi(rn, i) = emit(0xF100001F | (i << 10) | (rn << 5))
-  COND = { eq: 0x0, ne: 0x1, ge: 0xA, lt: 0xB, gt: 0xC, le: 0xD }
-  INV = { eq: :ne, ne: :eq, ge: :lt, lt: :ge, gt: :le, le: :gt }
+  COND = { eq: 0x0, ne: 0x1, ge: 0xA, lt: 0xB, gt: 0xC, le: 0xD, mi: 0x4, pl: 0x5, ls: 0x9, hi: 0x8,
+           # float compares: unordered must be false for < <= (mi/ls), true for != (ne)
+           feq: 0x0, fne: 0x1, flt: 0x4, fle: 0x9, fgt: 0xC, fge: 0xA }
+  INV = { eq: :ne, ne: :eq, ge: :lt, lt: :ge, gt: :le, le: :gt, mi: :pl, pl: :mi, ls: :hi, hi: :ls,
+          feq: :fne, fne: :feq, flt: :pl, fle: :hi, fgt: :fle_u, fge: :flt_u }
+  COND[:fle_u] = 0xD; COND[:flt_u] = 0xB # le / lt (true on unordered), the inverses of gt / ge
   def cset(rd, c) = emit(0x9A9F07E0 | (COND[INV[c]] << 12) | rd)
   def bcond(c, n) = (fix(n, :b19); emit(0x54000000 | COND[c]))
   def cbz(rt, n) = (fix(n, :b19); emit(0xB4000000 | rt))
@@ -488,7 +671,9 @@ end
 class Codegen
   CALLEE = (19..27).to_a # x28 = heap
   CALLER = (10..15).to_a # x8, x9 scratch
-  TMP = 8
+  FCALLEE = (8..15).to_a  # d8-d15
+  FCALLER = (16..29).to_a # d30, d31 scratch
+  TMP = 8; FTMP = 30; FTMP2 = 31
 
   def initialize(asm) = @asm = asm
 
@@ -545,13 +730,22 @@ class Codegen
     call_at = all.each_index.select { all[_1].call? }
     across = ->(v, from) { call_at.any? { |c| c > from && c < last[v] } }
     callee, caller = CALLEE.dup, CALLER.dup; used = []; freed = []
+    fcallee, fcaller = FCALLEE.dup, FCALLER.dup; fused = []
     nslots = 0
     assign = ->(v, pool) {
+      if v.float?
+        pool = pool.equal?(callee) ? fcallee : fcaller
+        r = pool.shift || (pool.equal?(fcallee) ? fcaller : fcallee).shift
+        if r then fused |= [r] if FCALLEE.include?(r); v.reg = r
+        else v.slot = nslots; nslots += 1 end
+        next
+      end
       r = pool.shift || (pool.equal?(callee) ? caller : callee).shift
       if r then used |= [r] if CALLEE.include?(r); v.reg = r
       else v.slot = nslots; nslots += 1 end # spill to the frame
     }
     phi_srcs = phis.flat_map { |p| p.args.map(&:last) }
+    f.params.each_with_index { |p, k| p.ty = f.ptypes[k] || :int }
     f.params.each { |p| assign.(p, (across.(p, -1) || phi_srcs.include?(p)) ? callee : caller) }
     phis.each do |ph|
       src = ph.args.map(&:last).find { |v| v.op == :param && last[v] <= idx[ph] && phi_srcs.count(v) == 1 }
@@ -568,23 +762,33 @@ class Codegen
     end
     all.each_with_index do |i, k|
       expired = (f.params + all[0...k]).select { |v| v.reg && !v.shared && last[v] < k && !freed.include?(v) }
-      expired.each { |v| freed << v; (CALLEE.include?(v.reg) ? callee : caller).unshift(v.reg) }
-      next if i.reg || i.slot || i.term? || i.op == :phi || i.op == :const || i.op == :puts_s || i.op == :puts_i
+      expired.each do |v|
+        freed << v
+        if v.float? then (FCALLEE.include?(v.reg) ? fcallee : fcaller).unshift(v.reg)
+        else (CALLEE.include?(v.reg) ? callee : caller).unshift(v.reg) end
+      end
+      next if i.reg || i.slot || i.term? || i.op == :phi || i.op == :const || i.op == :fconst || i.op == :puts_s || i.op == :puts_i || i.op == :putc
       next if i.op == :cmp && fused?(i)
       assign.(i, across.(i, k) ? callee : caller)
     end
 
     used |= [Asm::HEAP] if f.name == :main
-    used.sort!
-    @spill_base = 16 + ((used.size + 1) / 2) * 16
+    used.sort!; fused.sort!
+    fsave = 16 + ((used.size + 1) / 2) * 16
+    @spill_base = fsave + ((fused.size + 1) / 2) * 16
     frame = @spill_base + ((nslots + 1) / 2) * 16
+    raise "frame too large" if frame > 504
     @asm.label(f.name)
     @asm.stp_pre(29, 30, frame); @asm.mov_fp_sp
     used.each_slice(2).with_index { |(a, b), i| @asm.stp(a, b, 16 + i * 16) }
+    fused.each_slice(2).with_index { |(a, b), i| @asm.fstp(a, b, fsave + i * 16) }
     @asm.mov(Asm::HEAP, 0) if f.name == :main # heap base arrives in x0
-    f.params.each_with_index { |p, i| @asm.mov(p.reg, i) }
+    # params: ints in x0.., floats in d0.. (separate counters, AAPCS64)
+    xi = fi = 0
+    f.params.each { |p| p.float? ? (@asm.fmov(p.reg, fi); fi += 1) : (@asm.mov(p.reg, xi); xi += 1) }
     f.blocks.each { block(_1) }
     @asm.label(:"#{f.name}_ret")
+    fused.each_slice(2).with_index { |(a, b), i| @asm.fldp(a, b, fsave + i * 16) }
     used.each_slice(2).with_index { |(a, b), i| @asm.ldp(a, b, 16 + i * 16) }
     @asm.ldp_post(29, 30, frame); @asm.ret
   end
@@ -602,27 +806,45 @@ class Codegen
 
   # a value in a register, loading a constant or a spilled value into tmp
   def reg(v, tmp = TMP)
+    return freg(v, tmp == TMP ? FTMP : FTMP2) if v.float?
     return v.reg if v.reg
     return (@asm.ldr(tmp, slot_off(v)); tmp) if v.slot
     raise "no reg for #{v.op} #{v}" unless v.op == :const
     @asm.mov_imm(tmp, v.args[0]); tmp
   end
+  def freg(v, tmp = FTMP)
+    return v.reg if v.reg
+    return (@asm.fldr(tmp, slot_off(v)); tmp) if v.slot
+    raise "no freg for #{v.op} #{v}" unless v.op == :fconst
+    @asm.fmov_imm(tmp, v.args[0]); tmp
+  end
 
   # where a definition is written; stored to its slot afterwards if spilled
-  def dst(i) = i.reg || SPILL
-  def spill!(i) = (@asm.str(SPILL, slot_off(i)) if i.slot)
+  def dst(i) = i.reg || (i.float? ? FTMP : SPILL)
+  def spill!(i)
+    return unless i.slot
+    i.float? ? @asm.fstr(FTMP, slot_off(i)) : @asm.str(SPILL, slot_off(i))
+  end
 
   def block(b)
     @asm.label(lbl(b))
     b.insts.each do |i|
       d = dst(i)
       case i.op
-      when :const then nil
-      when :add, :sub
+      when :const, :fconst then nil
+      when :add, :sub, :mul, :div
         l, r = i.args
-        if imm?(r) then @asm.send(i.op == :add ? :addi : :subi, d, reg(l), r.args[0])
+        if i.float?
+          @asm.send({ add: :fadd, sub: :fsub, mul: :fmul, div: :fdiv }[i.op], d, freg(l), freg(r, FTMP2))
+        elsif i.op == :div then @asm.sdiv_floor(d, reg(l), reg(r, 9))
+        elsif i.op == :mul then @asm.mul(d, reg(l), reg(r, 9))
+        elsif imm?(r) then @asm.send(i.op == :add ? :addi : :subi, d, reg(l), r.args[0])
         else @asm.send(i.op, d, reg(l), reg(r, 9)) end
-      when :mul then @asm.mul(d, reg(i.args[0]), reg(i.args[1], 9))
+      when :itof then @asm.scvtf(d, reg(i.args[0]))
+      when :to_f then @asm.scvtf(d, reg(i.args[0]))
+      when :to_i then i.args[0].float? ? @asm.fcvtzs(d, freg(i.args[0])) : @asm.mov(d, reg(i.args[0]))
+      when :putc
+        @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:__putc)
       when :and then @asm.and_(d, reg(i.args[0]), reg(i.args[1], 9))
       when :or  then @asm.orr(d, reg(i.args[0]), reg(i.args[1], 9))
       when :xor then @asm.eor(d, reg(i.args[0]), reg(i.args[1], 9))
@@ -631,19 +853,19 @@ class Codegen
       when :anew
         l, v = i.args
         @asm.mov(0, reg(l, 0))
-        @asm.mov(1, reg(v, 1))
+        v.float? ? @asm.emit(0x9E660000 | (freg(v) << 5) | 1) : @asm.mov(1, reg(v, 1)) # fmov x1, d
         @asm.bl(:__anew); @asm.mov(d, 0)
       when :aget # out of range (incl. negative, via unsigned compare) -> nil (0)
         a, ix = i.args; ra = reg(a); ri = reg(ix, 9)
         @asm.ldur(16, ra, -8); @asm.cmp(ri, 16)      # x16: len (x8/x9 may hold ra/ri)
         skip = @asm.uniq
-        @asm.mov_imm(d, 0); @asm.bhs(skip)
-        @asm.ldr_idx(d, ra, ri)
+        if i.float? then @asm.fmov_imm(d, 0.0); @asm.bhs(skip); @asm.fldr_idx(d, ra, ri)
+        else @asm.mov_imm(d, 0); @asm.bhs(skip); @asm.ldr_idx(d, ra, ri) end
         @asm.label(skip)
       when :aset # in range: store; else slow path (fill / grow) which returns the handle
         a, ix, v = i.args
         @asm.mov(0, reg(a, 0)); @asm.mov(1, reg(ix, 1))
-        @asm.mov(2, reg(v, 2))
+        v.float? ? @asm.emit(0x9E660000 | (freg(v) << 5) | 2) : @asm.mov(2, reg(v, 2)) # fmov x2, d
         @asm.ldur(TMP, 0, -8); @asm.cmp(1, TMP)
         slow = @asm.uniq; done = @asm.uniq
         @asm.bhs(slow); @asm.str_idx(2, 0, 1); @asm.b(done)
@@ -651,12 +873,16 @@ class Codegen
         @asm.label(done); @asm.mov(d, 0)
       when :cmp
         l, r = i.args
-        imm?(r) ? @asm.cmpi(reg(l), r.args[0]) : @asm.cmp(reg(l), reg(r, 9))
+        if l.float? then @asm.fcmp(freg(l), freg(r, FTMP2))
+        elsif imm?(r) then @asm.cmpi(reg(l), r.args[0])
+        else @asm.cmp(reg(l), reg(r, 9)) end
         @asm.cset(d, i.cond) unless fused?(i)
       when :call
         f, *a = i.args
-        a.each_with_index { |v, n| @asm.mov(n, reg(v, n)) }
-        @asm.bl(f.name); @asm.mov(d, 0)
+        xi = fi = 0
+        a.each { |v| v.float? ? (@asm.fmov(fi, freg(v, fi)); fi += 1) : (@asm.mov(xi, reg(v, xi)); xi += 1) }
+        @asm.bl(f.name)
+        i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
       when :puts_i
         @asm.mov(0, reg(i.args[0], 0))
         @asm.bl(:__puts_i)
@@ -680,7 +906,8 @@ class Codegen
         @asm.b(lbl(i.args[0])) unless next_block(b) == i.args[0]
       when :ret
         v = i.args[0]
-        if v.reg || v.slot || v.op == :const then @asm.mov(0, reg(v, 0))
+        if v.float? then @asm.fmov(0, freg(v, 0))
+        elsif v.reg || v.slot || v.op == :const then @asm.mov(0, reg(v, 0))
         else @asm.mov_imm(0, 0) end # nil-valued (puts, while)
         @asm.b(:"#{@f.name}_ret") unless b == @f.blocks.last
       else raise "codegen: #{i.op}"
@@ -694,8 +921,17 @@ class Codegen
 
   # parallel copy for the phis of `to` along the edge from `from`.
   # locations: Integer register, [:slot, n], or a const Inst (source only)
-  def loc(v) = v.reg || (v.slot ? [:slot, v.slot] : v)
+  def loc(v) = v.reg ? (v.float? ? [:f, v.reg] : v.reg) : (v.slot ? [:slot, v.slot] : v)
   def move(d, s)
+    if (d.is_a?(Array) && d[0] == :f) || (s.is_a?(Array) && s[0] == :f) || (s.is_a?(Inst) && s.float?) || (s.is_a?(Inst) && s.op == :fconst)
+      sreg = case s
+             when Array then s[0] == :f ? s[1] : (@asm.fldr(FTMP, @spill_base + 8 * s[1]); FTMP)
+             when Inst then @asm.fmov_imm(FTMP, s.args[0]); FTMP
+             else s
+             end
+      d.is_a?(Array) && d[0] == :f ? @asm.fmov(d[1], sreg) : @asm.fstr(sreg, @spill_base + 8 * d[1])
+      return
+    end
     sreg = case s
            when Integer then s
            when Inst then @asm.mov_imm(TMP, s.args[0]); TMP
@@ -710,9 +946,10 @@ class Codegen
       ready = moves.find { |(d, _)| moves.none? { |(_, s2)| s2 == d } }
       if ready
         move(*ready); moves.delete(ready)
-      else # cycle: park one source in x9
+      else # cycle: park one source in x9 / d31
         _, s = moves.first
-        move(9, s); moves.map! { |(dd, ss)| [dd, ss == s ? 9 : ss] }
+        park = (s.is_a?(Array) && s[0] == :f) ? [:f, FTMP2] : 9
+        move(park, s); moves.map! { |(dd, ss)| [dd, ss == s ? park : ss] }
       end
     end
   end
@@ -743,6 +980,7 @@ module Indus
   # standalone: nil (run in-process via libc write), :darwin or :linux
   def self.compile(src, standalone: nil)
     funcs = Lower.new(src).run
+    Types.run(funcs)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]
     asm = Asm.new
@@ -750,6 +988,7 @@ module Indus
     asm.emit_start_linux if standalone == :linux
     funcs.each { Codegen.new(asm).func(_1) }
     asm.emit_puts_i
+    asm.emit_putc
     asm.emit_array_new
     asm.emit_array_set_slow
     asm.emit_syscalls(standalone) if standalone

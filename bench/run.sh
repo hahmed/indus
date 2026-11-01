@@ -3,7 +3,7 @@
 cd "$(dirname "$0")/.."
 best() { local m=999999; for i in 1 2 3 4 5; do s=$(date +%s%N); "$@" >/dev/null 2>&1; e=$(date +%s%N); t=$(( (e-s)/1000000 )); (( t < m )) && m=$t; done; echo $m; }
 printf "%-12s %8s %8s %8s %10s %10s\n" bench cruby yjit spinel indus-proc indus-code
-for b in fib ackermann tak tarai nested_loop nqueens sieve; do
+for b in fib ackermann tak tarai nested_loop nqueens sieve matmul mandel_term; do
   c=$(best ruby --disable-gems bench/$b.rb)
   y=$(best ruby --disable-gems --yjit bench/$b.rb)
   s=$(best ~/tmp/sp/$b)
