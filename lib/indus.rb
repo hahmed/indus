@@ -295,9 +295,21 @@ class Asm
   attr_accessor :write_addr # nil => bl __write (syscall stub)
   def call_write = write_addr ? (mov_imm(16, write_addr); blr(16)) : bl(:__write)
 
-  # raw syscalls, for a standalone binary: write(2)=4, exit=1
-  def emit_syscalls
-    label(:__write); emit 0xD2800090; emit 0xD4001001; ret      # mov x16,#4 ; svc #0x80
+  # raw syscalls for a standalone binary.
+  #   darwin: number in x16, svc #0x80, write=4
+  #   linux:  number in x8,  svc #0,    write=64 exit=93
+  def emit_syscalls(os)
+    label(:__write)
+    case os
+    when :darwin then emit 0xD2800090; emit 0xD4001001; ret      # mov x16,#4 ; svc #0x80
+    when :linux  then emit 0xD2800808; emit 0xD4000001; ret      # mov x8,#64 ; svc #0
+    end
+  end
+
+  # linux has no dyld to call main: _start calls main then exit(0)
+  def emit_start_linux
+    label(:_start); bl(:main)
+    emit 0xD2800000; emit 0xD2800BA8; emit 0xD4000001            # mov x0,#0 ; mov x8,#93 ; svc #0
   end
 
   def emit_puts_i
@@ -541,15 +553,17 @@ end
 
 # ================================================================ driver
 module Indus
-  def self.compile(src, standalone: false)
+  # standalone: nil (run in-process via libc write), :darwin or :linux
+  def self.compile(src, standalone: nil)
     funcs = Lower.new(src).run
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]
     asm = Asm.new
     asm.write_addr = Metal::LIBC["write"].to_i unless standalone
+    asm.emit_start_linux if standalone == :linux
     funcs.each { Codegen.new(asm).func(_1) }
     asm.emit_puts_i
-    asm.emit_syscalls if standalone
+    asm.emit_syscalls(standalone) if standalone
     asm.resolve!
   end
 end
