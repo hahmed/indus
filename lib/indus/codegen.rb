@@ -1,11 +1,7 @@
 # SSA -> arm64: layout, register allocation, instruction selection.
 module Indus
   class Codegen
-    CALLEE = (19..26).to_a # x27 = globals base, x28 = heap bump pointer
-    CALLER = (10..15).to_a # x8, x9 scratch
-    FCALLEE = (8..15).to_a  # d8-d15
-    FCALLER = (16..29).to_a # d30, d31 scratch
-    TMP = 8; FTMP = 30; FTMP2 = 31
+    TMP = 8; FTMP = 30; FTMP2 = 31 # scratch; pools live in RegAlloc
 
     def initialize(asm, classes = {}) = (@asm, @classes = asm, classes)
 
@@ -28,83 +24,9 @@ module Indus
     def func(f)
       @f = f
       layout(f)
-      all = f.all
-      idx = {}; all.each_with_index { |i, k| idx[i] = k }
-      f.params.each { |p| idx[p] = -1 }
-      last = Hash.new(-1)
-      all.each_with_index do |i, k|
-        if i.op == :phi
-          i.args.each { |(pred, v)| last[v] = [last[v], idx[pred.term]].max if v.is_a?(Inst) }
-        else
-          i.args.each { |a| last[a] = [last[a], k].max if a.is_a?(Inst) }
-        end
-      end
-      phis = all.select { _1.op == :phi }
-      # a phi is live over its whole loop: from its block to the last pred terminator
-      phis.each { |p| last[p] = [last[p], *p.args.map { |(pred, _)| idx[pred.term] }].max }
-      # loops: a value defined before a loop and used inside it is live to the loop's end
-      loops = f.blocks.filter_map do |h|
-        next if h.phis.empty?
-        back = f.blocks.select { |b| b.succs.include?(h) && idx[b.term] > idx[h.phis.first] }
-        [idx[h.phis.first], back.map { idx[_1.term] }.max] unless back.empty?
-      end
-      loop do
-        changed = false
-        (f.params + all).each do |v|
-          d = idx[v]
-          loops.each do |(ls, le)|
-            if d < ls && last[v] >= ls && last[v] < le then last[v] = le; changed = true end
-          end
-        end
-        break unless changed
-      end
-
-      call_at = all.each_index.select { all[_1].call? }
-      across = ->(v, from) { call_at.any? { |c| c > from && c < last[v] } }
-      callee, caller = CALLEE.dup, CALLER.dup; used = []; freed = []
-      fcallee, fcaller = FCALLEE.dup, FCALLER.dup; fused = []
-      nslots = 0
-      assign = ->(v, pool) {
-        # a value that crosses a call may only take a callee-saved register
-        # (or spill); one that does not may take either pool
-        if v.float?
-          pool = pool.equal?(callee) ? fcallee : fcaller
-          r = pool.shift || (pool.equal?(fcaller) ? fcallee.shift : nil)
-          if r then fused |= [r] if FCALLEE.include?(r); v.reg = r
-          else v.slot = nslots; nslots += 1 end
-          next
-        end
-        r = pool.shift || (pool.equal?(caller) ? callee.shift : nil)
-        if r then used |= [r] if CALLEE.include?(r); v.reg = r
-        else v.slot = nslots; nslots += 1 end # spill to the frame
-      }
-      phi_srcs = phis.flat_map { |p| p.args.map(&:last) }
       f.params.each_with_index { |p, k| p.ty = f.ptypes[k] || :int }
-      f.params.each { |p| assign.(p, (across.(p, -1) || phi_srcs.include?(p)) ? callee : caller) }
-      phis.each do |ph|
-        src = ph.args.map(&:last).find { |v| v.op == :param && last[v] <= idx[ph] && phi_srcs.count(v) == 1 }
-        if src then ph.reg = src.reg; src.shared = true
-        else assign.(ph, across.(ph, idx[ph.block.insts.first] - 1) || across.(ph, -1) ? callee : caller) end
-      end
-      phis.each do |ph|
-        ph.args.each do |(pred, v)|
-          next unless v.is_a?(Inst) && !v.reg && !%i[param phi const fconst].include?(v.op) && v.block == pred
-          next unless last[v] == idx[pred.term]
-          after = pred.insts[(pred.insts.index(v) + 1)..].any? { |j| j.args.include?(ph) }
-          (v.reg = ph.reg; v.shared = true) unless after || ph.reg.nil?
-        end
-      end
-      all.each_with_index do |i, k|
-        expired = (f.params + all[0...k]).select { |v| v.reg && !v.shared && last[v] < k && !freed.include?(v) }
-        expired.each do |v|
-          freed << v
-          if v.float? then (FCALLEE.include?(v.reg) ? fcallee : fcaller).unshift(v.reg)
-          else (CALLEE.include?(v.reg) ? callee : caller).unshift(v.reg) end
-        end
-        next if i.reg || i.slot || i.term? || %i[phi const fconst puts_s puts_i putc gset fld_set].include?(i.op)
-        next if i.op == :cmp && fused?(i)
-        assign.(i, across.(i, k) ? callee : caller)
-      end
+      ra = RegAlloc.new(f).run
+      used, fused, nslots = ra.used.dup, ra.fused.dup, ra.nslots
 
       used |= [Asm::HEAP, Asm::GBASE] if f.name == :main
       used.sort!; fused.sort!

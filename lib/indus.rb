@@ -5,7 +5,8 @@
 #   lib/indus/types.rb    type inference (int/float/arrays), conversions
 #   lib/indus/passes.rb   SSA passes (trivial phis, return sinking, accumulator loops)
 #   lib/indus/asm.rb      arm64 encoder + hand-written runtime routines
-#   lib/indus/codegen.rb  layout, register allocation, instruction selection
+#   lib/indus/regalloc.rb linear-scan register allocation over dataflow liveness
+#   lib/indus/codegen.rb  layout, frames, instruction selection
 #   lib/indus/metal.rb    run in-process
 #   lib/indus/macho.rb    standalone Mach-O writer
 #   lib/indus/elf.rb      standalone Linux ELF writer
@@ -14,7 +15,7 @@
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir lower types passes asm codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir lower types passes asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # standalone: nil (run in-process via libc write), :darwin or :linux
