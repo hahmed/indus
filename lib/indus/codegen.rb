@@ -7,7 +7,7 @@ module Indus
     FCALLER = (16..29).to_a # d30, d31 scratch
     TMP = 8; FTMP = 30; FTMP2 = 31
 
-    def initialize(asm) = @asm = asm
+    def initialize(asm, classes = {}) = (@asm, @classes = asm, classes)
 
     def layout(f)
       order, seen, work = [], {}, [f.entry]
@@ -65,14 +65,16 @@ module Indus
       fcallee, fcaller = FCALLEE.dup, FCALLER.dup; fused = []
       nslots = 0
       assign = ->(v, pool) {
+        # a value that crosses a call may only take a callee-saved register
+        # (or spill); one that does not may take either pool
         if v.float?
           pool = pool.equal?(callee) ? fcallee : fcaller
-          r = pool.shift || (pool.equal?(fcallee) ? fcaller : fcallee).shift
+          r = pool.shift || (pool.equal?(fcaller) ? fcallee.shift : nil)
           if r then fused |= [r] if FCALLEE.include?(r); v.reg = r
           else v.slot = nslots; nslots += 1 end
           next
         end
-        r = pool.shift || (pool.equal?(callee) ? caller : callee).shift
+        r = pool.shift || (pool.equal?(caller) ? callee.shift : nil)
         if r then used |= [r] if CALLEE.include?(r); v.reg = r
         else v.slot = nslots; nslots += 1 end # spill to the frame
       }
@@ -178,15 +180,44 @@ module Indus
         when :fsqrt then @asm.fsqrt(d, freg(i.args[0]))
         when :alen then @asm.ldur(d, reg(i.args[0]), -8)
         when :onew
-          @asm.mov_imm(0, [i.args[0].size, 8].max); @asm.bl(:__onew); @asm.mov(d, 0)
+          k = i.args[0]
+          @asm.mov_imm(0, [k.size, 8].max); @asm.bl(:__onew)
+          (@asm.mov_imm(TMP, k.id); @asm.str_off(TMP, 0, 0)) if k.tagged # class id in word 0
+          @asm.mov(d, 0)
+        when :mod # Ruby modulo: floor division remainder
+          l, r = i.args
+          @asm.sdiv_floor(16, reg(l), reg(r, 9)); @asm.emit(0x9B008000 | (reg(r, 9) << 16) | (reg(l) << 10) | (16 << 5) | d) # msub d, x16, r, l
+        when :pcall # dispatch on the class id in word 0; one arm per class, each a direct call or a field access
+          arms, recv, *args = i.args
+          rr = reg(recv); @asm.ldr_off(16, rr, 0)
+          done = @asm.uniq
+          arms.each do |klass, kind, payload|
+            nxt = @asm.uniq
+            @asm.cmpi(16, klass.id); @asm.bcond(:ne, nxt)
+            case kind
+            when :call
+              xi = fi = 0
+              [recv, *args].each { |v| v.float? ? (@asm.fmov(fi, freg(v, fi)); fi += 1) : (@asm.mov(xi, reg(v, xi)); xi += 1) }
+              @asm.bl(payload.name); i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
+              @asm.ldr_off(16, rr, 0) if false
+            when :fld_get
+              off = klass.base + payload * 8
+              i.float? ? @asm.fldr_off(d, reg(recv), off) : @asm.ldr_off(d, reg(recv), off)
+            when :fld_set
+              off = klass.base + payload * 8; v = args[0]
+              v.float? ? @asm.fstr_off(freg(v), reg(recv), off) : @asm.str_off(reg(v, 9), reg(recv), off)
+            end
+            @asm.b(done); @asm.label(nxt)
+          end
+          @asm.label(done)
         when :ipow
           @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:__ipow); @asm.mov(d, 0)
         when :fld_get
-          o, ix = i.args
-          i.float? ? @asm.fldr_off(d, reg(o), ix * 8) : @asm.ldr_off(d, reg(o), ix * 8)
+          o, ix = i.args; off = @classes.fetch(o.ty) { raise "fld_get on #{o} (#{o.op}) typed #{o.ty.inspect} in #{@f.name}" }.base + ix * 8
+          i.float? ? @asm.fldr_off(d, reg(o), off) : @asm.ldr_off(d, reg(o), off)
         when :fld_set
-          o, ix, v = i.args; ro = reg(o)
-          v.float? ? @asm.fstr_off(freg(v), ro, ix * 8) : @asm.str_off(reg(v, 9), ro, ix * 8)
+          o, ix, v = i.args; ro = reg(o); off = @classes[o.ty].base + ix * 8
+          v.float? ? @asm.fstr_off(freg(v), ro, off) : @asm.str_off(reg(v, 9), ro, off)
         when :gget
           off = @asm.global(i.args[0])
           i.float? ? @asm.fldr_off(d, Asm::GBASE, off) : @asm.ldr_off(d, Asm::GBASE, off)

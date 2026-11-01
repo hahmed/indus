@@ -5,7 +5,7 @@ module Indus
   # merge. Trivial phis are removed afterwards.
   class Lower
     CMP = { :== => :eq, :!= => :ne, :< => :lt, :<= => :le, :> => :gt, :>= => :ge }
-    ARITH = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :& => :and, :| => :or, :^ => :xor, :<< => :shl, :>> => :shr }
+    ARITH = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :% => :mod, :& => :and, :| => :or, :^ => :xor, :<< => :shl, :>> => :shr }
 
     attr_reader :classes
 
@@ -19,7 +19,9 @@ module Indus
       defs.each { |d| @funcs[d.name] = Func.new(d.name, d.parameters&.requireds&.size || 0) }
       methods = [] # [klass, def, func]
       cdefs.each do |c|
-        k = @classes[c.constant_path.name] = Klass.new(c.constant_path.name)
+        sup = c.superclass && @classes.fetch(c.superclass.name) { raise "superclass #{c.superclass.name} must be defined first" }
+        k = @classes[c.constant_path.name] = Klass.new(c.constant_path.name, sup)
+        k.id = @classes.size
         (c.body&.body || []).each do |st|
           case st
           when Prism::DefNode
@@ -161,7 +163,7 @@ module Indus
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
         k = @classes[n.receiver.name]
         obj = @cur << Inst.new(:onew, [k])
-        if (init = k.methods[:initialize])
+        if (init = k.find_method(:initialize))
           @cur << Inst.new(:call, [init, obj, *args.map { expr(_1) }])
         end
         obj
@@ -183,8 +185,8 @@ module Indus
       elsif n.receiver && !n.receiver.is_a?(Prism::ConstantReadNode)
         # a method call on an object: resolved by Types once the receiver's class is known
         @cur << Inst.new(:mcall, [n.name, expr(n.receiver), *args.map { expr(_1) }])
-      elsif @klass && @klass.methods[n.name] && !@funcs[n.name]
-        @cur << Inst.new(:call, [@klass.methods[n.name], @locals.fetch(:self), *args.map { expr(_1) }])
+      elsif @klass && @klass.find_method(n.name) && !@funcs[n.name]
+        @cur << Inst.new(:call, [@klass.find_method(n.name), @locals.fetch(:self), *args.map { expr(_1) }])
       else
         f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
         @cur << Inst.new(:call, [f, *args.map { expr(_1) }])

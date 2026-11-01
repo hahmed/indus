@@ -6,7 +6,7 @@ module Indus
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
     def term? = %i[br condbr ret].include?(op)
-    def call? = %i[call mcall puts_i puts_s putc anew aset onew ipow].include?(op)
+    def call? = %i[call mcall pcall puts_i puts_s putc anew aset onew ipow].include?(op)
     def float? = ty == :float
     def to_s = "v#{id}"
   end
@@ -29,9 +29,19 @@ module Indus
   # a user class: ivar layout (8 bytes each, no header), methods, attrs
   class Klass
     attr_reader :name, :ivars, :methods, :readers, :writers
-    def initialize(name) = (@name, @ivars, @methods, @readers, @writers = name, [], {}, {}, {})
+    attr_accessor :superclass, :tagged, :id
+    def initialize(name, superclass = nil)
+      @name, @methods, @readers, @writers = name, {}, {}, {}
+      @superclass = superclass
+      @ivars = superclass ? superclass.ivars.dup : [] # parent's fields first, same offsets
+    end
     def ivar(n) = (@ivars << n unless @ivars.include?(n); @ivars.index(n))
-    def size = @ivars.size * 8
+    # a class that ever meets another in a poly slot carries its id in word 0
+    def base = tagged ? 8 : 0
+    def size = @ivars.size * 8 + base
+    def find_method(n) = methods[n] || superclass&.find_method(n)
+    def find_reader(n) = readers[n] || superclass&.find_reader(n)
+    def find_writer(n) = writers[n] || superclass&.find_writer(n)
   end
 
   class Func
@@ -55,7 +65,13 @@ module Indus
         s << "#{b.name}:#{b.cold ? ' (cold)' : ''}\n"
         b.phis.each { |p| s << "  #{p} = phi #{p.args.map { |(bb, v)| "[#{bb.name}: #{v}]" }.join(', ')}\n" }
         b.insts.each do |i|
-          a = i.args.map { _1.is_a?(Block) ? _1.name : _1.is_a?(Func) ? _1.name : _1.to_s }.join(", ")
+          a = i.args.map do |x|
+            case x
+            when Block, Func, Klass then x.name
+            when Array then x.map { |arm| arm.is_a?(Array) ? "#{arm[0].name}->#{arm[2].is_a?(Func) ? arm[2].name : arm[2]}" : arm.to_s }.join(" | ")
+            else x.to_s
+            end
+          end.join(", ")
           s << (i.term? ? "  #{i.op} #{a}\n" : "  #{i}#{i.ty ? ":#{i.ty}" : ''} = #{i.op}#{i.cond ? ".#{i.cond}" : ''} #{a}\n")
         end
       end

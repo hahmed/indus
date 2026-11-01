@@ -27,7 +27,7 @@ module Indus
     asm = Asm.new
     asm.write_addr = Metal::LIBC["write"].to_i unless standalone
     asm.emit_start_linux if standalone == :linux
-    funcs.each { Codegen.new(asm).func(_1) }
+    funcs.each { Codegen.new(asm, lower.classes).func(_1) }
     asm.emit_puts_i
     asm.emit_putc
     asm.emit_array_new

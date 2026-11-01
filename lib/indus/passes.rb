@@ -37,9 +37,10 @@ module Indus
 
       header = Block.new(:header); old_entry = f.entry; entry = Block.new(:entry)
       f.blocks.insert(1, header); f.blocks.unshift(entry)
-      zero = entry << Inst.new(:const, [0]); entry << Inst.new(:br, [header])
+      zero = entry << Inst.new(:const, [0]); zero.ty = :int; entry << Inst.new(:br, [header])
       header << Inst.new(:br, [old_entry]); old_entry.name = :body
-      param_phis = f.params.map { header.phi }; acc = header.phi
+      param_phis = f.params.each_with_index.map { |_, k| ph = header.phi; ph.ty = f.ptypes[k]; ph }
+      acc = header.phi; acc.ty = f.rtype
       param_phis.each_with_index { |p, i| p.args << [entry, f.params[i]] }; acc.args << [entry, zero]
       rewrite = f.params.zip(param_phis).to_h
       f.blocks.each do |b|
@@ -48,11 +49,11 @@ module Indus
       end
       tb = tail.block
       tb.insts.delete(add); tb.insts.delete(self_call); tb.insts.delete(tail)
-      acc2 = tb << Inst.new(:add, [acc, other]); tb << Inst.new(:br, [header])
+      acc2 = tb << Inst.new(:add, [acc, other]); acc2.ty = f.rtype; tb << Inst.new(:br, [header])
       param_phis.each_with_index { |p, i| p.args << [tb, self_call.args[i + 1]] }; acc.args << [tb, acc2]
       (rets - [tail]).each do |r|
         r.block.insts.delete(r)
-        sum = r.block << Inst.new(:add, [r.args[0], acc]); r.block << Inst.new(:ret, [sum])
+        sum = r.block << Inst.new(:add, [r.args[0], acc]); sum.ty = f.rtype; r.block << Inst.new(:ret, [sum])
       end
       true
     end
