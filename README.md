@@ -3,6 +3,7 @@
 Ruby to metal. Experiments.
 
 ```sh
-ruby experiments/04_subset/indus.rb bench/fib.rb
-bench/run.sh
+bin/indus bench/fib.rb            # compile + run in process
+bin/indus bench/fib.rb -o fib     # write a standalone arm64 Mach-O (no linker)
+bench/run.sh                      # vs CRuby, YJIT, Spinel
 ```

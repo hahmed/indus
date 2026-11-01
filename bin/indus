@@ -1,0 +1,21 @@
+#!/usr/bin/env ruby
+# indus file.rb            compile and run in-process (JIT-style)
+# indus file.rb -o out     write a standalone Mach-O executable
+require_relative "../lib/indus"
+require_relative "../lib/indus/macho"
+
+file = ARGV[0] or abort "usage: indus file.rb [-o out]"
+out = ARGV[ARGV.index("-o") + 1] if ARGV.include?("-o")
+src = File.read(file)
+
+if out
+  code = Indus.compile(src, standalone: true)
+  Indus::MachO.write(out, code)
+  $stderr.puts "indus: #{out} (#{code.bytesize} bytes of code, #{File.size(out)} bytes on disk)"
+else
+  code = Indus.compile(src)
+  if ENV["HEX"] then code.unpack("V*").each_with_index { |w, i| printf("%4d: %08x\n", i * 4, w) }; exit end
+  t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  Metal.run(code)
+  $stderr.puts "indus: #{code.bytesize} bytes, #{((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round(1)} ms"
+end
