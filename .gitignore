@@ -1,0 +1,4 @@
+# ideas stay local
+notes/
+*.md
+!README.md
