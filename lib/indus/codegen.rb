@@ -40,6 +40,13 @@ module Indus
       fused.each_slice(2).with_index { |(a, b), i| @asm.fstp(a, b, fsave + i * 16) }
       if f.name == :main # heap base arrives in x0: globals in the first 4K, bump pointer after
         @asm.mov(Asm::GBASE, 0); @asm.addi(Asm::HEAP, 0, 4096)
+        # patchable methods start out pointing at their static code
+        @classes.each_value do |k|
+          k.methods.each_value do |m|
+            next unless m.patchable
+            @asm.adr(16, m.name); @asm.str_off(16, Asm::GBASE, @asm.global(:"m_#{m.name}"))
+          end
+        end
       end
       # params: ints in x0.., floats in d0.. (separate counters, AAPCS64)
       xi = fi = 0
@@ -186,8 +193,16 @@ module Indus
           f, *a = i.args
           xi = fi = 0
           a.each { |v| v.float? ? (@asm.fmov(fi, freg(v, fi)); fi += 1) : (@asm.mov(xi, reg(v, xi)); xi += 1) }
-          @asm.bl(f.name)
+          if f.patchable # through the method's slot: redefinition rewrites one word
+            @asm.ldr_off(16, Asm::GBASE, @asm.global(:"m_#{f.name}")); @asm.blr(16)
+          else
+            @asm.bl(f.name)
+          end
           i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
+        when :seam # call the resident compiler with the seam id; it patches the slots
+          @asm.seams << i.args
+          @asm.mov_imm(0, @asm.seams.size - 1)
+          @asm.ldr_off(16, Asm::GBASE, @asm.global(:__seam_cb)); @asm.blr(16)
         when :puts_i
           @asm.mov(0, reg(i.args[0], 0))
           @asm.bl(:__puts_i)

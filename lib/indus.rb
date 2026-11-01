@@ -1,13 +1,13 @@
 # Indus: Ruby -> SSA -> arm64. No C, no LLVM, no assembler, no linker.
 #
-#   lib/indus/ir.rb       SSA values, blocks, functions
+#   lib/indus/ir.rb       SSA values, blocks, functions, classes
 #   lib/indus/lower.rb    Prism AST -> SSA
-#   lib/indus/types.rb    type inference (int/float/arrays), conversions
+#   lib/indus/types.rb    type inference (int/float/arrays/classes/poly), conversions
 #   lib/indus/passes.rb   SSA passes (trivial phis, return sinking, accumulator loops)
 #   lib/indus/asm.rb      arm64 encoder + hand-written runtime routines
 #   lib/indus/regalloc.rb linear-scan register allocation over dataflow liveness
 #   lib/indus/codegen.rb  layout, frames, instruction selection
-#   lib/indus/metal.rb    run in-process
+#   lib/indus/metal.rb    run in-process; hosts the resident compiler for seams
 #   lib/indus/macho.rb    standalone Mach-O writer
 #   lib/indus/elf.rb      standalone Linux ELF writer
 #
@@ -18,6 +18,14 @@ require "fiddle"
 %w[ir lower types passes asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
+  # everything a compiled program knows about itself: enough for the
+  # resident compiler to add to it later
+  Unit = Struct.new(:code, :asm, :lower, :funcs) do
+    def seams = asm.seams
+    def globals = asm.globals
+    def label(n) = asm.labels.fetch(n)
+  end
+
   # standalone: nil (run in-process via libc write), :darwin or :linux
   def self.compile(src, standalone: nil)
     lower = Lower.new(src)
@@ -36,6 +44,27 @@ module Indus
     asm.emit_object_new
     asm.emit_ipow
     asm.emit_syscalls(standalone) if standalone
-    asm.resolve!
+    raise "this program has a seam (class_eval); a standalone binary needs the resident compiler" if standalone && !asm.seams.empty?
+    Unit.new(asm.resolve!, asm, lower, funcs)
+  end
+
+  # The resident compiler: compile one redefined method against the running
+  # program's types, place it in new executable memory, return its address.
+  # Calls out of the new code go through absolute addresses into the old.
+  def self.compile_method(unit, base, klass, src)
+    d = Prism.parse(src).value.statements.body.grep(Prism::DefNode).first
+    old = klass.find_method(d.name)
+    f = unit.lower.lower_method(klass, d, old)
+    Types.run([f], unit.lower.classes)
+    Passes.run(f)
+    raise "redefinition changed #{f.name}'s signature" unless f.ptypes == old.ptypes && f.rtype == old.rtype
+    asm = Asm.new
+    asm.write_addr = Metal::LIBC["write"].to_i
+    asm.externs = unit.asm.labels.transform_values { base + _1 * 4 }
+    asm.instance_variable_set(:@globals, unit.globals) # same slots
+    f.name = :"#{old.name}@#{unit.seams.size}" # fresh label
+    Codegen.new(asm, unit.lower.classes).func(f)
+    code = asm.resolve!
+    [code, asm.labels.fetch(f.name) * 4, f]
   end
 end

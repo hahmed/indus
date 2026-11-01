@@ -2,7 +2,7 @@
 module Indus
   class Asm
     attr_reader :words
-    def initialize = (@words, @labels, @fixups, @data = [], {}, [], [])
+    def initialize = (@words, @labels, @fixups, @data, @seams = [], {}, [], [], [])
     def pos = @words.size
     def emit(w) = @words << (w & 0xFFFFFFFF)
     def label(n) = (@labels[n] = pos)
@@ -199,7 +199,14 @@ module Indus
     def cbz(rt, n) = (fix(n, :b19); emit(0xB4000000 | rt))
     def cbnz(rt, n) = (fix(n, :b19); emit(0xB5000000 | rt))
     def b(n) = (fix(n, :b26); emit(0x14000000))
-    def bl(n) = (fix(n, :b26); emit(0x94000000))
+    # a later compilation unit calls back into the first through absolute addresses
+    attr_accessor :externs # name -> absolute address
+    def bl(n)
+      if externs&.key?(n) then mov_imm(16, externs[n]); blr(16)
+      else fix(n, :b26); emit(0x94000000) end
+    end
+    attr_reader :labels
+    attr_accessor :seams # [[klass, src], ...] in id order
     def blr(rn) = emit(0xD63F0000 | (rn << 5))
     def ret = emit(0xD65F03C0)
     def adr(rd, n) = (fix(n, :adr); emit(0x10000000 | rd))
@@ -216,6 +223,7 @@ module Indus
     # globals: 8-byte slots at the start of the heap, addressed off x27
     GBASE = 27
     def global(name) = (@globals ||= {})[name] ||= @globals.size * 8
+    def globals = (@globals ||= {})
 
     # --- the whole "runtime": puts for an Integer, via write(2) --------------
     # x0 = value. Builds decimal + "\n" in a 32-byte stack buffer, calls write.

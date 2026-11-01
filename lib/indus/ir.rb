@@ -6,7 +6,7 @@ module Indus
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
     def term? = %i[br condbr ret].include?(op)
-    def call? = %i[call mcall pcall puts_i puts_s putc anew aset onew ipow].include?(op)
+    def call? = %i[call mcall pcall puts_i puts_s putc anew aset onew ipow seam].include?(op)
     def float? = ty == :float
     def to_s = "v#{id}"
   end
@@ -45,7 +45,7 @@ module Indus
   end
 
   class Func
-    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls
+    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable
     def initialize(name, nparams)
       @name, @params, @blocks = name, Array.new(nparams) { Inst.new(:param) }, [Block.new(:entry)]
     end

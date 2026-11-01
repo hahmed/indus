@@ -46,6 +46,16 @@ module Indus
       all
     end
 
+    # the resident compiler: lower one `def` from a string into a Func that
+    # replaces `old` (same class, same signature)
+    def lower_method(klass, def_node, old)
+      f = Func.new(old.name, old.params.size)
+      f.cls = klass; f.ptypes = old.ptypes.dup; f.rtype = old.rtype
+      lower_body(f, [:self, *(def_node.parameters&.requireds&.map(&:name) || [])], def_node.body&.body || [], klass)
+      prune(f)
+      f
+    end
+
     # drop blocks unreachable from entry (code after break/return) and the phi
     # edges that came from them
     def prune(f)
@@ -167,6 +177,17 @@ module Indus
           @cur << Inst.new(:call, [init, obj, *args.map { expr(_1) }])
         end
         obj
+      elsif n.name == :class_eval && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
+        # a puncture: the methods this string defines can change at run time.
+        # They are called through a slot from here on; nothing else changes.
+        k = @classes[n.receiver.name]
+        src = args[0]
+        raise "class_eval needs a string literal (a computed string would make every method of #{k.name} patchable)" unless src.is_a?(Prism::StringNode)
+        Prism.parse(src.unescaped).value.statements.body.grep(Prism::DefNode).each do |d|
+          m = k.find_method(d.name) or raise "class_eval defining a new method #{d.name} (only redefinition for now)"
+          m.patchable = true
+        end
+        @cur << Inst.new(:seam, [k, src.unescaped])
       elsif n.name == :sqrt && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
         @cur << Inst.new(:fsqrt, [expr(args[0])])
       elsif n.name == :** then @cur << Inst.new(:ipow, [expr(n.receiver), expr(args[0])])

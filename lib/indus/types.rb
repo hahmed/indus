@@ -28,7 +28,7 @@ module Indus
       @classes = classes
       @ivars = Hash.new { |h, k| h[k] = {} } # class name -> ivar index -> type
       @consts = {}
-      funcs.each { |f| f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = f.cls.name if f.cls }
+      funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = f.cls.name if f.cls }
       loop do
         changed = false
         set = ->(cur, nt, &w) { (w.call(join(cur, nt)); changed = true) if nt && join(cur, nt) != cur }
