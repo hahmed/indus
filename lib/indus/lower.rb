@@ -7,15 +7,41 @@ module Indus
     CMP = { :== => :eq, :!= => :ne, :< => :lt, :<= => :le, :> => :gt, :>= => :ge }
     ARITH = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :& => :and, :| => :or, :^ => :xor, :<< => :shl, :>> => :shr }
 
-    def initialize(src) = (@ast, @funcs = Prism.parse(src).value, {})
+    attr_reader :classes
+
+    def initialize(src) = (@ast, @funcs, @classes, @consts = Prism.parse(src).value, {}, {}, {})
 
     def run
-      defs, top = @ast.statements.body.partition { _1.is_a?(Prism::DefNode) }
+      body = @ast.statements.body
+      defs = body.grep(Prism::DefNode)
+      cdefs = body.grep(Prism::ClassNode)
+      top = body - defs - cdefs
       defs.each { |d| @funcs[d.name] = Func.new(d.name, d.parameters&.requireds&.size || 0) }
+      methods = [] # [klass, def, func]
+      cdefs.each do |c|
+        k = @classes[c.constant_path.name] = Klass.new(c.constant_path.name)
+        (c.body&.body || []).each do |st|
+          case st
+          when Prism::DefNode
+            f = Func.new(:"#{k.name}##{st.name}", 1 + (st.parameters&.requireds&.size || 0))
+            f.cls = k; k.methods[st.name] = f; methods << [k, st, f]
+          when Prism::CallNode # attr_accessor / attr_reader / attr_writer
+            st.arguments.arguments.each do |sym|
+              n = sym.unescaped.to_sym; k.ivar(:"@#{n}")
+              k.readers[n] = :"@#{n}" if %i[attr_accessor attr_reader].include?(st.name)
+              k.writers[:"#{n}="] = :"@#{n}" if %i[attr_accessor attr_writer].include?(st.name)
+            end
+          else raise "unsupported in class body: #{st.class}"
+          end
+        end
+      end
       main = Func.new(:main, 0)
       lower_body(main, [], top)
       defs.each { |d| lower_body(@funcs[d.name], d.parameters&.requireds&.map(&:name) || [], d.body&.body || []) }
-      [main, *@funcs.values].each { prune(_1) }
+      methods.each { |k, d, f| lower_body(f, [:self, *(d.parameters&.requireds&.map(&:name) || [])], d.body&.body || [], k) }
+      all = [main, *@funcs.values, *methods.map(&:last)]
+      all.each { prune(_1) }
+      all
     end
 
     # drop blocks unreachable from entry (code after break/return) and the phi
@@ -32,8 +58,8 @@ module Indus
 
     private
 
-    def lower_body(f, names, stmts)
-      @f, @locals, @cur = f, names.zip(f.params).to_h, f.entry
+    def lower_body(f, names, stmts, klass = nil)
+      @f, @locals, @cur, @klass = f, names.zip(f.params).to_h, f.entry, klass
       last = nil
       stmts.each { last = expr(_1) }
       @cur << Inst.new(:ret, [last || const(0)]) unless @cur.term
@@ -46,6 +72,18 @@ module Indus
       case n
       when Prism::IntegerNode then const(n.value)
       when Prism::FloatNode then fconst(n.value)
+      when Prism::NilNode then (c = const(0); c.ty = :nil; c)
+      when Prism::SelfNode then @locals.fetch(:self)
+      when Prism::ArrayNode
+        raise "array literal with elements" unless n.elements.empty?
+        fill = const(0); fill.ty = :nil # element type comes from the first push
+        @cur << Inst.new(:anew, [const(0), fill])
+      when Prism::InstanceVariableReadNode then @cur << Inst.new(:fld_get, [@locals.fetch(:self), @klass.ivar(n.name)])
+      when Prism::InstanceVariableWriteNode
+        v = expr(n.value); @cur << Inst.new(:fld_set, [@locals.fetch(:self), @klass.ivar(n.name), v]); v
+      when Prism::ConstantReadNode then @cur << Inst.new(:gget, [n.name])
+      when Prism::ConstantWriteNode
+        v = expr(n.value); @cur << Inst.new(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode then @locals.fetch(n.name) { raise "undefined local #{n.name}" }
       when Prism::LocalVariableWriteNode then @locals[n.name] = expr(n.value)
       when Prism::LocalVariableOperatorWriteNode
@@ -120,6 +158,20 @@ module Indus
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array
         len = expr(args[0]); fill = args[1] ? expr(args[1]) : const(0)
         @cur << Inst.new(:anew, [len, fill])
+      elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
+        k = @classes[n.receiver.name]
+        obj = @cur << Inst.new(:onew, [k])
+        if (init = k.methods[:initialize])
+          @cur << Inst.new(:call, [init, obj, *args.map { expr(_1) }])
+        end
+        obj
+      elsif n.name == :sqrt && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
+        @cur << Inst.new(:fsqrt, [expr(args[0])])
+      elsif n.name == :** then @cur << Inst.new(:ipow, [expr(n.receiver), expr(args[0])])
+      elsif n.name == :length && args.empty? && n.receiver then @cur << Inst.new(:alen, [expr(n.receiver)])
+      elsif n.name == :push && n.receiver.is_a?(Prism::LocalVariableReadNode)
+        a = expr(n.receiver); v = expr(args[0]); len = @cur << Inst.new(:alen, [a])
+        @locals[n.receiver.name] = @cur << Inst.new(:aset, [a, len, v])
       elsif n.name == :[]
         @cur << Inst.new(:aget, [expr(n.receiver), expr(args[0])])
       elsif n.name == :[]=
@@ -128,6 +180,11 @@ module Indus
         a = expr(n.receiver); i = expr(args[0]); v = expr(args[1])
         @locals[n.receiver.name] = @cur << Inst.new(:aset, [a, i, v])
         v
+      elsif n.receiver && !n.receiver.is_a?(Prism::ConstantReadNode)
+        # a method call on an object: resolved by Types once the receiver's class is known
+        @cur << Inst.new(:mcall, [n.name, expr(n.receiver), *args.map { expr(_1) }])
+      elsif @klass && @klass.methods[n.name] && !@funcs[n.name]
+        @cur << Inst.new(:call, [@klass.methods[n.name], @locals.fetch(:self), *args.map { expr(_1) }])
       else
         f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
         @cur << Inst.new(:call, [f, *args.map { expr(_1) }])

@@ -1,7 +1,7 @@
 # SSA -> arm64: layout, register allocation, instruction selection.
 module Indus
   class Codegen
-    CALLEE = (19..27).to_a # x28 = heap
+    CALLEE = (19..26).to_a # x27 = globals base, x28 = heap bump pointer
     CALLER = (10..15).to_a # x8, x9 scratch
     FCALLEE = (8..15).to_a  # d8-d15
     FCALLER = (16..29).to_a # d30, d31 scratch
@@ -86,7 +86,7 @@ module Indus
       end
       phis.each do |ph|
         ph.args.each do |(pred, v)|
-          next unless v.is_a?(Inst) && !v.reg && !%i[param phi const].include?(v.op) && v.block == pred
+          next unless v.is_a?(Inst) && !v.reg && !%i[param phi const fconst].include?(v.op) && v.block == pred
           next unless last[v] == idx[pred.term]
           after = pred.insts[(pred.insts.index(v) + 1)..].any? { |j| j.args.include?(ph) }
           (v.reg = ph.reg; v.shared = true) unless after || ph.reg.nil?
@@ -99,12 +99,12 @@ module Indus
           if v.float? then (FCALLEE.include?(v.reg) ? fcallee : fcaller).unshift(v.reg)
           else (CALLEE.include?(v.reg) ? callee : caller).unshift(v.reg) end
         end
-        next if i.reg || i.slot || i.term? || i.op == :phi || i.op == :const || i.op == :fconst || i.op == :puts_s || i.op == :puts_i || i.op == :putc
+        next if i.reg || i.slot || i.term? || %i[phi const fconst puts_s puts_i putc gset fld_set].include?(i.op)
         next if i.op == :cmp && fused?(i)
         assign.(i, across.(i, k) ? callee : caller)
       end
 
-      used |= [Asm::HEAP] if f.name == :main
+      used |= [Asm::HEAP, Asm::GBASE] if f.name == :main
       used.sort!; fused.sort!
       fsave = 16 + ((used.size + 1) / 2) * 16
       @spill_base = fsave + ((fused.size + 1) / 2) * 16
@@ -114,7 +114,9 @@ module Indus
       @asm.stp_pre(29, 30, frame); @asm.mov_fp_sp
       used.each_slice(2).with_index { |(a, b), i| @asm.stp(a, b, 16 + i * 16) }
       fused.each_slice(2).with_index { |(a, b), i| @asm.fstp(a, b, fsave + i * 16) }
-      @asm.mov(Asm::HEAP, 0) if f.name == :main # heap base arrives in x0
+      if f.name == :main # heap base arrives in x0: globals in the first 4K, bump pointer after
+        @asm.mov(Asm::GBASE, 0); @asm.addi(Asm::HEAP, 0, 4096)
+      end
       # params: ints in x0.., floats in d0.. (separate counters, AAPCS64)
       xi = fi = 0
       f.params.each { |p| p.float? ? (@asm.fmov(p.reg, fi); fi += 1) : (@asm.mov(p.reg, xi); xi += 1) }
@@ -173,6 +175,24 @@ module Indus
           elsif imm?(r) then @asm.send(i.op == :add ? :addi : :subi, d, reg(l), r.args[0])
           else @asm.send(i.op, d, reg(l), reg(r, 9)) end
         when :itof then @asm.scvtf(d, reg(i.args[0]))
+        when :fsqrt then @asm.fsqrt(d, freg(i.args[0]))
+        when :alen then @asm.ldur(d, reg(i.args[0]), -8)
+        when :onew
+          @asm.mov_imm(0, [i.args[0].size, 8].max); @asm.bl(:__onew); @asm.mov(d, 0)
+        when :ipow
+          @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:__ipow); @asm.mov(d, 0)
+        when :fld_get
+          o, ix = i.args
+          i.float? ? @asm.fldr_off(d, reg(o), ix * 8) : @asm.ldr_off(d, reg(o), ix * 8)
+        when :fld_set
+          o, ix, v = i.args; ro = reg(o)
+          v.float? ? @asm.fstr_off(freg(v), ro, ix * 8) : @asm.str_off(reg(v, 9), ro, ix * 8)
+        when :gget
+          off = @asm.global(i.args[0])
+          i.float? ? @asm.fldr_off(d, Asm::GBASE, off) : @asm.ldr_off(d, Asm::GBASE, off)
+        when :gset
+          name, v = i.args; off = @asm.global(name)
+          v.float? ? @asm.fstr_off(freg(v), Asm::GBASE, off) : @asm.str_off(reg(v, 9), Asm::GBASE, off)
         when :to_f then @asm.scvtf(d, reg(i.args[0]))
         when :to_i then i.args[0].float? ? @asm.fcvtzs(d, freg(i.args[0])) : @asm.mov(d, reg(i.args[0]))
         when :putc

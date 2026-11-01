@@ -52,6 +52,47 @@ module Indus
     def fstp(t1, t2, off) = t2 ? emit(0x6D000000 | ((off / 8) << 15) | (t2 << 10) | (31 << 5) | t1) : fstr(t1, off)
     def fldp(t1, t2, off) = t2 ? emit(0x6D400000 | ((off / 8) << 15) | (t2 << 10) | (31 << 5) | t1) : fldr(t1, off)
     def fmov_imm(rd, v) = (mov_imm(8, [v].pack("E").unpack1("Q")); fmov_dx(rd, 8))
+    def fsqrt(rd, rn) = emit(0x1E61C000 | (rn << 5) | rd)
+    # field access: unsigned scaled offsets
+    def ldr_off(rt, rn, off) = emit(0xF9400000 | ((off / 8) << 10) | (rn << 5) | rt)
+    def str_off(rt, rn, off) = emit(0xF9000000 | ((off / 8) << 10) | (rn << 5) | rt)
+    def fldr_off(rt, rn, off) = emit(0xFD400000 | ((off / 8) << 10) | (rn << 5) | rt)
+    def fstr_off(rt, rn, off) = emit(0xFD000000 | ((off / 8) << 10) | (rn << 5) | rt)
+    def ldr_lit(rt, n) = (fix(n, :b19); emit(0x58000000 | rt))        # ldr xt, label (pc-relative data)
+    def fldr_lit(rt, n) = (fix(n, :b19); emit(0x5C000000 | rt))       # ldr dt, label
+
+    # x0 = bytes -> x0 = zeroed block from the bump heap
+    def emit_object_new
+      label(:__onew)
+      emit 0xAA1C03E1                 # mov x1, x28
+      emit 0x8B00039C                 # add x28, x28, x0
+      emit 0x91003F9C; emit 0x927CEF9C # round x28 up to 16
+      emit 0xAA0103E2                 # mov x2, x1
+      l = uniq; d = uniq
+      label(l)
+      emit 0xEB1C005F                 # cmp x2, x28
+      bhs(d)
+      emit 0xF800845F                 # str xzr, [x2], #8
+      b(l)
+      label(d)
+      emit 0xAA0103E0                 # mov x0, x1
+      ret
+    end
+
+    # x0 = base, x1 = exp (>= 0) -> x0 = base ** exp
+    def emit_ipow
+      label(:__ipow)
+      emit 0xAA0003E2                 # mov x2, x0
+      emit 0xD2800020                 # mov x0, #1
+      l = uniq; d = uniq
+      label(l)
+      cbz(1, d)
+      emit 0x9B027C00                 # mul x0, x0, x2
+      emit 0xD1000421                 # sub x1, x1, #1
+      b(l)
+      label(d)
+      ret
+    end
     # integer division, Ruby semantics (floor): q = a/b; if r != 0 && (r^b) < 0 then q -= 1
     def sdiv_floor(rd, rn, rm)
       emit(0x9AC00C00 | (rm << 16) | (rn << 5) | rd)                 # sdiv rd, rn, rm
@@ -140,7 +181,10 @@ module Indus
       emit 0xAA0703E0             # mov x0, x7
       b(fill)
     end
-    def addi(rd, rn, i) = emit(0x91000000 | (i << 10) | (rn << 5) | rd)
+    def addi(rd, rn, i)
+      raise "addi immediate out of range: #{i}" unless (0..4095).cover?(i) || (i % 4096 == 0 && i <= 4095 * 4096)
+      i < 4096 ? emit(0x91000000 | (i << 10) | (rn << 5) | rd) : emit(0x91400000 | ((i >> 12) << 10) | (rn << 5) | rd)
+    end
     def subi(rd, rn, i) = emit(0xD1000000 | (i << 10) | (rn << 5) | rd)
     def cmp(rn, rm) = emit(0xEB00001F | (rm << 16) | (rn << 5))
     def cmpi(rn, i) = emit(0xF100001F | (i << 10) | (rn << 5))
@@ -169,6 +213,9 @@ module Indus
 
     # data: bytes placed after the code, addressed with adr
     def data(name, bytes) = @data << [name, bytes]
+    # globals: 8-byte slots at the start of the heap, addressed off x27
+    GBASE = 27
+    def global(name) = (@globals ||= {})[name] ||= @globals.size * 8
 
     # --- the whole "runtime": puts for an Integer, via write(2) --------------
     # x0 = value. Builds decimal + "\n" in a 32-byte stack buffer, calls write.

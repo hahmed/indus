@@ -102,7 +102,7 @@ def advance(bodies, nbodies, dt)
   end
 end
 
-n = Integer(ARGV[0] || 1000)
+n = 1000
 
 puts (energy(bodies, nbodies) * 1000000000).to_i
 

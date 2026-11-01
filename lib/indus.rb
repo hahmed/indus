@@ -19,8 +19,9 @@ require "fiddle"
 module Indus
   # standalone: nil (run in-process via libc write), :darwin or :linux
   def self.compile(src, standalone: nil)
-    funcs = Lower.new(src).run
-    Types.run(funcs)
+    lower = Lower.new(src)
+    funcs = lower.run
+    Types.run(funcs, lower.classes)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]
     asm = Asm.new
@@ -31,6 +32,8 @@ module Indus
     asm.emit_putc
     asm.emit_array_new
     asm.emit_array_set_slow
+    asm.emit_object_new
+    asm.emit_ipow
     asm.emit_syscalls(standalone) if standalone
     asm.resolve!
   end
