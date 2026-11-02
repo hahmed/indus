@@ -35,6 +35,7 @@ module Indus
 
   def self.compile(src, standalone: nil)
     src = PRELUDE_GC + "\n" + src if GC.enabled? # the collector rides along as Ruby
+    Types.reset!
     lower = Lower.new(src)
     funcs = lower.run
     funcs.each { Passes.trivial_phis(_1) } # dead statement-valued phis would confuse typing
@@ -58,6 +59,13 @@ module Indus
     Unit.new(asm.resolve!, asm, lower, funcs)
   end
 
+  def self.diff_tables((iv0, c0), (iv1, c1))
+    out = []
+    iv1.each { |k, h| h.each { |ix, t| out << "#{k} ivar #{ix}: #{iv0.dig(k, ix).inspect} -> #{t.inspect}" if iv0.dig(k, ix) != t } }
+    c1.each { |k, t| out << "#{k}: #{c0[k].inspect} -> #{t.inspect}" if c0[k] != t }
+    out.join(", ")
+  end
+
   # The resident compiler: compile one redefined method against the running
   # program's types, place it in new executable memory, return its address.
   # Calls out of the new code go through absolute addresses into the old.
@@ -65,8 +73,17 @@ module Indus
     d = Prism.parse(src).value.statements.body.grep(Prism::DefNode).first
     old = klass.find_method(d.name)
     f = unit.lower.lower_method(klass, d, old)
+    Passes.trivial_phis(f)
+    before = Types.snapshot
     Types.run([f], unit.lower.classes)
+    after = Types.snapshot
+    if before != after # world-age, type edition: dependents would need recompiling
+      raise "redefinition of #{klass.name}##{d.name} changes a type the program was compiled against (#{diff_tables(before, after)}); not supported yet"
+    end
     Passes.run(f)
+    Peephole.run(f) unless ENV["NOPEEP"]
+    GC.mark_allocators(unit.funcs + [f])
+    Escape.run([f], unit.lower.classes) unless ENV["NOESCAPE"]
     raise "redefinition changed #{f.name}'s signature" unless f.ptypes == old.ptypes && f.rtype == old.rtype
     asm = Asm.new
     asm.gc_table = unit.asm.gc_table
@@ -74,8 +91,10 @@ module Indus
     asm.externs = unit.asm.labels.transform_values { base + _1 * 4 }
     asm.instance_variable_set(:@globals, unit.globals) # same slots
     f.name = :"#{old.name}@#{unit.seams.size}" # fresh label
+    asm.label(:__text_base)
     Codegen.new(asm, unit.lower.classes).func(f)
+    asm.emit_gc_tables if GC.enabled? # this unit's frame maps, with the (grown) type table
     code = asm.resolve!
-    [code, asm.labels.fetch(f.name) * 4, f]
+    [code, asm.labels.fetch(f.name) * 4, f, GC.enabled? ? asm.labels.fetch(:__gc_tables) * 4 : nil]
   end
 end

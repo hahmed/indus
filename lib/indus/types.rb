@@ -39,10 +39,16 @@ module Indus
     end
     def self.hsh(t) = t.is_a?(Array) && t[0] == :hash
 
+    def self.reset! = (@ivars = nil; @consts = nil)
+    # a snapshot of the program-wide tables, to detect a seam widening a type
+    # that compiled code already relies on
+    def self.snapshot = Marshal.load(Marshal.dump([@ivars.to_h { |k, v| [k, v.dup] }, @consts.dup]))
     def self.run(funcs, classes, lower = nil)
       @classes = classes; @lower = lower || @lower
-      @ivars = Hash.new { |h, k| h[k] = {} } # class name -> ivar index -> type
-      @consts = {}
+      # program-wide state; the resident compiler re-runs inference for one
+      # function against the tables the whole program built
+      @ivars ||= Hash.new { |h, k| h[k] = {} } # class name -> ivar index -> type
+      @consts ||= {}
       funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = f.cls.name if f.cls }
       loop do
         changed = false

@@ -19,9 +19,10 @@ module Indus
     def self.run(funcs, classes)
       @classes = classes
       funcs.each do |f|
-        f.leaks = Array.new(f.params.size, false)       # param k flows somewhere that keeps it
-        f.stores_param = Array.new(f.params.size, false) # a heap value is stored into param k
-        f.stores_other = false                           # a heap value is stored into non-param memory / global
+        # a patchable method can be replaced by anything at run time: assume it keeps and stores everything
+        f.leaks = Array.new(f.params.size, !!f.patchable)       # param k flows somewhere that keeps it
+        f.stores_param = Array.new(f.params.size, !!f.patchable) # a heap value is stored into param k
+        f.stores_other = !!f.patchable                           # a heap value is stored into non-param memory / global
       end
       loop do
         changed = false

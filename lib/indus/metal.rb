@@ -39,8 +39,15 @@ module Indus
         cb = Fiddle::Closure::BlockCaller.new(Fiddle::TYPE_LONG, [Fiddle::TYPE_LONG]) do |id|
           klass, src = unit.seams[id]
           t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          code, off, f = Indus.compile_method(unit, mem.to_i, klass, src)
-          addr = place(code).to_i + off
+          code, off, f, tables_off = Indus.compile_method(unit, mem.to_i, klass, src)
+          blob = place(code).to_i
+          addr = blob + off
+          if tables_off # link this unit's GC tables into the collector's chain
+            rec = MMAP.call(nil, 4096, 3, 0x1002, -1, 0)
+            rec[0, 24] = [heap[unit.globals.fetch(:__gc_extra), 8].unpack1("Q"), blob, blob + tables_off].pack("QQQ")
+            heap[unit.globals.fetch(:__gc_extra), 8] = [rec.to_i].pack("Q")
+            @keep_recs = (@keep_recs || []) << rec
+          end
           method = f.name.to_s.split("@").first # Greeter#hello
           heap[unit.globals.fetch(:"m_#{method}"), 8] = [addr].pack("Q")
           $stderr.puts "indus: seam #{id}: recompiled #{method} (#{code.bytesize} bytes) in #{((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round(2)} ms; slot rewritten, world moved on" if ENV["SEAM_LOG"]

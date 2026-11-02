@@ -8,7 +8,8 @@
 #   __adr_tables / __adr_text         addresses of __gc_tables / __text_base
 #
 # Globals (byte offsets from __gbase): 8 limit, 16 from, 24 from_end,
-# 32 to, 40 to_end, 48 bitmap, 56 worklist, 64 count.
+# 32 to, 40 to_end, 48 bitmap, 56 worklist, 64 count, 72/80 scratch,
+# 88 mmap fn, 96 chain of seam-compiled units' tables.
 # Table layout: [ntypewords, types..., nframes, frames..., nglobals, globals...]
 # (32-bit words). types: [count, off_0.., descriptors]; a descriptor is
 #   [0]  STR       [1, elem_tid]  ARR       [2, k_tid, v_tid]  HASH
@@ -96,6 +97,40 @@ def __gc_run(fp)
         end
         fe = fe + 12 + ns * 8
         f = f + 1
+      end
+      # not in the static table: try code compiled later through a seam.
+      # Each extra record: [next, text_base, tables] with its own types/frames.
+      extra = __ld(g + 96)
+      while extra != 0 && found == 0
+        xtext = __ld(extra + 8)
+        xtables = __ld(extra + 16)
+        xret = __ld(child + 8) - xtext
+        xntw = __ld32(xtables)
+        xtypes = xtables + 4
+        xframes = xtypes + xntw * 4
+        xn = __ld32(xframes)
+        fe = xframes + 4
+        f = 0
+        while f < xn
+          cs = __ld32(fe)
+          ce = __ld32(fe + 4)
+          ns = __ld32(fe + 8)
+          if found == 0 && xret >= cs && xret < ce
+            found = 1
+            s = 0
+            while s < ns
+              so = __ld32(fe + 12 + s * 8)
+              tid = __ld32(fe + 16 + s * 8)
+              __gc_forward(parent + so, tid, from, from_end, free, wtop, bitmap, xtypes)
+              free = __ld(g + 72)
+              wtop = __ld(g + 80)
+              s = s + 1
+            end
+          end
+          fe = fe + 12 + ns * 8
+          f = f + 1
+        end
+        extra = __ld(extra)
       end
       # a frame whose return address is outside our code belongs to the host: stop
       child = found == 0 ? 0 : parent

@@ -408,9 +408,12 @@ module Indus
         emit(:libm, [n.name, expr(args[0])])
       elsif n.name == :** then emit(:pow, [expr(n.receiver), expr(args[0])]) # ipow or libm pow, by type
       elsif n.name == :length && args.empty? && n.receiver then emit(:alen, [expr(n.receiver)])
-      elsif n.name == :push && n.receiver.is_a?(Prism::LocalVariableReadNode)
+      elsif n.name == :push && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode))
         a = expr(n.receiver); v = expr(args[0]); len = emit(:alen, [a])
-        @locals[n.receiver.name] = emit(:aset, [a, len, v])
+        r = emit(:aset, [a, len, v]) # may grow: rebind the home
+        if n.receiver.is_a?(Prism::LocalVariableReadNode) then @locals[lname(n.receiver.name)] = r
+        else emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
+        r
       elsif n.name == :[] # array / hash / string: Types decides
         emit(:idx, [expr(n.receiver), *args.map { expr(_1) }])
       elsif n.name == :[]=
