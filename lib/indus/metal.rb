@@ -23,7 +23,7 @@ module Indus
       mem = place(unit.code)
       heap = MMAP.call(nil, 1 << 28, 3, 0x1002, -1, 0)
       if GC.enabled?
-        size = (ENV["INDUS_HEAP_MB"] || 64).to_i << 20
+        size = GC.semispace_bytes
         from = heap.to_i + 4096
         to = MMAP.call(nil, size, 3, 0x1002, -1, 0).to_i
         bitmap = MMAP.call(nil, size / 128 + 4096, 3, 0x1002, -1, 0).to_i

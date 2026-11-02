@@ -1,7 +1,7 @@
 # SSA IR: values, blocks, functions.
 module Indus
   class Inst
-    attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack
+    attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home
     attr_reader :id
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
@@ -45,7 +45,7 @@ module Indus
   end
 
   class Func
-    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :rest
+    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :rest, :allocates
     def initialize(name, nparams)
       @name, @params, @blocks = name, Array.new(nparams) { Inst.new(:param) }, [Block.new(:entry)]
     end

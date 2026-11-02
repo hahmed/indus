@@ -41,6 +41,7 @@ module Indus
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     funcs.each { Peephole.run(_1) unless ENV["NOPEEP"] }
     Escape.run(funcs, lower.classes) unless ENV["NOESCAPE"]
+    GC.mark_allocators(funcs) if GC.enabled?
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]
     asm = Asm.new
     asm.gc_table = GC::Table.new(lower.classes)

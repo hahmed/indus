@@ -192,17 +192,37 @@ module Indus
     end
 
     # linux has no dyld to call main: _start calls main then exit(0)
-    def emit_start_linux
-      label(:_start)
-      # mmap(NULL, 256MB, PROT_READ|WRITE, MAP_PRIVATE|ANON, -1, 0) -> x0
+    # linux mmap(NULL, size, RW, PRIVATE|ANON, -1, 0) -> x0
+    def linux_mmap(size)
       emit 0xD2800000             # mov x0, #0
-      emit 0xD2A20001             # mov x1, #0x10000000
+      mov_imm(1, size)
       emit 0xD2800062             # mov x2, #3
       emit 0xD2800443             # mov x3, #0x22
       emit 0x92800004             # mov x4, #-1
       emit 0xD2800005             # mov x5, #0
       emit 0xD2801BC8             # mov x8, #222
       emit 0xD4000001             # svc #0
+    end
+
+    def emit_start_linux
+      label(:_start)
+      if GC.enabled?
+        semi = GC.semispace_bytes
+        linux_mmap(semi + 4096); mov(19, 0)                     # heap: globals page + from-space
+        linux_mmap(semi); mov(20, 0)                            # to-space
+        linux_mmap(semi / 128 + 4096); mov(21, 0)               # forwarding bitmap
+        linux_mmap(1 << 26); mov(22, 0)                         # worklist
+        addi(23, 19, 4096); str_off(23, 19, global(:__gc_from))
+        mov_imm(16, semi); add(24, 23, 16); str_off(24, 19, global(:__gc_from_end))
+        mov_imm(16, 1 << 20); sub(25, 24, 16); str_off(25, 19, global(:__gc_limit))
+        str_off(20, 19, global(:__gc_to))
+        add(16, 20, 16); mov_imm(17, semi); add(16, 20, 17); str_off(16, 19, global(:__gc_to_end))
+        str_off(21, 19, global(:__gc_bitmap))
+        str_off(22, 19, global(:__gc_work))
+        mov(0, 19)
+      else
+        linux_mmap(1 << 28)
+      end
       bl(:main)
       emit 0xD2800000; emit 0xD2800BA8; emit 0xD4000001            # mov x0,#0 ; mov x8,#93 ; svc #0
     end

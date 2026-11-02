@@ -19,9 +19,46 @@
 # slot keeps an object alive one collection longer, which is safe.
 module Indus
   module GC
-    def self.enabled? = !!ENV["INDUS_GC"]
+    # on by default; INDUS_NOGC=1 turns it off
+    def self.enabled? = !ENV["INDUS_NOGC"]
+    def self.semispace_bytes = (ENV["INDUS_HEAP_MB"] || 64).to_i << 20
 
     def self.pointer?(t) = Types.heap_pointer?(t)
+
+    # ops that bump the heap themselves (calls are decided by their callee)
+    DIRECT_ALLOC = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos].freeze
+
+    # Func#allocates: can running this function (transitively) allocate? A call
+    # to a function that cannot needs no safepoint. Patchable methods may be
+    # replaced by anything at run time, so they always count.
+    def self.mark_allocators(funcs)
+      funcs.each { |f| f.allocates = f.patchable || f.all.any? { |i| DIRECT_ALLOC.include?(i.op) } }
+      loop do
+        changed = false
+        funcs.each do |f|
+          next if f.allocates
+          f.all.each do |i|
+            callees = case i.op
+                      when :call then [i.args[0]]
+                      when :pcall then i.args[0].filter_map { |(_, kind, payload)| payload if kind == :call }
+                      when :sendsw then i.args[0].filter_map { |(_, kind, payload)| payload if kind == :call }
+                      else []
+                      end
+            if callees.any?(&:allocates) then f.allocates = true; changed = true; break end
+          end
+        end
+        break unless changed
+      end
+    end
+
+    def self.needs_safepoint?(i)
+      return true if DIRECT_ALLOC.include?(i.op)
+      case i.op
+      when :call then i.args[0].allocates
+      when :pcall, :sendsw then i.args[0].any? { |(_, kind, payload)| kind == :call && payload.allocates }
+      else false
+      end
+    end
 
     class Table
       attr_reader :types

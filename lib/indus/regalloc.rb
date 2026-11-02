@@ -22,9 +22,9 @@ module Indus
     FCALLEE = (8..15).to_a
     FCALLER = (16..29).to_a  # d30, d31 scratch
 
-    Interval = Struct.new(:v, :start, :stop, :crosses_call, :hint, :gc_slot)
+    Interval = Struct.new(:v, :start, :stop, :crosses_call, :hint, :gc_home, :gc_slot)
 
-    attr_reader :used, :fused, :nslots
+    attr_reader :used, :fused, :nslots, :safepoint_live
 
     def initialize(f) = @f = f
 
@@ -93,8 +93,25 @@ module Indus
       iv.each_value { |it| it.crosses_call = calls.any? { |c| c > it.start && c < it.stop } }
       # GC mode: a pointer that is live at a call -- including as that call's argument, since a
       # collection may run before the callee sees it -- must sit in a frame slot the collector can find
-      gc = GC.enabled?
-      iv.each_value { |it| it.gc_slot = gc && GC.pointer?(it.v.ty) && calls.any? { |c| c > it.start && c <= it.stop } }
+      # GC: a pointer live at a safepoint keeps its register but also gets a typed
+      # home slot; codegen stores it there right before the collection check and
+      # reloads after. Per-safepoint live sets tell codegen which ones.
+      @safepoint_live = {}
+      if GC.enabled?
+        sps = blocks.flat_map { |b| b.insts.select { GC.needs_safepoint?(_1) } }
+        crossings = Hash.new(0)
+        sps.each do |sp|
+          c = pos[sp]
+          live = iv.values.select { |it| GC.pointer?(it.v.ty) && c > it.start && c <= it.stop }
+          live.each { |it| crossings[it] += 1 }
+          @safepoint_live[sp] = live.map(&:v)
+        end
+        # a value that crosses more safepoints than it has uses is cheaper in its slot
+        # (one load per use) than in a register with a home (store+load per safepoint)
+        uses = Hash.new(0)
+        blocks.each { |b| (b.phis + b.insts).each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { uses[_1] += 1 if _1.is_a?(Inst) } } }
+        crossings.each { |it, n| n > uses[it.v] ? it.gc_slot = true : it.gc_home = true }
+      end
       # phi hints: phi <-> its args
       blocks.each do |b|
         b.phis.each do |p|
@@ -117,7 +134,8 @@ module Indus
       spill = ->(it) { it.v.slot = @nslots; @nslots += 1 }
 
       intervals.each do |it|
-        if it.gc_slot then spill.(it); next end
+        if it.gc_slot then spill.(it); next end                   # lives in its (typed) slot
+        if it.gc_home then it.v.home = @nslots; @nslots += 1 end # register + typed home slot for safepoints
         # expire
         active.reject! do |a|
           if a.stop < it.start

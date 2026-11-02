@@ -29,6 +29,7 @@ module Indus
       f.params.each_with_index { |p, k| p.ty = f.ptypes[k] || :int }
       ra = RegAlloc.new(f).run
       used, fused, nslots = ra.used.dup, ra.fused.dup, ra.nslots
+      @safepoint_live = ra.safepoint_live
 
       used |= [Asm::HEAP, Asm::GBASE] if f.name == :main
       used.sort!; fused.sort!
@@ -43,6 +44,7 @@ module Indus
       @asm.sub_sp(frame); @asm.stp(29, 30, 0); @asm.mov_fp_sp
       if GC.enabled? # pointer slots are roots: zero them, and describe this frame
         ptr_slots = (f.params + f.all).select { |i| i.slot && GC.pointer?(i.ty) }.map { |i| [slot_off(i), @asm.gc_table.tid(i.ty)] }
+        ptr_slots += (f.params + f.all).select { |i| i.home && GC.pointer?(i.ty) }.map { |i| [@spill_base + 8 * i.home, @asm.gc_table.tid(i.ty)] }
         ptr_slots.each { |(off, _)| @asm.str(31, off) }
         @asm.gc_frames << [f.name, :"#{f.name}_ret", ptr_slots]
       end
@@ -113,7 +115,8 @@ module Indus
       b.insts.each do |i|
         d = dst(i)
         calls_before = @asm.ncalls || 0
-        @asm.gc_safepoint if GC.enabled? && ALLOCATING.include?(i.op) && !@f.name.to_s.start_with?("__gc")
+        sp = GC.enabled? && GC.needs_safepoint?(i) && i.op != :aset && !@f.name.to_s.start_with?("__gc") # aset: on its grow path
+        safepoint(i) if sp
         case i.op
         when :const, :fconst then nil
         when :add, :sub, :mul, :div
@@ -265,7 +268,12 @@ module Indus
           @asm.ldur(TMP, 0, -8); @asm.cmp(1, TMP)
           slow = @asm.uniq; done = @asm.uniq
           @asm.bhs(slow); @asm.str_idx(2, 0, 1); @asm.b(done)
-          @asm.label(slow); @asm.bl(:__aset_slow)
+          @asm.label(slow)
+          if GC.enabled? && !@f.name.to_s.start_with?("__gc") # the store may grow the array: collect first if due
+            safepoint(i); @asm.mov(0, reg(a, 0)); @asm.mov(1, reg(ix, 1)) # reload: a may have moved
+            v.float? ? @asm.emit(0x9E660000 | (freg(v) << 5) | 2) : @asm.mov(2, reg(v, 2))
+          end
+          @asm.bl(:__aset_slow)
           @asm.label(done); @asm.mov(d, 0)
         when :cmp
           l, r = i.args
@@ -349,10 +357,23 @@ module Indus
         else raise "codegen: #{i.op}"
         end
         spill!(i)
+        reload_homes(i) if sp && i.call? # a collection inside the callee moved what our registers point at
         # the allocator trusted Inst#call?; make sure codegen agreed
         emitted = (@asm.ncalls || 0) > calls_before
         raise "#{i.op} emits a call but is not Inst#call? (register allocation would be unsafe)" if emitted && !i.call?
       end
+    end
+
+    # live pointers go to their typed home slots around the collection check
+    def safepoint(i)
+      live = (@safepoint_live[i] || []).select { |v| v.reg && v.home } # spilled ones are already in slots
+      live.each { |v| @asm.str(v.reg, @spill_base + 8 * v.home) }
+      @asm.gc_safepoint
+      reload_homes(i)
+    end
+
+    def reload_homes(i)
+      (@safepoint_live[i] || []).each { |v| @asm.ldr(v.reg, @spill_base + 8 * v.home) if v.reg && v.home && v != i }
     end
 
     def lbl(b) = :"#{@f.name}_#{b.name}"
