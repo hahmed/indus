@@ -122,6 +122,7 @@ module Indus
         latches = f.blocks.select { |b| b.succs.include?(h) && b != pre }
         next if latches.empty?
         body = loop_body(f, h, latches)
+        next unless body.keys.any? { |b| b.insts.any? { |i| GC::DIRECT_ALLOC.include?(i.op) || (i.op == :call && (i.args[0].allocates.nil? || i.args[0].allocates)) || %i[pcall sendsw].include?(i.op) } } # a reset is only worth it if the body allocates
         next unless region_safe?(f, h, body)
         # save the bump pointer before the loop, restore on every back edge
         save = Inst.new(:hsave); save.ty = :int; save.block = pre

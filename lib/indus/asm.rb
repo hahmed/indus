@@ -46,6 +46,13 @@ module Indus
       (label(:__gc_run); emit(0xD4200000)) unless @labels[:__gc_run] || GC.enabled?
     end
 
+    # a 64-bit literal in the data area, for pc-relative loads
+    def literal(v)
+      name = :"lit_#{v & 0xFFFFFFFFFFFFFFFF}"
+      @data << [name, [v & 0xFFFFFFFFFFFFFFFF].pack("Q")] unless @data.any? { _1[0] == name }
+      name
+    end
+
     # a string literal: [cap][len][bytes] in the data area; label at the bytes
     def str_data(name, str)
       @data << [name, [str.bytesize, str.bytesize].pack("QQ") + str, 16] unless @data.any? { _1[0] == name }
@@ -109,6 +116,28 @@ module Indus
     def ldr_lit(rt, n) = (fix(n, :b19); emit(0x58000000 | rt))        # ldr xt, label (pc-relative data)
     def fldr_lit(rt, n) = (fix(n, :b19); emit(0x5C000000 | rt))       # ldr dt, label
 
+
+    # division / modulo by a constant d >= 2 (Ruby floor semantics) without sdiv:
+    # multiply-high by a magic number, shift, truncate, then the floor fix.
+    # rd <- quotient (want == :div) or remainder (want == :mod). Scratch: x8, x9, x16, x17.
+    def divmod_const(rd, rn, d, want)
+      m, s = Magic.for(d)
+      ldr_lit(16, literal(m))                                      # one load from the pool (rn may be x8: a materialized constant)
+      emit(0x9B407C00 | (16 << 16) | (rn << 5) | 16)             # smulh x16, rn, x16
+      emit(0x8B000000 | (rn << 16) | (16 << 5) | 16) if m < 0      # add x16, x16, rn
+      emit(0x9340FC00 | (s << 16) | (16 << 5) | 16) if s > 0       # asr x16, x16, #s
+      emit(0x8B40FC00 | (rn << 16) | (16 << 5) | 16)               # add x16, x16, rn, lsr #63   (toward zero)
+      mov_imm(9, d)
+      emit(0x9B008000 | (9 << 16) | (rn << 10) | (16 << 5) | 17)   # msub x17, x16, x9, rn      r = rn - q*d
+      emit(0xF100023F)                                             # cmp x17, #0
+      emit(0xFA401800 | (rn << 5))                                 # ccmp rn, #0, #0, ne        r != 0 && rn < 0 -> lt
+      cset(8, :lt)                                                 # x8 = fix (0/1)
+      if want == :div
+        emit(0xCB080200 | rd)                                      # sub rd, x16, x8
+      else
+        emit(0x9B094500 | rd)                                      # madd rd, x8, x9, x17       r + fix*d
+      end
+    end
 
     # integer division, Ruby semantics (floor): q = a/b; if r != 0 && (r^b) < 0 then q -= 1
     def sdiv_floor(rd, rn, rm)

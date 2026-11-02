@@ -18,7 +18,7 @@
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir lower types passes peephole escape gc runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir lower types passes peephole escape gc magic runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # everything a compiled program knows about itself: enough for the
@@ -40,8 +40,8 @@ module Indus
     Types.run(funcs, lower.classes, lower)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     funcs.each { Peephole.run(_1) unless ENV["NOPEEP"] }
+    GC.mark_allocators(funcs)
     Escape.run(funcs, lower.classes) unless ENV["NOESCAPE"]
-    GC.mark_allocators(funcs) if GC.enabled?
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]
     asm = Asm.new
     asm.gc_table = GC::Table.new(lower.classes)
