@@ -189,7 +189,10 @@ module Indus
           @asm.ldur(16, ra, -8); @asm.cmp(ri, 16)      # x16: len (x8/x9 may hold ra/ri)
           skip = @asm.uniq
           if i.float? then @asm.fmov_imm(d, 0.0); @asm.bhs(skip); @asm.fldr_idx(d, ra, ri)
-          else @asm.mov_imm(d, 0); @asm.bhs(skip); @asm.ldr_idx(d, ra, ri) end
+          else
+            i.ty == :int? ? @asm.emit(0xD2F00000 | d) : @asm.mov_imm(d, 0) # nil: sentinel for ints, null for pointers
+            @asm.bhs(skip); @asm.ldr_idx(d, ra, ri)
+          end
           @asm.label(skip)
         when :aset # in range: store; else slow path (fill / grow) which returns the handle
           a, ix, v = i.args
@@ -237,7 +240,15 @@ module Indus
           kind = kt == :str ? "s" : "i"
           i.args[1..].each_with_index { |v, n| @asm.mov(n + 1, reg(v, n + 1)) }
           @asm.mov(0, reg(i.args[0], 0))
-          @asm.bl(:"rt_hash#{kind}_#{i.op.to_s.sub('h', '')}"); @asm.mov(d, 0)
+          op = i.op.to_s.sub("h", ""); op = "geti" if i.op == :hget && i.ty == :int? # int values: miss -> sentinel
+          @asm.bl(:"rt_hash#{kind}_#{op}"); @asm.mov(d, 0)
+        when :puts_nil then @asm.str_data(:__nl, ""); @asm.adr(0, :__nl); @asm.bl(:rt_puts_str)
+        when :puts_opt # nullable int: blank line for nil
+          @asm.str_data(:__nl, "")
+          nl = @asm.uniq; dn = @asm.uniq
+          r = reg(i.args[0]); @asm.emit(0xD2F00000 | 16); @asm.cmp(r, 16); @asm.bcond(:eq, nl)
+          @asm.mov(0, r); @asm.bl(:__puts_i); @asm.b(dn)
+          @asm.label(nl); @asm.adr(0, :__nl); @asm.bl(:rt_puts_str); @asm.label(dn)
         when :hkeys then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_hash_keys); @asm.mov(d, 0)
         when :ssub
           @asm.mov(1, reg(i.args[1], 1)); @asm.mov(2, reg(i.args[2], 2)); @asm.mov(0, reg(i.args[0], 0))
@@ -295,7 +306,7 @@ module Indus
       end
       sreg = case s
              when Integer then s
-             when Inst then @asm.mov_imm(TMP, s.args[0]); TMP
+             when Inst then raise "phi source #{s} (#{s.op}, ty #{s.ty.inspect}) has no location in #{@f.name}" unless s.op == :const; @asm.mov_imm(TMP, s.args[0]); TMP
              else @asm.ldr(TMP, @spill_base + 8 * s[1]); TMP
              end
       d.is_a?(Integer) ? @asm.mov(d, sreg) : @asm.str(sreg, @spill_base + 8 * d[1])

@@ -28,6 +28,7 @@ module Indus
     def movn(rd, imm) = emit(0x92800000 | ((imm & 0xFFFF) << 5) | rd)
     def mov_imm(rd, v)
       if v < 0 && v >= -0x10000 then movn(rd, ~v)
+      elsif v == -(1 << 63) then emit(0xD2F00000 | rd) # movz rd, #0x8000, lsl #48
       else
         u = v & 0xFFFFFFFFFFFFFFFF
         movz(rd, u & 0xFFFF)

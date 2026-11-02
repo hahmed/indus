@@ -5,8 +5,13 @@ module Indus
     def self.trivial_phis(f)
       loop do
         changed = false
+        used = {}
+        f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { used[_1] = true if _1.is_a?(Inst) } }
         f.blocks.each do |b|
           b.phis.dup.each do |p|
+            unless used[p] # dead phi (e.g. the value of an if whose arms are statements)
+              b.phis.delete(p); changed = true; next
+            end
             others = p.args.map(&:last).reject { _1 == p }.uniq
             next unless others.size == 1
             f.replace_uses(p, others[0]); b.phis.delete(p); changed = true

@@ -6,10 +6,17 @@
 # class is known.
 module Indus
   module Types
+    INT_NIL = -(1 << 63) # the nil of a nullable integer (:int?)
+    def self.nullable(t) = t == :int ? :int? : t   # a read that may miss
+    def self.narrow(t) = t == :int? ? :int : t     # used as a number: nil would have raised
     def self.join(a, b)
-      return b if a.nil? || a == :nil
-      return a if b.nil? || b == :nil || a == b
+      return b if a.nil?
+      return a if b.nil? || a == b
+      return :int? if (a == :int && b == :nil) || (a == :nil && b == :int) || [a, b].sort_by(&:to_s) == %i[int int?]
+      return b if a == :nil
+      return a if b == :nil
       return :float if (a == :int && b == :float) || (a == :float && b == :int)
+      return :int? if (a == :int? && b == :nil) || (a == :nil && b == :int?)
       return [:arr, join(a[1], b[1])] if arr(a) && arr(b)
       return [:hash, join(a[1], b[1]), join(a[2], b[2])] if hsh(a) && hsh(b)
       # two classes meet: a closed poly set (whole program, so it is finite)
@@ -93,9 +100,13 @@ module Indus
       f.all.each do |i|
         case i.op
         when :add then i.op = :scat if of(f, i.args[0]) == :str
-        when :cmp then (i.op = :seq; i.cond = nil) if of(f, i.args[0]) == :str && i.cond == :eq
+        when :cmp
+          l, r = i.args
+          (i.op = :seq; i.cond = nil) if of(f, l) == :str && of(f, r) == :str && i.cond == :eq # nil stays a pointer compare
+          if of(f, l) == :int? && of(f, r) == :nil then r.args[0] = INT_NIL; r.ty = :int
+          elsif of(f, r) == :int? && of(f, l) == :nil then l.args[0] = INT_NIL; l.ty = :int end
         when :to_s then i.op = of(f, i.args[0]) == :str ? :nop : :itos
-        when :puts_v then i.op = { str: :puts_str, bool: :puts_bool }.fetch(of(f, i.args[0]), :puts_i)
+        when :puts_v then i.op = { str: :puts_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil }.fetch(of(f, i.args[0]), :puts_i)
         when :lshift_or_append then i.op = of(f, i.args[0]) == :int ? :shl : :sappend
         end
       end
@@ -156,23 +167,23 @@ module Indus
       when :fconst then :float
       when :sconst, :scat, :sappend, :itos then :str
       when :seq then :bool
-      when :puts_i, :puts_str, :puts_bool then :int
+      when :puts_i, :puts_str, :puts_bool, :puts_opt, :puts_nil then :int
       when :lshift_or_append then (t = of(f, a[0])) && (t == :int ? :int : t)
-      when :to_s then (t = of(f, a[0])) && (t == :str ? :str : t == :int ? :str : nil)
+      when :to_s then (t = of(f, a[0])) && (t == :str ? :str : narrow(t) == :int ? :str : nil)
       when :puts_v then of(f, a[0]) && :int
-      when :add, :sub, :mul, :div then join(of(f, a[0]), of(f, a[1]))
+      when :add, :sub, :mul, :div then join(narrow(of(f, a[0])), narrow(of(f, a[1])))
       when :and, :or, :xor, :shl, :shr, :mod, :to_i, :alen, :ipow then :int
       when :cmp then :bool
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :to_f, :fsqrt then :float
       when :anew then (t = of(f, a[1])) && t != :nil ? [:arr, t] : [:arr, nil] # partial until a store
       when :hnew then [:hash, nil, nil]
-      when :hget then (t = of(f, a[0])) && hsh(t) ? t[2] : nil
+      when :hget then (t = of(f, a[0])) && hsh(t) ? nullable(t[2]) : nil
       when :hset then of(f, a[0])
       when :hkey then :bool
       when :hkeys then (t = of(f, a[0])) && hsh(t) ? [:arr, t[1]] : nil
       when :ssub then :str
-      when :aget then (t = of(f, a[0])) && arr(t) ? t[1] : nil
+      when :aget then (t = of(f, a[0])) && arr(t) ? nullable(t[1]) : nil
       when :aset then of(f, a[0])
       when :phi then a.map { of(f, _2) }.reduce(nil) { join(_1, _2) }
       when :call then a[0].rtype

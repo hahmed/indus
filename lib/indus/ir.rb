@@ -6,7 +6,7 @@ module Indus
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
     def term? = %i[br condbr ret].include?(op)
-    def call? = %i[call mcall pcall puts_i puts_s puts_str puts_bool putc anew aset onew ipow seam sconst scat sappend seq itos hnew hget hset hkey hkeys ssub].include?(op)
+    def call? = %i[call mcall pcall puts_i puts_s puts_str puts_bool puts_opt puts_nil putc anew aset onew ipow seam sconst scat sappend seq itos hnew hget hset hkey hkeys ssub].include?(op)
     def float? = ty == :float
     def to_s = "v#{id}"
   end

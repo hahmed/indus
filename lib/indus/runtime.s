@@ -287,6 +287,29 @@ rt_hashs_get:
 0:      mov     x0, #0
         ldp     x29, x30, [sp], #16
         ret
+// integer-valued hashes: a miss is the int-nil sentinel INT64_MIN
+rt_hashs_geti:
+        stp     x29, x30, [sp, #-16]!
+        bl      rt_hashs_find
+        ldr     x1, [x0]
+        cbz     x1, 0f
+        ldr     x0, [x0, #8]
+        ldp     x29, x30, [sp], #16
+        ret
+0:      movz    x0, #0x8000, lsl #48
+        ldp     x29, x30, [sp], #16
+        ret
+rt_hashi_geti:
+        stp     x29, x30, [sp, #-16]!
+        bl      rt_hashi_find
+        ldr     x1, [x0]
+        cbz     x1, 0f
+        ldr     x0, [x0, #8]
+        ldp     x29, x30, [sp], #16
+        ret
+0:      movz    x0, #0x8000, lsl #48
+        ldp     x29, x30, [sp], #16
+        ret
 rt_hashs_key:
         stp     x29, x30, [sp, #-16]!
         bl      rt_hashs_find
