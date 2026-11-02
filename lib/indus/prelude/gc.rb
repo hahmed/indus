@@ -23,6 +23,12 @@ def __gc_run(fp)
   bitmap = __ld(g + 48)
   tables = __adr_tables
   text = __adr_text
+  # the pair must match: after a growth the other space is still the old size
+  if __ld(g + 40) - to < from_end - from
+    to = __mmap(from_end - from)
+    __st(g + 32, to)
+    __st(g + 40, to + (from_end - from))
+  end
 
   # clear the forwarding bitmap: one bit per 16 bytes of from-space
   nbytes = (from_end - from) / 128 + 8
@@ -177,9 +183,15 @@ def __gc_forward(slot, tid, from, from_end, free, wtop, bitmap, types)
     return 0
   end
   if p < from || p >= from_end
-    # outside from-space (a stack object): scan in place, do not move
     __st(g + 72, free)
     __st(g + 80, wtop)
+    if p >= __ld(g + 32) && p < __ld(g + 40)
+      # a pointer into to-space can only be stale: a dead slot still holding
+      # an address from two collections ago. Clear it, never follow it.
+      __st(slot, 0)
+      return 0
+    end
+    # outside both spaces: a stack object or a large object. Scan in place.
     __gc_scan(p, tid, from, from_end, bitmap, types)
     return 0
   end

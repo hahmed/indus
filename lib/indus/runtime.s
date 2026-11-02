@@ -17,12 +17,24 @@ rt_memcpy:
 1:      ret
 
 // rt_alloc(x0 bytes) -> x0 handle; 16-byte header before it, 16-aligned bump.
+// If it does not fit in the current space ([x27+24] = from_end), it gets its
+// own mapping: a large object the collector scans in place and never moves.
 rt_alloc:
         add     x1, x28, #16
-        add     x28, x1, x0
-        add     x28, x28, #15
-        and     x28, x28, #0xfffffffffffffff0
+        add     x2, x1, x0
+        add     x2, x2, #15
+        and     x2, x2, #0xfffffffffffffff0
+        ldr     x3, [x27, #24]
+        cmp     x2, x3
+        b.hi    1f
+        mov     x28, x2
         mov     x0, x1
+        ret
+1:      stp     x29, x30, [sp, #-16]!
+        add     x0, x0, #32
+        bl      rt_mmap
+        add     x0, x0, #16
+        ldp     x29, x30, [sp], #16
         ret
 
 // rt_str_new(x0 src, x1 len) -> handle (copy)
@@ -528,19 +540,24 @@ __putc:
 
 // __anew(x0 len, x1 fill) -> handle; cap = len
 __anew:
-        add     x2, x28, #16
-        stur    x0, [x2, #-16]
-        stur    x0, [x2, #-8]
-        add     x28, x2, x0, lsl #3
-        add     x28, x28, #15
-        and     x28, x28, #0xfffffffffffffff0
+        stp     x29, x30, [sp, #-32]!
+        stp     x19, x20, [sp, #16]
+        mov     x19, x0
+        mov     x20, x1
+        lsl     x0, x0, #3
+        bl      rt_alloc
+        mov     x2, x0
+        stur    x19, [x2, #-16]
+        stur    x19, [x2, #-8]
         mov     x3, #0
-0:      cmp     x3, x0
+0:      cmp     x3, x19
         b.hs    1f
-        str     x1, [x2, x3, lsl #3]
+        str     x20, [x2, x3, lsl #3]
         add     x3, x3, #1
         b       0b
 1:      mov     x0, x2
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #32
         ret
 
 // __aset_slow(x0 handle, x1 i >= len, x2 v) -> handle (grown if needed)
@@ -562,12 +579,29 @@ __aset_slow:
         add     x6, x1, #1
         cmp     x5, x6
         csel    x5, x5, x6, hi
-        add     x7, x28, #16
+        stp     x29, x30, [sp, #-64]!
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        stp     x23, x24, [sp, #48]
+        mov     x19, x0
+        mov     x20, x1
+        mov     x21, x2
+        mov     x22, x4
+        mov     x23, x5
+        lsl     x0, x5, #3
+        bl      rt_alloc
+        mov     x7, x0
+        mov     x0, x19
+        mov     x1, x20
+        mov     x2, x21
+        mov     x4, x22
+        mov     x5, x23
+        ldp     x23, x24, [sp, #48]
+        ldp     x21, x22, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #64
         stur    x5, [x7, #-16]
         stur    x4, [x7, #-8]
-        add     x28, x7, x5, lsl #3
-        add     x28, x28, #15
-        and     x28, x28, #0xfffffffffffffff0
         mov     x6, #0
 3:      cmp     x6, x4
         b.hs    4f
@@ -578,18 +612,23 @@ __aset_slow:
 4:      mov     x0, x7
         b       0b
 
-// __onew(x0 bytes) -> zeroed block
+// __onew(x0 bytes) -> zeroed block (no header: the handle is the block)
 __onew:
-        mov     x1, x28
-        add     x28, x28, x0
-        add     x28, x28, #15
-        and     x28, x28, #0xfffffffffffffff0
+        stp     x29, x30, [sp, #-32]!
+        str     x19, [sp, #16]
+        mov     x19, x0
+        sub     x0, x0, #16             // rt_alloc adds a 16-byte header; objects have none,
+        bl      rt_alloc                // so ask for 16 less and use the header as the block
+        sub     x1, x0, #16
         mov     x2, x1
-0:      cmp     x2, x28
+        add     x3, x1, x19
+0:      cmp     x2, x3
         b.hs    1f
         str     xzr, [x2], #8
         b       0b
 1:      mov     x0, x1
+        ldr     x19, [sp, #16]
+        ldp     x29, x30, [sp], #32
         ret
 
 // __ipow(x0 base, x1 exp) -> base ** exp

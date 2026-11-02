@@ -1,6 +1,7 @@
 # Indus: Ruby -> SSA -> arm64. No C, no LLVM, no assembler, no linker.
 #
 #   lib/indus/ir.rb       SSA values, blocks, functions, classes
+#   lib/indus/pretype.rb  coarse kinds over the AST, before lowering (receiver kinds for blocks/send)
 #   lib/indus/lower.rb    Prism AST -> SSA
 #   lib/indus/types.rb    type inference (int/float/arrays/classes/poly), conversions
 #   lib/indus/passes.rb   SSA passes (trivial phis, return sinking, accumulator loops)
@@ -18,7 +19,7 @@
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir lower types passes peephole escape gc magic runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir pretype lower types passes peephole escape gc magic runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # everything a compiled program knows about itself: enough for the

@@ -262,7 +262,9 @@ module Indus
         str_off(22, 19, global(:__gc_work))
         mov(0, 19)
       else
-        linux_mmap(1 << 28)
+        linux_mmap(1 << 28); mov(19, 0)
+        mov_imm(16, 1 << 28); add(16, 19, 16); str_off(16, 19, global(:__gc_from_end)) # rt_alloc's bound
+        mov(0, 19)
       end
       bl(:main)
       emit 0xD2800000; emit 0xD2800BA8; emit 0xD4000001            # mov x0,#0 ; mov x8,#93 ; svc #0

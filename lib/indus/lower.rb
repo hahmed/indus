@@ -51,6 +51,7 @@ module Indus
           end
         end
       end
+      @pre = Pretype.new(@ast, @classes) # receiver kinds for the structural decisions below
       main = Func.new(:main, 0)
       lower_body(main, [], top)
       defs.each { |d| lower_body(@funcs[d.name], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []), d.body&.body || []) if @funcs[d.name] }
@@ -158,6 +159,16 @@ module Indus
     # builtin iterator and a user yield-method at lowering time:
     # :array, :range, :int, :str, a class name, or nil (unknown)
     def kind_of(n)
+      if @pre && (k = @pre[n])
+        return :array if k.is_a?(Array) && k[0] == :array
+        return :range if k == [:range]
+        return k if k.is_a?(Symbol) && (@classes[k] || %i[int str].include?(k))
+      end
+      syntactic_kind(n)
+    end
+
+    # the old guess, kept as a fallback for nodes the pre-typing has no answer for
+    def syntactic_kind(n)
       case n
       when Prism::ArrayNode then :array
       when Prism::RangeNode then :range
