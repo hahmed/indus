@@ -13,7 +13,7 @@
 # fresh this iteration (Node.new(l, r) -> initialize writes @left) are fine.
 module Indus
   module Escape
-    def self.heap?(t) = t.is_a?(Symbol) && !%i[int float nil].include?(t) || (t.is_a?(Array) && %i[arr poly].include?(t[0])) # :str and classes are heap
+    def self.heap?(t) = t.is_a?(Symbol) && !%i[int float nil].include?(t) || (t.is_a?(Array) && %i[arr poly hash].include?(t[0])) # :str and classes are heap
     def self.ty(f, v) = v.op == :param ? f.ptypes[f.params.index(v)] : v.ty
 
     def self.run(funcs, classes)
@@ -45,6 +45,7 @@ module Indus
         case i.op
         when :fld_set then mark.(i.args[2])
         when :aset then mark.(i.args[2])
+        when :hset then mark.(i.args[1]); mark.(i.args[2])
         when :gset then mark.(i.args[1])
         when :ret then mark.(i.args[0])
         when :call
@@ -75,7 +76,7 @@ module Indus
 
     # a store into memory this function allocated itself keeps nothing alive
     # beyond what the allocation already does
-    def self.fresh_here?(v) = v.is_a?(Inst) && %i[onew anew].include?(v.op)
+    def self.fresh_here?(v) = v.is_a?(Inst) && %i[onew anew hnew].include?(v.op)
 
     def self.store_summary(f)
       sp = Array.new(f.params.size, false); so = false
@@ -85,9 +86,9 @@ module Indus
         when :fld_set
           o, _, v = i.args
           into.(o) if heap?(ty(f, v))
-        when :aset
-          a, _, v = i.args
-          into.(a) if heap?(ty(f, v))
+        when :aset, :hset
+          a, k, v = i.args
+          into.(a) if heap?(ty(f, v)) || (i.op == :hset && heap?(ty(f, k)))
         when :gset then so = true if heap?(ty(f, i.args[1]))
         when :call
           callee, *args = i.args
@@ -138,9 +139,10 @@ module Indus
       body.each_key do |b|
         b.insts.each do |i|
           case i.op
-          when :fld_set, :aset
-            o, _, v = i.args
+          when :fld_set, :aset, :hset
+            o, k, v = i.args
             return false if heap?(ty(f, v)) && !fresh[o]      # heap value into pre-existing memory
+            return false if i.op == :hset && heap?(ty(f, k)) && !fresh[o]
           when :gset then return false if heap?(ty(f, i.args[1]))
           when :ret then return false if heap?(ty(f, i.args[0]))
           when :call

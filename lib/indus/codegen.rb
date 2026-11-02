@@ -231,6 +231,17 @@ module Indus
         when :seq then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_eq); @asm.mov(d, 0)
         when :itos then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_itos); @asm.mov(d, 0)
         when :puts_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_puts_str)
+        when :hnew then @asm.mov_imm(0, 8); @asm.bl(:rt_hash_new); @asm.mov(d, 0)
+        when :hget, :hkey, :hset
+          kt = i.args[0].ty&.[](1) or raise "hash #{i.args[0]} has no key type in #{@f.name}"
+          kind = kt == :str ? "s" : "i"
+          i.args[1..].each_with_index { |v, n| @asm.mov(n + 1, reg(v, n + 1)) }
+          @asm.mov(0, reg(i.args[0], 0))
+          @asm.bl(:"rt_hash#{kind}_#{i.op.to_s.sub('h', '')}"); @asm.mov(d, 0)
+        when :hkeys then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_hash_keys); @asm.mov(d, 0)
+        when :ssub
+          @asm.mov(1, reg(i.args[1], 1)); @asm.mov(2, reg(i.args[2], 2)); @asm.mov(0, reg(i.args[0], 0))
+          @asm.bl(:rt_str_sub); @asm.mov(d, 0)
         when :puts_bool
           @asm.str_data(:__true, "true"); @asm.str_data(:__false, "false")
           f_ = @asm.uniq; dn = @asm.uniq

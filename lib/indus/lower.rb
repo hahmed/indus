@@ -89,9 +89,17 @@ module Indus
       when Prism::NilNode then (c = const(0); c.ty = :nil; c)
       when Prism::SelfNode then @locals.fetch(:self)
       when Prism::ArrayNode
-        raise "array literal with elements" unless n.elements.empty?
-        fill = const(0); fill.ty = :nil # element type comes from the first push
-        @cur << Inst.new(:anew, [const(0), fill])
+        fill = const(0); fill.ty = :nil # element type comes from the first store
+        a = @cur << Inst.new(:anew, [const(n.elements.size), fill])
+        n.elements.each_with_index { |e, k| a = @cur << Inst.new(:aset, [a, const(k), expr(e)]) }
+        a
+      when Prism::HashNode
+        h = @cur << Inst.new(:hnew, [])
+        n.elements.each do |el|
+          raise "unsupported hash element #{el.class}" unless el.is_a?(Prism::AssocNode)
+          h = @cur << Inst.new(:hset, [h, expr(el.key), expr(el.value)])
+        end
+        h
       when Prism::InstanceVariableReadNode then @cur << Inst.new(:fld_get, [@locals.fetch(:self), @klass.ivar(n.name)])
       when Prism::InstanceVariableWriteNode
         v = expr(n.value); @cur << Inst.new(:fld_set, [@locals.fetch(:self), @klass.ivar(n.name), v]); v
@@ -217,14 +225,18 @@ module Indus
       elsif n.name == :push && n.receiver.is_a?(Prism::LocalVariableReadNode)
         a = expr(n.receiver); v = expr(args[0]); len = @cur << Inst.new(:alen, [a])
         @locals[n.receiver.name] = @cur << Inst.new(:aset, [a, len, v])
-      elsif n.name == :[]
-        @cur << Inst.new(:aget, [expr(n.receiver), expr(args[0])])
+      elsif n.name == :[] # array / hash / string: Types decides
+        @cur << Inst.new(:idx, [expr(n.receiver), *args.map { expr(_1) }])
       elsif n.name == :[]=
-        # a[i] = v may grow a: the result is the (possibly new) array, rebound to the local
+        # a[i] = v may grow a: the result is the (possibly new) container, rebound to the local
         raise "[]= on non-local receiver" unless n.receiver.is_a?(Prism::LocalVariableReadNode)
         a = expr(n.receiver); i = expr(args[0]); v = expr(args[1])
-        @locals[n.receiver.name] = @cur << Inst.new(:aset, [a, i, v])
+        @locals[n.receiver.name] = @cur << Inst.new(:idx_set, [a, i, v])
         v
+      elsif (n.name == :key? || n.name == :has_key?) && args.size == 1 && n.receiver
+        @cur << Inst.new(:hkey, [expr(n.receiver), expr(args[0])])
+      elsif n.name == :keys && args.empty? && n.receiver
+        @cur << Inst.new(:hkeys, [expr(n.receiver)])
       elsif n.receiver && !n.receiver.is_a?(Prism::ConstantReadNode)
         # a method call on an object: resolved by Types once the receiver's class is known
         @cur << Inst.new(:mcall, [n.name, expr(n.receiver), *args.map { expr(_1) }])

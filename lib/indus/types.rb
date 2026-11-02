@@ -11,6 +11,7 @@ module Indus
       return a if b.nil? || b == :nil || a == b
       return :float if (a == :int && b == :float) || (a == :float && b == :int)
       return [:arr, join(a[1], b[1])] if arr(a) && arr(b)
+      return [:hash, join(a[1], b[1]), join(a[2], b[2])] if hsh(a) && hsh(b)
       # two classes meet: a closed poly set (whole program, so it is finite)
       ca, cb = classes_of(a), classes_of(b)
       return [:poly, (ca | cb).sort] if ca && cb
@@ -23,6 +24,7 @@ module Indus
     def self.poly?(t) = t.is_a?(Array) && t[0] == :poly
     def self.of(f, v) = v.op == :param ? f.ptypes[f.params.index(v)] : v.ty
     def self.arr(t) = t.is_a?(Array) && t[0] == :arr
+    def self.hsh(t) = t.is_a?(Array) && t[0] == :hash
 
     def self.run(funcs, classes)
       @classes = classes
@@ -35,6 +37,7 @@ module Indus
         funcs.each do |f|
           f.all.each do |i|
             bind(f, i) if i.op == :mcall
+            index(f, i) if i.op == :idx || i.op == :idx_set
             t = infer(f, i)
             set.(i.ty, t) { i.ty = _1 }
             case i.op
@@ -58,6 +61,15 @@ module Indus
               cur = of(f, a)
               if of(f, v) && (cur.nil? || (arr(cur) && join(cur, nt) != cur))
                 a.op == :param ? f.ptypes[f.params.index(a)] = join(cur, nt) : a.ty = join(cur, nt); changed = true
+              end
+            when :hset
+              h, k, v = i.args
+              kt, vt = of(f, k), of(f, v)
+              if kt && vt && vt != :nil
+                nt = [:hash, kt, vt]; cur = of(f, h)
+                if cur.nil? || join(cur, nt) != cur
+                  h.op == :param ? f.ptypes[f.params.index(h)] = join(cur, nt) : h.ty = join(cur, nt); changed = true
+                end
               end
             when :fld_set
               o, ix, v = i.args; k = of(f, o)
@@ -107,6 +119,18 @@ module Indus
       end
     end
 
+    # [] / []= once the receiver's type is known
+    def self.index(f, i)
+      r = i.args[0]
+      t = of(f, r)
+      t ||= { hnew: [:hash, nil, nil], anew: [:arr, nil] }[r.op] if r.is_a?(Inst) # empty literal, nothing stored yet
+      return unless t
+      if arr(t) then i.op = i.op == :idx ? :aget : :aset
+      elsif hsh(t) then i.op = i.op == :idx ? :hget : :hset
+      elsif t == :str && i.op == :idx then i.op = :ssub; i.args << (c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); c) if i.args.size == 2
+      else raise "[] on #{t.inspect}" end
+    end
+
     def self.resolve(klass, name, nargs)
       if (iv = klass.find_reader(name)) && nargs == 0 then [:fld_get, klass.ivar(iv)]
       elsif (iv = klass.find_writer(name)) && nargs == 1 then [:fld_set, klass.ivar(iv)]
@@ -141,7 +165,13 @@ module Indus
       when :cmp then :bool
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :to_f, :fsqrt then :float
-      when :anew then (t = of(f, a[1])) && t != :nil ? [:arr, t] : nil
+      when :anew then (t = of(f, a[1])) && t != :nil ? [:arr, t] : [:arr, nil] # partial until a store
+      when :hnew then [:hash, nil, nil]
+      when :hget then (t = of(f, a[0])) && hsh(t) ? t[2] : nil
+      when :hset then of(f, a[0])
+      when :hkey then :bool
+      when :hkeys then (t = of(f, a[0])) && hsh(t) ? [:arr, t[1]] : nil
+      when :ssub then :str
       when :aget then (t = of(f, a[0])) && arr(t) ? t[1] : nil
       when :aset then of(f, a[0])
       when :phi then a.map { of(f, _2) }.reduce(nil) { join(_1, _2) }
