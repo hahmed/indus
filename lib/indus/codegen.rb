@@ -114,6 +114,19 @@ module Indus
           else @asm.send(i.op, d, reg(l), reg(r, 9)) end
         when :itof then @asm.scvtf(d, reg(i.args[0]))
         when :fsqrt then @asm.fsqrt(d, freg(i.args[0]))
+        when :libm, :fpow # in-process: call libm by absolute address (d0[, d1] -> d0)
+          @asm.libm or raise "Math.#{i.op == :fpow ? 'pow' : i.args[0]} needs libm; not available in a standalone binary yet"
+          name, *fa = i.op == :fpow ? [:pow, *i.args] : i.args
+          fa.each_with_index { |v, n| @asm.fmov(n, freg(v, n)) }
+          @asm.mov_imm(16, @asm.libm.fetch(name)); @asm.blr(16); @asm.fmov(d, 0)
+        when :seq_char # s[i] == "c" without allocating: bounds check, byte load, compare
+          s_, ix, byte = i.args
+          rs = reg(s_); ri = reg(ix, 9)
+          @asm.ldur(16, rs, -8); @asm.cmp(ri, 16)
+          no = @asm.uniq; dn = @asm.uniq
+          @asm.bhs(no)
+          @asm.ldrb_idx(16, rs, ri); @asm.cmpi(16, byte); @asm.cset(d, :eq); @asm.b(dn)
+          @asm.label(no); @asm.mov_imm(d, 0); @asm.label(dn)
         when :alen then @asm.ldur(d, reg(i.args[0]), -8)
         when :onew
           k = i.args[0]

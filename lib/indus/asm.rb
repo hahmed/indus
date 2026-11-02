@@ -246,6 +246,8 @@ module Indus
     # --- the whole "runtime": puts for an Integer, via write(2) --------------
     # x0 = value. Builds decimal + "\n" in a 32-byte stack buffer, calls write.
     attr_accessor :write_addr # nil => bl __write (syscall stub)
+    attr_accessor :libm       # name -> address, in-process only
+    def ldrb_idx(rt, rn, rm) = emit(0x38606800 | (rm << 16) | (rn << 5) | rt) # ldrb wt, [xn, xm]
     def call_write = write_addr ? (mov_imm(16, write_addr); blr(16)) : bl(:__write)
 
     # raw syscalls for a standalone binary.

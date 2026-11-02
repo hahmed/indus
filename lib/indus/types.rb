@@ -175,7 +175,9 @@ module Indus
       when :and, :or, :xor, :shl, :shr, :mod, :to_i, :alen, :ipow then :int
       when :cmp then :bool
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
-      when :to_f, :fsqrt then :float
+      when :to_f, :fsqrt, :libm then :float
+      when :pow then join(narrow(of(f, a[0])), narrow(of(f, a[1]))) == :float ? :float : :int
+      when :seq_char then :bool
       when :anew then (t = of(f, a[1])) && t != :nil ? [:arr, t] : [:arr, nil] # partial until a store
       when :hnew then [:hash, nil, nil]
       when :hget then (t = of(f, a[0])) && hsh(t) ? nullable(t[2]) : nil
@@ -216,6 +218,11 @@ module Indus
             i.args.map! { |v| of(f, v) == :int ? cvt.(b, i, v) : v }
             i.cond = :"f#{i.cond}" if i.op == :cmp
           when :fsqrt then i.args[0] = cvt.(b, i, i.args[0]) if of(f, i.args[0]) == :int
+          when :libm then i.args[1] = cvt.(b, i, i.args[1]) if of(f, i.args[1]) == :int
+          when :pow
+            if i.ty == :float
+              i.args.map! { |v| of(f, v) == :int ? cvt.(b, i, v) : v }; i.op = :fpow
+            else i.op = :ipow end
           when :aset
             a, _, v = i.args
             i.args[2] = cvt.(b, i, v) if arr(of(f, a)) && of(f, a)[1] == :float && of(f, v) == :int

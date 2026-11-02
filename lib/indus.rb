@@ -4,6 +4,7 @@
 #   lib/indus/lower.rb    Prism AST -> SSA
 #   lib/indus/types.rb    type inference (int/float/arrays/classes/poly), conversions
 #   lib/indus/passes.rb   SSA passes (trivial phis, return sinking, accumulator loops)
+#   lib/indus/peephole.rb string peepholes (byte compare, in-place append)
 #   lib/indus/escape.rb   escape analysis -> stack objects, loop regions
 #   lib/indus/runtime.s   runtime routines in assembly -> runtime_blob.rb (tools/build_runtime.sh)
 #   lib/indus/asm.rb      arm64 encoder + the older hand-encoded routines
@@ -17,7 +18,7 @@
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir lower types passes escape runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir lower types passes peephole escape runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # everything a compiled program knows about itself: enough for the
@@ -34,10 +35,12 @@ module Indus
     funcs = lower.run
     Types.run(funcs, lower.classes)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
+    funcs.each { Peephole.run(_1) unless ENV["NOPEEP"] }
     Escape.run(funcs, lower.classes) unless ENV["NOESCAPE"]
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]
     asm = Asm.new
     asm.write_addr = Metal::LIBC["write"].to_i unless standalone
+    asm.libm = %i[sin cos pow].to_h { [_1, Metal::LIBC[_1.to_s].to_i] } unless standalone
     asm.emit_start_linux if standalone == :linux
     funcs.each { Codegen.new(asm, lower.classes).func(_1) }
     asm.emit_puts_i

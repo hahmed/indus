@@ -220,7 +220,9 @@ module Indus
         @cur << Inst.new(:seam, [k, src.unescaped])
       elsif n.name == :sqrt && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
         @cur << Inst.new(:fsqrt, [expr(args[0])])
-      elsif n.name == :** then @cur << Inst.new(:ipow, [expr(n.receiver), expr(args[0])])
+      elsif %i[sin cos].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
+        @cur << Inst.new(:libm, [n.name, expr(args[0])])
+      elsif n.name == :** then @cur << Inst.new(:pow, [expr(n.receiver), expr(args[0])]) # ipow or libm pow, by type
       elsif n.name == :length && args.empty? && n.receiver then @cur << Inst.new(:alen, [expr(n.receiver)])
       elsif n.name == :push && n.receiver.is_a?(Prism::LocalVariableReadNode)
         a = expr(n.receiver); v = expr(args[0]); len = @cur << Inst.new(:alen, [a])
