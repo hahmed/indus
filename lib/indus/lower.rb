@@ -15,14 +15,24 @@ module Indus
 
     def run
       body = @ast.statements.body
+      # modules are namespaces: hoist their classes and constants to the top level
+      mods = body.grep(Prism::ModuleNode)
+      mod_classes = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ClassNode) }
+      mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
       defs = body.grep(Prism::DefNode)
-      cdefs = body.grep(Prism::ClassNode)
-      top = body - defs - cdefs
+      cdefs = body.grep(Prism::ClassNode) + mod_classes
+      top = (body - defs - cdefs - mods) 
+      top = mod_consts + top
       # methods that take a block (contain yield) are inlined at call sites with a literal block;
       # they still get compiled as functions for block-less callers
       @yielders = {} # name -> [klass or nil, def]
       defs.each { |d| @yielders[d.name] = [nil, d] if yields?(d) }
-      defs.each { |d| @funcs[d.name] = Func.new(d.name, d.parameters&.requireds&.size || 0) unless yields?(d) }
+      @defs_by_func = {}
+      defs.each do |d|
+        next if yields?(d)
+        f = @funcs[d.name] = Func.new(d.name, (d.parameters&.requireds&.size || 0) + (d.parameters&.optionals&.size || 0))
+        @defs_by_func[f] = d
+      end
       methods = [] # [klass, def, func]
       cdefs.each do |c|
         sup = c.superclass && @classes.fetch(c.superclass.name) { raise "superclass #{c.superclass.name} must be defined first" }
@@ -43,7 +53,7 @@ module Indus
       end
       main = Func.new(:main, 0)
       lower_body(main, [], top)
-      defs.each { |d| lower_body(@funcs[d.name], d.parameters&.requireds&.map(&:name) || [], d.body&.body || []) if @funcs[d.name] }
+      defs.each { |d| lower_body(@funcs[d.name], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []), d.body&.body || []) if @funcs[d.name] }
       methods.each do |k, d, f, names, body, ct|
         if d
           names = [:self, *(d.parameters&.requireds&.map(&:name) || [])]
@@ -185,6 +195,26 @@ module Indus
       when Prism::IntegerNode then const(n.value)
       when Prism::FloatNode then fconst(n.value)
       when Prism::NilNode then (c = const(0); c.ty = :nil; c)
+      when Prism::TrueNode then (c = const(1); c.ty = :bool; c)
+      when Prism::FalseNode then (c = const(0); c.ty = :bool; c)
+      when Prism::UnlessNode then if_expr(n, negate: true)
+      when Prism::UntilNode then while_stmt(n, negate: true)
+      when Prism::CaseNode then case_expr(n)
+      when Prism::LambdaNode then lambda_value(n)
+      when Prism::ConstantPathNode then expr_const_path(n)
+      when Prism::ModuleNode then raise "module in expression position"
+      when Prism::LocalVariableOrWriteNode # x ||= v
+        cur = @locals[lname(n.name)]
+        if cur.nil? || cur.ty == :nil then (v = expr(n.value); @locals[lname(n.name)] = v)
+        else cond_assign(cur, false, -> { expr(n.value) }, ->(v) { @locals[lname(n.name)] = v }) end
+      when Prism::LocalVariableAndWriteNode # x &&= v
+        cond_assign(@locals.fetch(lname(n.name)), true, -> { expr(n.value) }, ->(v) { @locals[lname(n.name)] = v })
+      when Prism::IndexOrWriteNode # h[k] ||= v
+        recv = expr(n.receiver); k = expr(n.arguments.arguments[0])
+        cur = emit(:idx, [recv, k])
+        cond_assign(cur, false, -> { expr(n.value) }, ->(v) {
+          r = emit(:idx_set, [recv, k, v])
+          @locals[lname(n.receiver.name)] = r if n.receiver.is_a?(Prism::LocalVariableReadNode) })
       when Prism::SelfNode then me_val
       when Prism::ArrayNode
         fill = const(0); fill.ty = :nil # element type comes from the first store
@@ -210,6 +240,10 @@ module Indus
         if @ct&.key?(n.name) then (c = const(sym_id(@ct[n.name])); c.ty = :sym; c) # compile-time symbol
         else @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" } end
       when Prism::LocalVariableWriteNode
+        if n.value.is_a?(Prism::LambdaNode) # a lambda is inlined at its call sites
+          (@lambdas ||= {})[lname(n.name)] = n.value
+          return const(0)
+        end
         v = expr(n.value) # value first: loops replace @locals
         (@kinds ||= {})[lname(n.name)] = kind_of(n.value)
         @locals[lname(n.name)] = v
@@ -269,8 +303,8 @@ module Indus
     def bool_expr(n)
       tb, eb, mb = @f.new_block(:bt), @f.new_block(:bf), @f.new_block(:bm)
       cond_branch(n, tb, eb)
-      @cur = tb; one = const(1); emit(:br, [mb])
-      @cur = eb; zero = const(0); emit(:br, [mb])
+      @cur = tb; one = const(1); one.ty = :bool; emit(:br, [mb])
+      @cur = eb; zero = const(0); zero.ty = :bool; emit(:br, [mb])
       @cur = mb; p = mb.phi; p.args = [[tb, one], [eb, zero]]; p
     end
 
@@ -299,6 +333,13 @@ module Indus
         a = expr(n.receiver); v = expr(args[0])
         r = emit(:lshift_or_append, [a, v])
         emit(:fld_set, [@locals.fetch(:self), @klass.ivar(n.receiver.name), r]); return r
+      end
+      if n.name == :! && args.empty?
+        v = expr(n.receiver)
+        return emit(:cmp, [v, const(0)], :eq) # !x : true iff x is nil/false (0)
+      end
+      if n.name == :call && n.receiver.is_a?(Prism::LocalVariableReadNode) && (@lambdas || {})[lname(n.receiver.name)]
+        return inline_lambda(@lambdas[lname(n.receiver.name)], args)
       end
       if n.name == :send || n.name == :public_send
         name, *rest = args
@@ -329,7 +370,7 @@ module Indus
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array
         len = expr(args[0]); fill = args[1] ? expr(args[1]) : const(0)
         emit(:anew, [len, fill])
-      elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
+      elsif n.name == :new && (n.receiver.is_a?(Prism::ConstantReadNode) || n.receiver.is_a?(Prism::ConstantPathNode)) && @classes[n.receiver.name]
         k = @classes[n.receiver.name]
         obj = emit(:onew, [k])
         if (init = k.find_method(:initialize))
@@ -380,8 +421,29 @@ module Indus
         emit(:call, [@klass.find_method(n.name), me, *args.map { expr(_1) }])
       else
         f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
-        emit(:call, [f, *args.map { expr(_1) }])
+        vals = args.map { expr(_1) }
+        vals = fill_defaults(f, vals) if vals.size < f.params.size
+        emit(:call, [f, *vals])
       end
+    end
+
+    # optional parameters: missing arguments take their default expressions,
+    # evaluated at the call site with earlier parameters bound
+    def fill_defaults(f, vals)
+      d = @defs_by_func[f] or raise "#{f.name}: wrong number of arguments"
+      ps = d.parameters
+      names = ps.requireds.map(&:name) + ps.optionals.map(&:name)
+      pfx = :"dflt#{@f.blocks.size}:"
+      names.each_with_index { |nm, k| @locals[:"#{pfx}#{nm}"] = vals[k] if vals[k] }
+      @blk_pfx = (@blk_pfx || []) << pfx
+      ps.optionals.each_with_index do |o, k|
+        idx = ps.requireds.size + k
+        next if vals[idx]
+        vals[idx] = expr(o.value); @locals[:"#{pfx}#{o.name}"] = vals[idx]
+      end
+      @blk_pfx.pop
+      @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
+      vals
     end
 
     # ------------------------------------------------------------ blocks
@@ -391,7 +453,11 @@ module Indus
     # under prefixed keys, so loop phis cover both scopes uniformly.
     def block_call(n, args)
       blk = n.block
-      params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+      params = case blk.parameters
+               when Prism::NumberedParametersNode then (1..blk.parameters.maximum).map { :"_#{_1}" }
+               when nil then []
+               else blk.parameters.parameters.requireds.map(&:name)
+               end
       body = blk.body&.body || []
       recv = n.receiver
       case n.name
@@ -529,18 +595,19 @@ module Indus
       last || const(0)
     end
 
-    def if_expr(n)
+    def if_expr(n, negate: false)
       tb, eb, mb = @f.new_block(:then), @f.new_block(:else), @f.new_block(:merge)
-      cond_branch(n.predicate, tb, eb)
+      negate ? cond_branch(n.predicate, eb, tb) : cond_branch(n.predicate, tb, eb)
       before = @locals.dup
 
       @cur = tb; tv = (n.statements&.body || []).map { expr(_1) }.last || const(0)
       tend, tlocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
 
       @cur = eb; @locals = before.dup
-      ev = case n.subsequent
-           when Prism::IfNode then if_expr(n.subsequent)
-           when Prism::ElseNode then n.subsequent.statements&.body&.map { expr(_1) }&.last
+      sub = n.is_a?(Prism::UnlessNode) ? n.else_clause : n.subsequent
+      ev = case sub
+           when Prism::IfNode then if_expr(sub)
+           when Prism::ElseNode then sub.statements&.body&.map { expr(_1) }&.last
            end || const(0)
       eend, elocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
 
@@ -548,6 +615,76 @@ module Indus
       @locals = merge_locals(mb, [[tend, tlocals], [eend, elocals]])
       p = mb.phi; p.args = [[tend, tv], [eend, ev]]
       p
+    end
+
+    # case v when a, b then ... when x..y then ... else ... end  ->  if-chain
+    def case_expr(n)
+      subj = n.predicate ? expr(n.predicate) : nil
+      tests = n.conditions.map do |w|
+        [w.conditions.map { |c| when_test(subj, c) }, w.statements&.body || []]
+      end
+      lower_chain(tests, n.else_clause&.statements&.body || [])
+    end
+
+    def when_test(subj, c)
+      return ->() { expr(c) } unless subj
+      if c.is_a?(Prism::RangeNode)
+        ->() { lo = expr(c.left); hi = expr(c.right)
+               a = emit(:cmp, [subj, lo], :ge); b = emit(:cmp, [subj, hi], c.exclude_end? ? :lt : :le)
+               emit(:and, [a, b]) }
+      else
+        ->() { emit(:cmp, [subj, expr(c)], :eq) } # Types turns str == str into seq
+      end
+    end
+
+    def lower_chain(tests, else_body)
+      return (else_body.map { expr(_1) }.last || const(0)) if tests.empty?
+      (conds, body), *rest = tests
+      tb, eb, mb = @f.new_block(:then), @f.new_block(:else), @f.new_block(:merge)
+      # any of the conditions
+      conds.each_with_index do |t, k|
+        v = t.call
+        nxt = k == conds.size - 1 ? eb : @f.new_block(:or)
+        emit(:condbr, [v, tb, nxt]); @cur = nxt
+      end
+      before = @locals.dup
+      @cur = tb; tv = body.map { expr(_1) }.last || const(0); tend, tl = @cur, @locals; emit(:br, [mb]) unless @cur.term
+      @cur = eb; @locals = before.dup; ev = lower_chain(rest, else_body); eend, el = @cur, @locals; emit(:br, [mb]) unless @cur.term
+      @cur = mb; @locals = merge_locals(mb, [[tend, tl], [eend, el]])
+      p = mb.phi; p.args = [[tend, tv], [eend, ev]]; p
+    end
+
+    # x ||= v (when_truthy=false) / x &&= v (when_truthy=true)
+    def cond_assign(cur, when_truthy, value_fn, assign_fn)
+      tb, mb = @f.new_block(:set), @f.new_block(:merge)
+      pre = @cur; before = @locals.dup
+      when_truthy ? emit(:condbr, [cur, tb, mb]) : emit(:condbr, [cur, mb, tb])
+      @cur = tb; v = value_fn.call; assign_fn.call(v); tend, tl = @cur, @locals; emit(:br, [mb])
+      @cur = mb; @locals = merge_locals(mb, [[pre, before], [tend, tl]])
+      p = mb.phi; p.args = [[pre, cur], [tend, v]]; p
+    end
+
+    # lambdas are inlined at .call / .() sites: a lambda value is its AST
+    def lambda_value(n)
+      @pending_lambda = n
+      c = const(0); c.ty = :lambda; c
+    end
+
+    def inline_lambda(lam, args)
+      params = lam.parameters&.parameters&.requireds&.map(&:name) || []
+      pfx = :"lam#{@f.blocks.size}:"
+      params.each_with_index { |p, k| @locals[:"#{pfx}#{p}"] = expr(args[k]) }
+      @blk_pfx = (@blk_pfx || []) << pfx
+      last = nil
+      (lam.body&.body || []).each { last = expr(_1) }
+      @blk_pfx.pop
+      @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
+      last || const(0)
+    end
+
+    def expr_const_path(n)
+      # Mod::NAME -> the constant; Mod::Klass handled by callers (Klass.new)
+      emit(:gget, [n.name])
     end
 
     def merge_locals(mb, arms)
@@ -561,7 +698,7 @@ module Indus
       end
     end
 
-    def while_stmt(n)
+    def while_stmt(n, negate: false)
       hb, bb, xb = @f.new_block(:head), @f.new_block(:body), @f.new_block(:exit)
       xb.cold = true
       pre = @cur
@@ -569,7 +706,7 @@ module Indus
       phis = @locals.to_h { |nm, v| ph = hb.phi; ph.args << [pre, v]; [nm, ph] }
       @locals = phis.dup
       @cur = hb
-      cond_branch(n.predicate, bb, xb)
+      negate ? cond_branch(n.predicate, xb, bb) : cond_branch(n.predicate, bb, xb)
       outer, @loop = @loop, { exit: xb, breaks: [] }
       @cur = bb
       (n.statements&.body || []).each { expr(_1) }

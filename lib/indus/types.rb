@@ -107,6 +107,13 @@ module Indus
 
     # generic ops whose operands turned out to be strings
     def self.strings(f)
+      f.blocks.each do |b| # truthiness of a nullable int: not the sentinel
+        t = b.term
+        next unless t&.op == :condbr && of(f, t.args[0]) == :int?
+        sent = Inst.new(:const, [INT_NIL]); sent.ty = :int; sent.block = b
+        c = Inst.new(:cmp, [t.args[0], sent], :ne); c.ty = :bool; c.block = b
+        b.insts.insert(b.insts.index(t), sent, c); t.args[0] = c
+      end
       f.all.each do |i|
         case i.op
         when :add then i.op = :scat if of(f, i.args[0]) == :str
@@ -224,16 +231,18 @@ module Indus
     def self.infer(f, i)
       a = i.args
       case i.op
-      when :const then %i[nil sym].include?(i.ty) ? i.ty : :int
+      when :const then %i[nil sym bool lambda].include?(i.ty) ? i.ty : :int
       when :fconst then :float
       when :sconst, :scat, :sappend, :itos then :str
       when :seq then :bool
       when :puts_i, :puts_str, :puts_bool, :puts_opt, :puts_nil then :int
+      when :idx, :idx_set, :dsend, :mcall then nil
       when :lshift_or_append then (t = of(f, a[0])) && (t == :int ? :int : t)
       when :to_s then (t = of(f, a[0])) && (t == :str ? :str : narrow(t) == :int ? :str : nil)
       when :puts_v then of(f, a[0]) && :int
       when :add, :sub, :mul, :div then join(narrow(of(f, a[0])), narrow(of(f, a[1])))
-      when :and, :or, :xor, :shl, :shr, :mod, :to_i, :alen, :ipow then :int
+      when :and, :or then (of(f, a[0]) == :bool && of(f, a[1]) == :bool) ? :bool : :int
+      when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow then :int
       when :cmp then :bool
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
