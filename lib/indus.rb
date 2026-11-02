@@ -7,7 +7,7 @@
 #   lib/indus/peephole.rb string peepholes (byte compare, in-place append)
 #   lib/indus/escape.rb   escape analysis -> stack objects, loop regions
 #   lib/indus/runtime.s   runtime routines in assembly -> runtime_blob.rb (tools/build_runtime.sh)
-#   lib/indus/asm.rb      arm64 encoder + the older hand-encoded routines
+#   lib/indus/asm.rb      arm64 encoder
 #   lib/indus/regalloc.rb linear-scan register allocation over dataflow liveness
 #   lib/indus/codegen.rb  layout, frames, instruction selection
 #   lib/indus/metal.rb    run in-process; hosts the resident compiler for seams
@@ -43,12 +43,6 @@ module Indus
     asm.libm = %i[sin cos pow].to_h { [_1, Metal::LIBC[_1.to_s].to_i] } unless standalone
     asm.emit_start_linux if standalone == :linux
     funcs.each { Codegen.new(asm, lower.classes).func(_1) }
-    asm.emit_puts_i
-    asm.emit_putc
-    asm.emit_array_new
-    asm.emit_array_set_slow
-    asm.emit_object_new
-    asm.emit_ipow
     asm.emit_runtime_blob
     asm.emit_syscalls(standalone) if standalone
     raise "this program has a seam (class_eval); a standalone binary needs the resident compiler" if standalone && !asm.seams.empty?

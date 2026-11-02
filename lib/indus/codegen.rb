@@ -102,6 +102,7 @@ module Indus
       @asm.label(lbl(b))
       b.insts.each do |i|
         d = dst(i)
+        calls_before = @asm.ncalls || 0
         case i.op
         when :const, :fconst then nil
         when :add, :sub, :mul, :div
@@ -321,6 +322,9 @@ module Indus
         else raise "codegen: #{i.op}"
         end
         spill!(i)
+        # the allocator trusted Inst#call?; make sure codegen agreed
+        emitted = (@asm.ncalls || 0) > calls_before
+        raise "#{i.op} emits a call but is not Inst#call? (register allocation would be unsafe)" if emitted && !i.call?
       end
     end
 

@@ -481,3 +481,123 @@ rt_str_sub:
         b       rt_str_new
 9:      mov     x0, #0
         ret
+
+// ---------------------------------------------------------------- formerly hand-encoded
+// __puts_i(x0 n): decimal + newline via write
+__puts_i:
+        stp     x29, x30, [sp, #-48]!
+        mov     x29, sp
+        add     x1, sp, #48
+        mov     w3, #10
+        strb    w3, [x1, #-1]!
+        mov     x10, #10
+        mov     x11, #0
+        cmp     x0, #0
+        b.ge    0f
+        neg     x0, x0
+        mov     x11, #1
+0:      udiv    x2, x0, x10
+        msub    x3, x2, x10, x0
+        add     w3, w3, #48
+        strb    w3, [x1, #-1]!
+        mov     x0, x2
+        cbnz    x0, 0b
+        cbz     x11, 1f
+        mov     w3, #45
+        strb    w3, [x1, #-1]!
+1:      add     x2, sp, #48
+        sub     x2, x2, x1
+        mov     x0, #1
+        ldr     x16, [x27]
+        blr     x16
+        ldp     x29, x30, [sp], #48
+        ret
+
+// __putc(x0 char)
+__putc:
+        stp     x29, x30, [sp, #-32]!
+        mov     x29, sp
+        strb    w0, [sp, #16]
+        add     x1, sp, #16
+        mov     x2, #1
+        mov     x0, #1
+        ldr     x16, [x27]
+        blr     x16
+        ldp     x29, x30, [sp], #32
+        ret
+
+// __anew(x0 len, x1 fill) -> handle; cap = len
+__anew:
+        add     x2, x28, #16
+        stur    x0, [x2, #-16]
+        stur    x0, [x2, #-8]
+        add     x28, x2, x0, lsl #3
+        add     x28, x28, #15
+        and     x28, x28, #0xfffffffffffffff0
+        mov     x3, #0
+0:      cmp     x3, x0
+        b.hs    1f
+        str     x1, [x2, x3, lsl #3]
+        add     x3, x3, #1
+        b       0b
+1:      mov     x0, x2
+        ret
+
+// __aset_slow(x0 handle, x1 i >= len, x2 v) -> handle (grown if needed)
+__aset_slow:
+        ldur    x3, [x0, #-16]          // cap
+        ldur    x4, [x0, #-8]           // len
+        cmp     x1, x3
+        b.hs    2f
+0:      cmp     x4, x1                  // fill len..i-1 with nil
+        b.hs    1f
+        str     xzr, [x0, x4, lsl #3]
+        add     x4, x4, #1
+        b       0b
+1:      str     x2, [x0, x1, lsl #3]
+        add     x4, x1, #1
+        stur    x4, [x0, #-8]
+        ret
+2:      lsl     x5, x3, #1              // grow: max(2*cap, i+1)
+        add     x6, x1, #1
+        cmp     x5, x6
+        csel    x5, x5, x6, hi
+        add     x7, x28, #16
+        stur    x5, [x7, #-16]
+        stur    x4, [x7, #-8]
+        add     x28, x7, x5, lsl #3
+        add     x28, x28, #15
+        and     x28, x28, #0xfffffffffffffff0
+        mov     x6, #0
+3:      cmp     x6, x4
+        b.hs    4f
+        ldr     x9, [x0, x6, lsl #3]
+        str     x9, [x7, x6, lsl #3]
+        add     x6, x6, #1
+        b       3b
+4:      mov     x0, x7
+        b       0b
+
+// __onew(x0 bytes) -> zeroed block
+__onew:
+        mov     x1, x28
+        add     x28, x28, x0
+        add     x28, x28, #15
+        and     x28, x28, #0xfffffffffffffff0
+        mov     x2, x1
+0:      cmp     x2, x28
+        b.hs    1f
+        str     xzr, [x2], #8
+        b       0b
+1:      mov     x0, x1
+        ret
+
+// __ipow(x0 base, x1 exp) -> base ** exp
+__ipow:
+        mov     x2, x0
+        mov     x0, #1
+0:      cbz     x1, 1f
+        mul     x0, x0, x2
+        sub     x1, x1, #1
+        b       0b
+1:      ret

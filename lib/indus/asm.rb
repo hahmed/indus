@@ -77,38 +77,7 @@ module Indus
     def ldr_lit(rt, n) = (fix(n, :b19); emit(0x58000000 | rt))        # ldr xt, label (pc-relative data)
     def fldr_lit(rt, n) = (fix(n, :b19); emit(0x5C000000 | rt))       # ldr dt, label
 
-    # x0 = bytes -> x0 = zeroed block from the bump heap
-    def emit_object_new
-      label(:__onew)
-      emit 0xAA1C03E1                 # mov x1, x28
-      emit 0x8B00039C                 # add x28, x28, x0
-      emit 0x91003F9C; emit 0x927CEF9C # round x28 up to 16
-      emit 0xAA0103E2                 # mov x2, x1
-      l = uniq; d = uniq
-      label(l)
-      emit 0xEB1C005F                 # cmp x2, x28
-      bhs(d)
-      emit 0xF800845F                 # str xzr, [x2], #8
-      b(l)
-      label(d)
-      emit 0xAA0103E0                 # mov x0, x1
-      ret
-    end
 
-    # x0 = base, x1 = exp (>= 0) -> x0 = base ** exp
-    def emit_ipow
-      label(:__ipow)
-      emit 0xAA0003E2                 # mov x2, x0
-      emit 0xD2800020                 # mov x0, #1
-      l = uniq; d = uniq
-      label(l)
-      cbz(1, d)
-      emit 0x9B027C00                 # mul x0, x0, x2
-      emit 0xD1000421                 # sub x1, x1, #1
-      b(l)
-      label(d)
-      ret
-    end
     # integer division, Ruby semantics (floor): q = a/b; if r != 0 && (r^b) < 0 then q -= 1
     def sdiv_floor(rd, rn, rm)
       emit(0x9AC00C00 | (rm << 16) | (rn << 5) | rd)                 # sdiv rd, rn, rm
@@ -119,84 +88,11 @@ module Indus
       cset(9, :lt)
       emit(0xCB090000 | (rd << 5) | rd)                              # sub rd, rd, x9
     end
-    # putc: x0 = char. strb to stack, write(1, sp+15, 1)
-    def emit_putc
-      label(:__putc)
-      stp_pre(29, 30, 32); mov_fp_sp
-      emit 0x390043E0                 # strb w0, [sp, #16]   (above the saved fp/lr pair)
-      emit 0x910003E1 | (16 << 10)    # add x1, sp, #16
-      emit 0xD2800022                 # mov x2, #1
-      emit 0xD2800020                 # mov x0, #1
-      call_write
-      ldp_post(29, 30, 32); ret
-    end
     def uniq = (@u = (@u || 0) + 1; :"L#{@u}")
 
     HEAP = 28 # bump pointer, reserved; arrays: [cap][len][elems...], handle -> elems
 
-    # x0 = len, x1 = fill -> x0 = handle. cap = len.
-    def emit_array_new
-      label(:__anew)
-      emit 0x91004382             # add x2, x28, #16        handle after the header
-      stur(0, 2, -16)             # cap = len
-      stur(0, 2, -8)              # len
-      emit 0x8B000C5C             # add x28, x2, x0, lsl #3
-      emit 0x91003F9C             # add x28, x28, #15
-      emit 0x927CEF9C             # and x28, x28, #~15      bump, 16-aligned
-      emit 0xD2800003             # mov x3, #0
-      l = uniq; d = uniq
-      label(l)
-      emit 0xEB00007F             # cmp x3, x0
-      bhs(d)
-      str_idx(1, 2, 3)            # [x2 + x3*8] = fill
-      emit 0x91000463             # add x3, x3, #1
-      b(l)
-      label(d)
-      emit 0xAA0203E0             # mov x0, x2
-      ret
-    end
 
-    # x0 = handle, x1 = i (>= len), x2 = v -> x0 = handle (new one if grown)
-    def emit_array_set_slow
-      label(:__aset_slow)
-      ldur(3, 0, -16)             # cap
-      ldur(4, 0, -8)              # len
-      emit 0xEB03003F             # cmp x1, x3
-      grow = uniq; fill = uniq; store = uniq
-      bhs(grow)
-      label(fill)                 # fill len..i-1 with nil(0)
-      emit 0xEB01009F             # cmp x4, x1
-      bhs(store)
-      str_idx(31, 0, 4)           # xzr
-      emit 0x91000484             # add x4, x4, #1
-      b(fill)
-      label(store)
-      str_idx(2, 0, 1)
-      emit 0x91000424             # add x4, x1, #1
-      stur(4, 0, -8)              # len = i+1
-      ret
-      label(grow)                 # newcap = max(cap*2, i+1); copy; then fill/store on the new array
-      emit 0xD37FF865             # lsl x5, x3, #1
-      emit 0x91000426             # add x6, x1, #1
-      emit 0xEB0600BF             # cmp x5, x6
-      emit 0x9A8680A5             # csel x5, x5, x6, hi     newcap = max(cap*2, i+1)
-      emit 0x91004387             # add x7, x28, #16  (new handle)
-      stur(5, 7, -16)             # cap
-      stur(4, 7, -8)              # len (same as old)
-      emit 0x8B050CFC             # add x28, x7, x5, lsl #3
-      emit 0x91003F9C; emit 0x927CEF9C
-      emit 0xD2800006             # x6 = 0 (copy index)
-      cl = uniq; cd = uniq
-      label(cl)
-      emit 0xEB0400DF             # cmp x6, x4
-      bhs(cd)
-      ldr_idx(9, 0, 6); str_idx(9, 7, 6)
-      emit 0x910004C6             # add x6, x6, #1
-      b(cl)
-      label(cd)
-      emit 0xAA0703E0             # mov x0, x7
-      b(fill)
-    end
     def addi(rd, rn, i)
       raise "addi immediate out of range: #{i}" unless (0..4095).cover?(i) || (i % 4096 == 0 && i <= 4095 * 4096)
       i < 4096 ? emit(0x91000000 | (i << 10) | (rn << 5) | rd) : emit(0x91400000 | ((i >> 12) << 10) | (rn << 5) | rd)
@@ -217,13 +113,15 @@ module Indus
     def b(n) = (fix(n, :b26); emit(0x14000000))
     # a later compilation unit calls back into the first through absolute addresses
     attr_accessor :externs # name -> absolute address
+    attr_reader :ncalls # bl/blr emitted so far; codegen checks it against Inst#call?
     def bl(n)
-      if externs&.key?(n) then mov_imm(16, externs[n]); blr(16)
+      @ncalls = (@ncalls || 0) + 1
+      if externs&.key?(n) then mov_imm(16, externs[n]); emit(0xD63F0000 | (16 << 5))
       else fix(n, :b26); emit(0x94000000) end
     end
     attr_reader :labels
     attr_accessor :seams # [[klass, src], ...] in id order
-    def blr(rn) = emit(0xD63F0000 | (rn << 5))
+    def blr(rn) = (@ncalls = (@ncalls || 0) + 1; emit(0xD63F0000 | (rn << 5)))
     def ret = emit(0xD65F03C0)
     def adr(rd, n) = (fix(n, :adr); emit(0x10000000 | rd))
     def stp(t1, t2, off) = t2 ? emit(0xA9000000 | ((off / 8) << 15) | (t2 << 10) | (31 << 5) | t1) : str(t1, off)
@@ -275,37 +173,6 @@ module Indus
       emit 0xD4000001             # svc #0
       bl(:main)
       emit 0xD2800000; emit 0xD2800BA8; emit 0xD4000001            # mov x0,#0 ; mov x8,#93 ; svc #0
-    end
-
-    def emit_puts_i
-      label(:__puts_i)
-      stp_pre(29, 30, 48); mov_fp_sp
-      emit 0x910083E1                 # add x1, sp, #32        (end of buffer; buf is [sp+16, sp+48))
-      emit 0x9100C3E1                 # add x1, sp, #48
-      emit 0x52800143                 # mov w3, #10  '\n'
-      emit 0x381FFC23                 # strb w3, [x1, #-1]!
-      emit 0xD280014A                 # mov x10, #10
-      emit 0xD280000B                 # mov x11, #0  (negative flag)
-      emit 0xF100001F                 # cmp x0, #0
-      bcond(:ge, :__pi_loop)
-      emit 0xCB0003E0                 # neg x0, x0
-      emit 0xD280002B                 # mov x11, #1
-      label(:__pi_loop)
-      emit 0x9ACA0802                 # udiv x2, x0, x10
-      emit 0x9B0A8043                 # msub x3, x2, x10, x0
-      emit 0x1100C063                 # add w3, w3, #48
-      emit 0x381FFC23                 # strb w3, [x1, #-1]!
-      emit 0xAA0203E0                 # mov x0, x2
-      cbnz(0, :__pi_loop)
-      cbz(11, :__pi_write)
-      emit 0x528005A3                 # mov w3, #45 '-'
-      emit 0x381FFC23                 # strb w3, [x1, #-1]!
-      label(:__pi_write)
-      emit 0x9100C3E2                 # add x2, sp, #48
-      emit 0xCB010042                 # sub x2, x2, x1
-      emit 0xD2800020                 # mov x0, #1
-      call_write
-      ldp_post(29, 30, 48); ret
     end
 
     def resolve!

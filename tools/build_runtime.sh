@@ -11,7 +11,7 @@ $LLVM/llvm-objcopy -O binary --only-section=.text /tmp/rt.o /tmp/rt.bin
   echo "module Indus"
   echo "  module RuntimeBlob"
   echo "    LABELS = {"
-  $LLVM/llvm-objdump -t /tmp/rt.o | awk '/ rt_/ {printf "      %s: 0x%s,\n", $NF, $1}'
+  $LLVM/llvm-objdump -t /tmp/rt.o | awk '/ (rt_|__)/ {printf "      %s: 0x%s,\n", $NF, $1}'
   echo "    }"
   echo "    WORDS = ["
   xxd -p -c4 /tmp/rt.bin | awk '{w=$1; printf "      0x%s%s%s%s,\n", substr(w,7,2), substr(w,5,2), substr(w,3,2), substr(w,1,2)}'
