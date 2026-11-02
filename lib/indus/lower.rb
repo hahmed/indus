@@ -16,7 +16,11 @@ module Indus
       defs = body.grep(Prism::DefNode)
       cdefs = body.grep(Prism::ClassNode)
       top = body - defs - cdefs
-      defs.each { |d| @funcs[d.name] = Func.new(d.name, d.parameters&.requireds&.size || 0) }
+      # methods that take a block (contain yield) are inlined at call sites with a literal block;
+      # they still get compiled as functions for block-less callers
+      @yielders = {} # name -> [klass or nil, def]
+      defs.each { |d| @yielders[d.name] = [nil, d] if yields?(d) }
+      defs.each { |d| @funcs[d.name] = Func.new(d.name, d.parameters&.requireds&.size || 0) unless yields?(d) }
       methods = [] # [klass, def, func]
       cdefs.each do |c|
         sup = c.superclass && @classes.fetch(c.superclass.name) { raise "superclass #{c.superclass.name} must be defined first" }
@@ -25,6 +29,7 @@ module Indus
         (c.body&.body || []).each do |st|
           case st
           when Prism::DefNode
+            if yields?(st) then @yielders[st.name] = [k, st]; next end # inlined only
             f = Func.new(:"#{k.name}##{st.name}", 1 + (st.parameters&.requireds&.size || 0))
             f.cls = k; k.methods[st.name] = f; methods << [k, st, f]
           when Prism::CallNode # attr_accessor / attr_reader / attr_writer
@@ -39,7 +44,7 @@ module Indus
       end
       main = Func.new(:main, 0)
       lower_body(main, [], top)
-      defs.each { |d| lower_body(@funcs[d.name], d.parameters&.requireds&.map(&:name) || [], d.body&.body || []) }
+      defs.each { |d| lower_body(@funcs[d.name], d.parameters&.requireds&.map(&:name) || [], d.body&.body || []) if @funcs[d.name] }
       methods.each { |k, d, f| lower_body(f, [:self, *(d.parameters&.requireds&.map(&:name) || [])], d.body&.body || [], k) }
       all = [main, *@funcs.values, *methods.map(&:last)]
       all.each { prune(_1) }
@@ -74,43 +79,88 @@ module Indus
       @f, @locals, @cur, @klass = f, names.zip(f.params).to_h, f.entry, klass
       last = nil
       stmts.each { last = expr(_1) }
-      @cur << Inst.new(:ret, [last || const(0)]) unless @cur.term
+      emit(:ret, [last || const(0)]) unless @cur.term
     end
 
-    def const(v) = (@cur << Inst.new(:const, [v]))
+    # a local's key: a block parameter (innermost block first), an inlined
+    # callee's local, or the plain name
+    def lname(name)
+      (@blk_pfx || []).reverse_each { |pfx| k = :"#{pfx}#{name}"; return k if @locals.key?(k) }
+      return :"#{@name_pfx}#{name}" if @name_pfx
+      name
+    end
+    # a syntactic guess at what a node evaluates to, for choosing between a
+    # builtin iterator and a user yield-method at lowering time:
+    # :array, :range, :int, :str, a class name, or nil (unknown)
+    def kind_of(n)
+      case n
+      when Prism::ArrayNode then :array
+      when Prism::RangeNode then :range
+      when Prism::IntegerNode then :int
+      when Prism::StringNode, Prism::InterpolatedStringNode then :str
+      when Prism::ParenthesesNode then kind_of(n.body.body.last)
+      when Prism::LocalVariableReadNode then (@kinds || {})[lname(n.name)]
+      when Prism::InstanceVariableReadNode then (@ivar_kinds || {})[[@klass&.name, n.name]]
+      when Prism::CallNode
+        if n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode)
+          n.receiver.name == :Array ? :array : (@classes[n.receiver.name] ? n.receiver.name : nil)
+        elsif %i[map keys to_a].include?(n.name) then :array
+        elsif n.name == :to_s then :str
+        end
+      end
+    end
+
+    def me_val = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
+    # append to the *current* block after the arguments have been evaluated
+    # (lowering an argument may move @cur: loops, inlining)
+    def emit(op, args = [], cond = nil) = (@cur << Inst.new(op, args, cond))
+    def const(v) = emit(:const, [v])
+    def sym_id(name) = (@syms ||= {})[name.to_sym] ||= @syms.size + 1
+    attr_reader :syms
+    def yields?(d) = d.body && d.body.body.any? { |st| contains_yield?(st) }
+    def contains_yield?(node)
+      return false unless node.is_a?(Prism::Node)
+      return true if node.is_a?(Prism::YieldNode)
+      node.compact_child_nodes.any? { contains_yield?(_1) }
+    end
     # x.to_s: strings pass through, integers convert; resolved after typing for others
-    def to_s(v) = (@cur << Inst.new(:to_s, [v]))
-    def fconst(v) = (@cur << Inst.new(:fconst, [v]))
+    def to_s(v) = (emit(:to_s, [v]))
+    def fconst(v) = (emit(:fconst, [v]))
 
     def expr(n)
       case n
       when Prism::IntegerNode then const(n.value)
       when Prism::FloatNode then fconst(n.value)
       when Prism::NilNode then (c = const(0); c.ty = :nil; c)
-      when Prism::SelfNode then @locals.fetch(:self)
+      when Prism::SelfNode then me_val
       when Prism::ArrayNode
         fill = const(0); fill.ty = :nil # element type comes from the first store
-        a = @cur << Inst.new(:anew, [const(n.elements.size), fill])
-        n.elements.each_with_index { |e, k| a = @cur << Inst.new(:aset, [a, const(k), expr(e)]) }
+        a = emit(:anew, [const(n.elements.size), fill])
+        n.elements.each_with_index { |e, k| a = emit(:aset, [a, const(k), expr(e)]) }
         a
       when Prism::HashNode
-        h = @cur << Inst.new(:hnew, [])
+        h = emit(:hnew, [])
         n.elements.each do |el|
           raise "unsupported hash element #{el.class}" unless el.is_a?(Prism::AssocNode)
-          h = @cur << Inst.new(:hset, [h, expr(el.key), expr(el.value)])
+          h = emit(:hset, [h, expr(el.key), expr(el.value)])
         end
         h
-      when Prism::InstanceVariableReadNode then @cur << Inst.new(:fld_get, [@locals.fetch(:self), @klass.ivar(n.name)])
+      when Prism::InstanceVariableReadNode then emit(:fld_get, [me_val, @klass.ivar(n.name)])
       when Prism::InstanceVariableWriteNode
-        v = expr(n.value); @cur << Inst.new(:fld_set, [@locals.fetch(:self), @klass.ivar(n.name), v]); v
-      when Prism::ConstantReadNode then @cur << Inst.new(:gget, [n.name])
+        v = expr(n.value)
+        ((@ivar_kinds ||= {})[[@klass&.name, n.name]] ||= kind_of(n.value)) if @klass
+        emit(:fld_set, [me_val, @klass.ivar(n.name), v]); v
+      when Prism::ConstantReadNode then emit(:gget, [n.name])
       when Prism::ConstantWriteNode
-        v = expr(n.value); @cur << Inst.new(:gset, [n.name, v]); v
-      when Prism::LocalVariableReadNode then @locals.fetch(n.name) { raise "undefined local #{n.name}" }
-      when Prism::LocalVariableWriteNode then @locals[n.name] = expr(n.value)
+        v = expr(n.value); emit(:gset, [n.name, v]); v
+      when Prism::LocalVariableReadNode then @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" }
+      when Prism::LocalVariableWriteNode
+        v = expr(n.value) # value first: loops replace @locals
+        (@kinds ||= {})[lname(n.name)] = kind_of(n.value)
+        @locals[lname(n.name)] = v
       when Prism::LocalVariableOperatorWriteNode
-        l = @locals.fetch(n.name); r = expr(n.value)
-        @locals[n.name] = @cur << Inst.new(ARITH.fetch(n.binary_operator), [l, r])
+        l = @locals.fetch(lname(n.name)); r = expr(n.value)
+        @locals[lname(n.name)] = emit(ARITH.fetch(n.binary_operator), [l, r])
       when Prism::MultiWriteNode # a, b = x, y  (evaluate all, then bind)
         vals = n.value.elements.map { expr(_1) }
         n.lefts.zip(vals).each { |t, v| @locals[t.name] = v }
@@ -118,24 +168,39 @@ module Indus
       when Prism::BreakNode
         raise "break outside loop" unless @loop
         @loop[:breaks] << [@cur, @locals.dup]
-        @cur << Inst.new(:br, [@loop[:exit]])
+        emit(:br, [@loop[:exit]])
         @cur = @f.new_block(:dead); const(0)
       when Prism::ReturnNode
         v = n.arguments ? expr(n.arguments.arguments[0]) : const(0)
-        @cur << Inst.new(:ret, [v])
+        if @ret_exit # returning from an inlined callee: jump to its exit with the value
+          @ret_exit[:arms] << [@cur, @locals.dup, v]
+          emit(:br, [@ret_exit[:block]])
+        else
+          emit(:ret, [v])
+        end
         @cur = @f.new_block(:dead); const(0)
       when Prism::StatementsNode then n.body.map { expr(_1) }.last
+      when Prism::NextNode
+        raise "next outside a block" unless @loop&.[](:next)
+        @loop[:nexts] << [@cur, @locals.dup]
+        emit(:br, [@loop[:next]])
+        @cur = @f.new_block(:dead); const(0)
+      when Prism::YieldNode
+        raise "yield outside an inlined block method" unless @block
+        yield_block(n.arguments&.arguments || [])
+      when Prism::RangeNode then raise "a Range is only supported as the receiver of each/map"
+      when Prism::SymbolNode then (c = const(sym_id(n.unescaped)); c.ty = :sym; c)
       when Prism::ParenthesesNode then n.body.body.map { expr(_1) }.last
-      when Prism::StringNode then @cur << Inst.new(:sconst, [n.unescaped])
+      when Prism::StringNode then emit(:sconst, [n.unescaped])
       when Prism::InterpolatedStringNode # "a#{x}b" -> concat chain
         parts = n.parts.map do |part|
           case part
-          when Prism::StringNode then @cur << Inst.new(:sconst, [part.unescaped])
+          when Prism::StringNode then emit(:sconst, [part.unescaped])
           when Prism::EmbeddedStatementsNode then to_s(expr(part.statements.body.last))
           else raise "unsupported interpolation part #{part.class}"
           end
         end
-        parts.reduce { |a, b| @cur << Inst.new(:scat, [a, b]) }
+        parts.reduce { |a, b| emit(:scat, [a, b]) }
       when Prism::IfNode then if_expr(n)
       when Prism::WhileNode then while_stmt(n)
       when Prism::CallNode then call(n)
@@ -149,8 +214,8 @@ module Indus
     def bool_expr(n)
       tb, eb, mb = @f.new_block(:bt), @f.new_block(:bf), @f.new_block(:bm)
       cond_branch(n, tb, eb)
-      @cur = tb; one = const(1); @cur << Inst.new(:br, [mb])
-      @cur = eb; zero = const(0); @cur << Inst.new(:br, [mb])
+      @cur = tb; one = const(1); emit(:br, [mb])
+      @cur = eb; zero = const(0); emit(:br, [mb])
       @cur = mb; p = mb.phi; p.args = [[tb, one], [eb, zero]]; p
     end
 
@@ -164,47 +229,48 @@ module Indus
       when Prism::ParenthesesNode then cond_branch(n.body.body.last, tb, eb)
       else
         c = expr(n)
-        @cur << Inst.new(:condbr, [c, tb, eb])
+        emit(:condbr, [c, tb, eb])
       end
     end
 
     def call(n)
       args = n.arguments&.arguments || []
+      return block_call(n, args) if n.block.is_a?(Prism::BlockNode)
       if n.name == :<< && n.receiver.is_a?(Prism::LocalVariableReadNode) && !@int_locals&.include?(n.receiver.name)
         # `<<` is append on strings/arrays and shift on integers; Types fixes up a misguess
         a = expr(n.receiver); v = expr(args[0])
-        return @locals[n.receiver.name] = @cur << Inst.new(:lshift_or_append, [a, v])
+        return @locals[n.receiver.name] = emit(:lshift_or_append, [a, v])
       elsif n.name == :<< && n.receiver.is_a?(Prism::InstanceVariableReadNode)
         a = expr(n.receiver); v = expr(args[0])
-        r = @cur << Inst.new(:lshift_or_append, [a, v])
-        @cur << Inst.new(:fld_set, [@locals.fetch(:self), @klass.ivar(n.receiver.name), r]); return r
+        r = emit(:lshift_or_append, [a, v])
+        emit(:fld_set, [@locals.fetch(:self), @klass.ivar(n.receiver.name), r]); return r
       end
       if (op = ARITH[n.name])
         l = expr(n.receiver); r = expr(args[0])
-        @cur << Inst.new(op, [l, r])
+        emit(op, [l, r])
       elsif (c = CMP[n.name])
         l = expr(n.receiver); r = expr(args[0])
-        @cur << Inst.new(:cmp, [l, r], c)
-      elsif n.name == :to_i && args.empty? then @cur << Inst.new(:to_i, [expr(n.receiver)])
-      elsif n.name == :to_f && args.empty? then @cur << Inst.new(:to_f, [expr(n.receiver)])
+        emit(:cmp, [l, r], c)
+      elsif n.name == :to_i && args.empty? then emit(:to_i, [expr(n.receiver)])
+      elsif n.name == :to_f && args.empty? then emit(:to_f, [expr(n.receiver)])
       elsif n.name == :putc
         a = args[0]
-        if a.is_a?(Prism::StringNode) then @cur << Inst.new(:putc, [const(a.unescaped.ord)])
-        else @cur << Inst.new(:putc, [expr(a)]) end
+        if a.is_a?(Prism::StringNode) then emit(:putc, [const(a.unescaped.ord)])
+        else emit(:putc, [expr(a)]) end
       elsif n.name == :puts
         a = args[0]
-        if a.is_a?(Prism::StringNode) then @cur << Inst.new(:puts_s, [a.unescaped])
-        else @cur << Inst.new(:puts_v, [expr(a)]) end # Types picks puts_i / puts_str
+        if a.is_a?(Prism::StringNode) then emit(:puts_s, [a.unescaped])
+        else emit(:puts_v, [expr(a)]) end # Types picks puts_i / puts_str
       elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
       elsif n.name == :+@ && args.empty? then expr(n.receiver) # +"" : literals are already fresh copies
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array
         len = expr(args[0]); fill = args[1] ? expr(args[1]) : const(0)
-        @cur << Inst.new(:anew, [len, fill])
+        emit(:anew, [len, fill])
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
         k = @classes[n.receiver.name]
-        obj = @cur << Inst.new(:onew, [k])
+        obj = emit(:onew, [k])
         if (init = k.find_method(:initialize))
-          @cur << Inst.new(:call, [init, obj, *args.map { expr(_1) }])
+          emit(:call, [init, obj, *args.map { expr(_1) }])
         end
         obj
       elsif n.name == :class_eval && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
@@ -217,37 +283,183 @@ module Indus
           m = k.find_method(d.name) or raise "class_eval defining a new method #{d.name} (only redefinition for now)"
           m.patchable = true
         end
-        @cur << Inst.new(:seam, [k, src.unescaped])
+        emit(:seam, [k, src.unescaped])
       elsif n.name == :sqrt && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
-        @cur << Inst.new(:fsqrt, [expr(args[0])])
+        emit(:fsqrt, [expr(args[0])])
       elsif %i[sin cos].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
-        @cur << Inst.new(:libm, [n.name, expr(args[0])])
-      elsif n.name == :** then @cur << Inst.new(:pow, [expr(n.receiver), expr(args[0])]) # ipow or libm pow, by type
-      elsif n.name == :length && args.empty? && n.receiver then @cur << Inst.new(:alen, [expr(n.receiver)])
+        emit(:libm, [n.name, expr(args[0])])
+      elsif n.name == :** then emit(:pow, [expr(n.receiver), expr(args[0])]) # ipow or libm pow, by type
+      elsif n.name == :length && args.empty? && n.receiver then emit(:alen, [expr(n.receiver)])
       elsif n.name == :push && n.receiver.is_a?(Prism::LocalVariableReadNode)
-        a = expr(n.receiver); v = expr(args[0]); len = @cur << Inst.new(:alen, [a])
-        @locals[n.receiver.name] = @cur << Inst.new(:aset, [a, len, v])
+        a = expr(n.receiver); v = expr(args[0]); len = emit(:alen, [a])
+        @locals[n.receiver.name] = emit(:aset, [a, len, v])
       elsif n.name == :[] # array / hash / string: Types decides
-        @cur << Inst.new(:idx, [expr(n.receiver), *args.map { expr(_1) }])
+        emit(:idx, [expr(n.receiver), *args.map { expr(_1) }])
       elsif n.name == :[]=
         # a[i] = v may grow a: the result is the (possibly new) container, rebound to the local
         raise "[]= on non-local receiver" unless n.receiver.is_a?(Prism::LocalVariableReadNode)
         a = expr(n.receiver); i = expr(args[0]); v = expr(args[1])
-        @locals[n.receiver.name] = @cur << Inst.new(:idx_set, [a, i, v])
+        @locals[n.receiver.name] = emit(:idx_set, [a, i, v])
         v
       elsif (n.name == :key? || n.name == :has_key?) && args.size == 1 && n.receiver
-        @cur << Inst.new(:hkey, [expr(n.receiver), expr(args[0])])
+        emit(:hkey, [expr(n.receiver), expr(args[0])])
       elsif n.name == :keys && args.empty? && n.receiver
-        @cur << Inst.new(:hkeys, [expr(n.receiver)])
+        emit(:hkeys, [expr(n.receiver)])
       elsif n.receiver && !n.receiver.is_a?(Prism::ConstantReadNode)
         # a method call on an object: resolved by Types once the receiver's class is known
-        @cur << Inst.new(:mcall, [n.name, expr(n.receiver), *args.map { expr(_1) }])
+        emit(:mcall, [n.name, expr(n.receiver), *args.map { expr(_1) }])
       elsif @klass && @klass.find_method(n.name) && !@funcs[n.name]
-        @cur << Inst.new(:call, [@klass.find_method(n.name), @locals.fetch(:self), *args.map { expr(_1) }])
+        me = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
+        emit(:call, [@klass.find_method(n.name), me, *args.map { expr(_1) }])
       else
         f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
-        @cur << Inst.new(:call, [f, *args.map { expr(_1) }])
+        emit(:call, [f, *args.map { expr(_1) }])
       end
+    end
+
+    # ------------------------------------------------------------ blocks
+    # Every block is inlined at its call site: builtin iterators become
+    # loops, a user method containing `yield` is inlined with the block body
+    # spliced at each yield. Callee locals live in the caller's @locals map
+    # under prefixed keys, so loop phis cover both scopes uniformly.
+    def block_call(n, args)
+      blk = n.block
+      params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+      body = blk.body&.body || []
+      recv = n.receiver
+      case n.name
+      when :times then counted_loop(const(0), expr(recv), :lt, params, body)
+      when :upto then counted_loop(expr(recv), expr(args[0]), :le, params, body)
+      when :each, :map, :each_with_index
+        r = recv.is_a?(Prism::ParenthesesNode) ? recv.body.body.last : recv
+        if r.is_a?(Prism::RangeNode)
+          raise "map over a range" if n.name == :map
+          return counted_loop(expr(r.left), expr(r.right), r.exclude_end? ? :lt : :le, params, body)
+        end
+        k = recv ? kind_of(recv) : (@klass&.name) # receiverless: self
+        y = @yielders[n.name]
+        return inline_yielder(y, recv, args, params, body) if y && k.is_a?(Symbol) && @classes[k] && y[0] && (k == y[0].name || y[0].name.nil?)
+        return inline_yielder(y, recv, args, params, body) if y && k.nil? && recv.nil?
+        array_loop(expr(recv), n.name, params, body)
+      else
+        y = @yielders[n.name] or raise "block passed to #{n.name}, which has no yield"
+        inline_yielder(y, recv, args, params, body)
+      end
+    end
+
+    # for i in [from, to): header phis over every local; block params are
+    # prefixed so they shadow without clobbering
+    def counted_loop(from, to, cond, params, body, &each)
+      pfx = :"blk#{@f.blocks.size}:"
+      hb, bb, lb, xb = @f.new_block(:head), @f.new_block(:body), @f.new_block(:latch), @f.new_block(:exit)
+      xb.cold = true
+      pre = @cur
+      ivar = :"#{pfx}i"
+      @locals[ivar] = from
+      emit(:br, [hb])
+      phis = @locals.to_h { |nm, v| ph = hb.phi; ph.args << [pre, v]; [nm, ph] }
+      @locals = phis.dup
+      @cur = hb
+      emit(:condbr, [emit(:cmp, [@locals[ivar], to], cond), bb, xb])
+      outer, @loop = @loop, { exit: xb, breaks: [], next: lb, nexts: [] }
+      @cur = bb
+      each ? each.call(@locals[ivar], params, pfx) : (@locals[:"#{pfx}#{params[0]}"] = @locals[ivar] if params[0])
+      @blk_pfx = (@blk_pfx || []) << pfx
+      last = nil
+      body.each { last = expr(_1) }
+      @blk_pfx.pop
+      if @map_target && @map_target[0] && @locals[@map_target[0]]
+        outv, idx = @map_target; @map_target = nil
+        @locals[outv] = emit(:aset, [@locals[outv], idx, last || const(0)])
+      end
+      emit(:br, [lb]) unless @cur.term
+      @loop[:nexts] << [@cur, @locals.dup] unless @cur.name.to_s.start_with?("dead")
+      # latch: merge normal end + nexts, then step
+      @cur = lb
+      arms = @loop[:nexts].select { |(b, _)| b.succs.include?(lb) }
+      @locals = merge_locals(lb, arms) unless arms.size <= 1
+      @locals = arms[0][1].dup if arms.size == 1
+      @locals[ivar] = emit(:add, [@locals[ivar], const(1)])
+      emit(:br, [hb])
+      phis.each { |nm, ph| ph.args << [lb, @locals.fetch(nm)] }
+      breaks = @loop[:breaks]; @loop = outer
+      @cur = xb
+      @locals = breaks.empty? ? phis.dup : merge_locals(xb, [[hb, phis.dup], *breaks])
+      @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
+      const(0)
+    end
+
+    def array_loop(arr, kind, params, body)
+      len = emit(:alen, [arr])
+      out = (emit(:anew, [len, (c = const(0); c.ty = :nil; c)])) if kind == :map
+      outv = :"map#{@f.blocks.size}:out"
+      @locals[outv] = out if out
+      counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
+        @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+        @locals[:"#{pfx}#{ps[1]}"] = i if kind == :each_with_index && ps[1]
+        if kind == :map
+          # the body's value is stored at the latch: wrap body so its last value is captured
+          @map_target = [outv, i]
+        end
+      end.then do |r|
+        if out
+          res = @locals.delete(outv); res
+        else r end
+      end
+    end
+
+    def inline_yielder((klass, d), recv, args, params, body)
+      pfx = :"inl#{@f.blocks.size}:"
+      me = recv ? expr(recv) : @locals[:self]
+      callee_locals = me ? { :"#{pfx}self" => me } : {} # top-level yielders have no self
+      (d.parameters&.requireds || []).each_with_index { |p, k| callee_locals[:"#{pfx}#{p.name}"] = expr(args[k]) }
+      saved = [@block, @klass, @inl, @ret_exit]
+      @block = [params, body]
+      @inl = pfx; @klass = klass || @klass
+      exit = @f.new_block(:inlret); exit.cold = false
+      @ret_exit = { block: exit, arms: [] }
+      @locals.merge!(callee_locals)
+      last = nil
+      (d.body&.body || []).each { last = inl_expr(_1) }
+      unless @cur.term
+        @ret_exit[:arms] << [@cur, @locals.dup, last || const(0)]
+        emit(:br, [exit])
+      end
+      @cur = exit
+      arms = @ret_exit[:arms]
+      @locals = arms.size == 1 ? arms[0][1].dup : merge_locals(exit, arms.map { |(b, l, _)| [b, l] })
+      val = if arms.size == 1 then arms[0][2]
+            else p = exit.phi; p.args = arms.map { |(b, _, v)| [b, v] }; p end
+      @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
+      @block, @klass, @inl, @ret_exit = saved
+      val
+    end
+
+    # inside an inlined callee every name resolves through the callee prefix
+    def inl_expr(n) = with_prefix(@inl) { expr(n) }
+
+    def with_prefix(pfx)
+      old = @name_pfx; @name_pfx = pfx
+      yield
+    ensure
+      @name_pfx = old
+    end
+
+    # splice the block body at a yield: it runs in the caller's naming
+    def yield_block(arg_nodes)
+      params, body = @block
+      vals = arg_nodes.map { expr(_1) }           # still in callee naming
+      bpfx = :"y#{@f.blocks.size}:"
+      saved_pfx, @name_pfx = @name_pfx, nil
+      saved_ret, @ret_exit = @ret_exit, nil        # a `return` in the block would return from the caller: unsupported
+      params.each_with_index { |p, k| @locals[:"#{bpfx}#{p}"] = vals[k] || const(0) }
+      @blk_pfx = (@blk_pfx || []) << bpfx
+      last = nil
+      body.each { last = expr(_1) }
+      @blk_pfx.pop
+      @locals.delete_if { |k, _| k.to_s.start_with?(bpfx.to_s) }
+      @name_pfx, @ret_exit = saved_pfx, saved_ret
+      last || const(0)
     end
 
     def if_expr(n)
@@ -256,14 +468,14 @@ module Indus
       before = @locals.dup
 
       @cur = tb; tv = (n.statements&.body || []).map { expr(_1) }.last || const(0)
-      tend, tlocals = @cur, @locals; @cur << Inst.new(:br, [mb]) unless @cur.term
+      tend, tlocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
 
       @cur = eb; @locals = before.dup
       ev = case n.subsequent
            when Prism::IfNode then if_expr(n.subsequent)
            when Prism::ElseNode then n.subsequent.statements&.body&.map { expr(_1) }&.last
            end || const(0)
-      eend, elocals = @cur, @locals; @cur << Inst.new(:br, [mb]) unless @cur.term
+      eend, elocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
 
       @cur = mb
       @locals = merge_locals(mb, [[tend, tlocals], [eend, elocals]])
@@ -286,7 +498,7 @@ module Indus
       hb, bb, xb = @f.new_block(:head), @f.new_block(:body), @f.new_block(:exit)
       xb.cold = true
       pre = @cur
-      @cur << Inst.new(:br, [hb])
+      emit(:br, [hb])
       phis = @locals.to_h { |nm, v| ph = hb.phi; ph.args << [pre, v]; [nm, ph] }
       @locals = phis.dup
       @cur = hb
@@ -295,7 +507,7 @@ module Indus
       @cur = bb
       (n.statements&.body || []).each { expr(_1) }
       bend = @cur
-      @cur << Inst.new(:br, [hb]) unless @cur.term
+      emit(:br, [hb]) unless @cur.term
       phis.each { |nm, ph| ph.args << [bend, @locals[nm]] }
       breaks = @loop[:breaks]; @loop = outer
       @cur = xb

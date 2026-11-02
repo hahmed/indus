@@ -200,7 +200,7 @@ module Indus
 
     # an ivar's type: joined over the class and its subclasses (same offset)
     def self.ivar_type(k, ix)
-      klass = @classes[k]
+      klass = @classes[k] or raise "ivar_type: receiver typed #{k.inspect}"
       [klass, *@classes.values.select { |c| c.superclass == klass }].map { @ivars[_1.name][ix] }.reduce(nil) { join(_1, _2) }
     end
 
