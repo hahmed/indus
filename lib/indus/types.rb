@@ -31,6 +31,12 @@ module Indus
     def self.poly?(t) = t.is_a?(Array) && t[0] == :poly
     def self.of(f, v) = v.op == :param ? f.ptypes[f.params.index(v)] : v.ty
     def self.arr(t) = t.is_a?(Array) && t[0] == :arr
+    # does a value of this type hold a heap pointer the collector must follow?
+    def self.heap_pointer?(t)
+      return true if t == :str
+      return true if t.is_a?(Array) && %i[arr hash poly].include?(t[0])
+      t.is_a?(Symbol) && !!@classes&.[](t)
+    end
     def self.hsh(t) = t.is_a?(Array) && t[0] == :hash
 
     def self.run(funcs, classes, lower = nil)
@@ -242,7 +248,7 @@ module Indus
       when :puts_v then of(f, a[0]) && :int
       when :add, :sub, :mul, :div then join(narrow(of(f, a[0])), narrow(of(f, a[1])))
       when :and, :or then (of(f, a[0]) == :bool && of(f, a[1]) == :bool) ? :bool : :int
-      when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow then :int
+      when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst then :int
       when :cmp then :bool
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }

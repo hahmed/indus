@@ -11,7 +11,11 @@ $LLVM/llvm-objcopy -O binary --only-section=.text /tmp/rt.o /tmp/rt.bin
   echo "module Indus"
   echo "  module RuntimeBlob"
   echo "    LABELS = {"
-  $LLVM/llvm-objdump -t /tmp/rt.o | awk '/ (rt_|__)/ {printf "      %s: 0x%s,\n", $NF, $1}'
+  $LLVM/llvm-objdump -t /tmp/rt.o | awk '/ (rt_|__)/ && !/UND/ {printf "      %s: 0x%s,\n", $NF, $1}'
+  echo "    }"
+  echo "    # external calls: word index -> symbol, fixed up by Asm against compiled code"
+  echo "    RELOCS = {"
+  $LLVM/llvm-objdump -r /tmp/rt.o | awk '/CALL26/ {print $1, $3}' | while read off sym; do echo "      $((16#$off / 4)) => :$sym,"; done
   echo "    }"
   echo "    WORDS = ["
   xxd -p -c4 /tmp/rt.bin | awk '{w=$1; printf "      0x%s%s%s%s,\n", substr(w,7,2), substr(w,5,2), substr(w,3,2), substr(w,1,2)}'

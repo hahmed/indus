@@ -334,6 +334,9 @@ module Indus
         r = emit(:lshift_or_append, [a, v])
         emit(:fld_set, [@locals.fetch(:self), @klass.ivar(n.receiver.name), r]); return r
       end
+      if n.receiver.nil? && n.name.to_s.start_with?("__") && !@funcs[n.name] && !(@klass && @klass.find_method(n.name))
+        return intrinsic(n.name, args) # the GC prelude's raw memory access
+      end
       if n.name == :! && args.empty?
         v = expr(n.receiver)
         return emit(:cmp, [v, const(0)], :eq) # !x : true iff x is nil/false (0)
@@ -444,6 +447,20 @@ module Indus
       @blk_pfx.pop
       @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
       vals
+    end
+
+    # raw memory / addresses for the collector (lib/indus/prelude/gc.rb)
+    def intrinsic(name, args)
+      case name
+      when :__ld then emit(:rawld, [expr(args[0])])
+      when :__ld32 then emit(:rawld32, [expr(args[0])])
+      when :__st then (a = expr(args[0]); v = expr(args[1]); emit(:rawst, [a, v]); v)
+      when :__gbase then emit(:gbase, [])
+      when :__adr_tables then emit(:adrlbl, [:__gc_tables])
+      when :__adr_text then emit(:adrlbl, [:__text_base])
+      when :__dbg then emit(:puts_i, [expr(args[0])])
+      else raise "unknown intrinsic #{name}"
+      end
     end
 
     # ------------------------------------------------------------ blocks

@@ -601,3 +601,64 @@ __ipow:
         sub     x1, x1, #1
         b       0b
 1:      ret
+
+// ---------------------------------------------------------------- the collector
+// The collector itself is Ruby (lib/indus/prelude/gc.rb), compiled by Indus
+// into GC-mode programs as __gc_run(fp) -> new bump pointer. This stub is the
+// safepoint entry: it preserves every caller-saved register (the compiled
+// code may hold non-pointer temporaries in them) and hands over the frame
+// pointer so the frame walk starts at the caller.
+rt_gc:
+        stp     x29, x30, [sp, #-176]!
+        mov     x29, sp
+        stp     x0, x1, [sp, #16]
+        stp     x2, x3, [sp, #32]
+        stp     x4, x5, [sp, #48]
+        stp     x6, x7, [sp, #64]
+        stp     x8, x9, [sp, #80]
+        stp     x10, x11, [sp, #96]
+        stp     x12, x13, [sp, #112]
+        stp     x14, x15, [sp, #128]
+        stp     x16, x17, [sp, #144]
+        str     x18, [sp, #160]
+        sub     sp, sp, #256
+        stp     d0, d1, [sp, #0]
+        stp     d2, d3, [sp, #16]
+        stp     d4, d5, [sp, #32]
+        stp     d6, d7, [sp, #48]
+        stp     d16, d17, [sp, #64]
+        stp     d18, d19, [sp, #80]
+        stp     d20, d21, [sp, #96]
+        stp     d22, d23, [sp, #112]
+        stp     d24, d25, [sp, #128]
+        stp     d26, d27, [sp, #144]
+        stp     d28, d29, [sp, #160]
+        stp     d30, d31, [sp, #176]
+        mov     x0, x29                         // the frame chain, starting here
+        bl      __gc_run
+        mov     x28, x0                         // allocation continues in to-space
+        ldp     d0, d1, [sp, #0]
+        ldp     d2, d3, [sp, #16]
+        ldp     d4, d5, [sp, #32]
+        ldp     d6, d7, [sp, #48]
+        ldp     d16, d17, [sp, #64]
+        ldp     d18, d19, [sp, #80]
+        ldp     d20, d21, [sp, #96]
+        ldp     d22, d23, [sp, #112]
+        ldp     d24, d25, [sp, #128]
+        ldp     d26, d27, [sp, #144]
+        ldp     d28, d29, [sp, #160]
+        ldp     d30, d31, [sp, #176]
+        add     sp, sp, #256
+        ldp     x0, x1, [sp, #16]
+        ldp     x2, x3, [sp, #32]
+        ldp     x4, x5, [sp, #48]
+        ldp     x6, x7, [sp, #64]
+        ldp     x8, x9, [sp, #80]
+        ldp     x10, x11, [sp, #96]
+        ldp     x12, x13, [sp, #112]
+        ldp     x14, x15, [sp, #128]
+        ldp     x16, x17, [sp, #144]
+        ldr     x18, [sp, #160]
+        ldp     x29, x30, [sp], #176
+        ret

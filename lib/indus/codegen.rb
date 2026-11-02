@@ -2,6 +2,8 @@
 module Indus
   class Codegen
     TMP = 8; FTMP = 30; FTMP2 = 31 # scratch; pools live in RegAlloc
+    # ops that may bump the heap: a collection may run just before them
+    ALLOCATING = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos call pcall sendsw].freeze
 
     def initialize(asm, classes = {}) = (@asm, @classes = asm, classes)
 
@@ -39,6 +41,11 @@ module Indus
       raise "frame too large (#{frame})" if frame > 4080
       @asm.label(f.name)
       @asm.sub_sp(frame); @asm.stp(29, 30, 0); @asm.mov_fp_sp
+      if GC.enabled? # pointer slots are roots: zero them, and describe this frame
+        ptr_slots = (f.params + f.all).select { |i| i.slot && GC.pointer?(i.ty) }.map { |i| [slot_off(i), @asm.gc_table.tid(i.ty)] }
+        ptr_slots.each { |(off, _)| @asm.str(31, off) }
+        @asm.gc_frames << [f.name, :"#{f.name}_ret", ptr_slots]
+      end
       used.each_slice(2).with_index { |(a, b), i| @asm.stp(a, b, 16 + i * 16) }
       fused.each_slice(2).with_index { |(a, b), i| @asm.fstp(a, b, fsave + i * 16) }
       if f.name == :main # heap base arrives in x0: globals in the first 4K, bump pointer after
@@ -56,7 +63,10 @@ module Indus
       end
       # params: ints in x0.., floats in d0.. (separate counters, AAPCS64)
       xi = fi = 0
-      f.params.each { |p| p.float? ? (@asm.fmov(p.reg, fi); fi += 1) : (@asm.mov(p.reg, xi); xi += 1) }
+      f.params.each do |p|
+        if p.float? then p.reg ? @asm.fmov(p.reg, fi) : @asm.fstr(fi, slot_off(p)); fi += 1
+        else p.reg ? @asm.mov(p.reg, xi) : @asm.str(xi, slot_off(p)); xi += 1 end
+      end
       f.blocks.each { block(_1) }
       @asm.label(:"#{f.name}_ret")
       @asm.str_off(Asm::HEAP, Asm::GBASE, @asm.global(:__heap_end)) if f.name == :main
@@ -103,6 +113,7 @@ module Indus
       b.insts.each do |i|
         d = dst(i)
         calls_before = @asm.ncalls || 0
+        @asm.gc_safepoint if GC.enabled? && ALLOCATING.include?(i.op) && !@f.name.to_s.start_with?("__gc")
         case i.op
         when :const, :fconst then nil
         when :add, :sub, :mul, :div
@@ -142,8 +153,21 @@ module Indus
             @asm.mov(d, 0)
           end
         when :nop then @asm.mov(d, reg(i.args[0]))
+        when :rawld then @asm.ldr_off(d, reg(i.args[0]), 0)
+        when :rawld32 then @asm.emit(0xB9400000 | (reg(i.args[0]) << 5) | d)      # ldr wd, [xn]
+        when :rawst then @asm.str_off(reg(i.args[1], 9), reg(i.args[0]), 0)
+        when :gbase then @asm.mov(d, Asm::GBASE)
+        when :adrlbl then @asm.adr(d, i.args[0])
         when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer
-        when :hrestore then @asm.mov(Asm::HEAP, reg(i.args[0])) # ...and drop the iteration's garbage
+        when :hrestore # ...and drop the iteration's garbage
+          if GC.enabled? # unless a collection moved the heap since the save
+            skip = @asm.uniq; r = reg(i.args[0])
+            @asm.ldr_off(16, Asm::GBASE, @asm.global(:__gc_from)); @asm.cmp(r, 16); @asm.bcond(:lo, skip)
+            @asm.ldr_off(16, Asm::GBASE, @asm.global(:__gc_from_end)); @asm.cmp(r, 16); @asm.bhs(skip)
+            @asm.mov(Asm::HEAP, r); @asm.label(skip)
+          else
+            @asm.mov(Asm::HEAP, reg(i.args[0]))
+          end
         when :mod # Ruby modulo: floor division remainder
           l, r = i.args
           @asm.sdiv_floor(16, reg(l), reg(r, 9)); @asm.emit(0x9B008000 | (reg(r, 9) << 16) | (reg(l) << 10) | (16 << 5) | d) # msub d, x16, r, l
@@ -206,6 +230,7 @@ module Indus
           i.float? ? @asm.fldr_off(d, Asm::GBASE, off) : @asm.ldr_off(d, Asm::GBASE, off)
         when :gset
           name, v = i.args; off = @asm.global(name)
+          @asm.gc_globals << [off, @asm.gc_table.tid(v.ty)] if GC.enabled? && GC.pointer?(v.ty) && @asm.gc_globals.none? { _1[0] == off }
           v.float? ? @asm.fstr_off(freg(v), Asm::GBASE, off) : @asm.str_off(reg(v, 9), Asm::GBASE, off)
         when :to_f then @asm.scvtf(d, reg(i.args[0]))
         when :to_i then i.args[0].float? ? @asm.fcvtzs(d, freg(i.args[0])) : @asm.mov(d, reg(i.args[0]))
@@ -222,10 +247,12 @@ module Indus
           v.float? ? @asm.emit(0x9E660000 | (freg(v) << 5) | 1) : @asm.mov(1, reg(v, 1)) # fmov x1, d
           @asm.bl(:__anew); @asm.mov(d, 0)
         when :aget # out of range (incl. negative, via unsigned compare) -> nil (0)
-          a, ix = i.args; ra = reg(a); ri = reg(ix, 9)
+          a, ix = i.args
+          @asm.fmov_imm(d, 0.0) if i.float?             # the nil default first: its mov_imm uses x8
+          ra = reg(a); ri = reg(ix, 9)
           @asm.ldur(16, ra, -8); @asm.cmp(ri, 16)      # x16: len (x8/x9 may hold ra/ri)
           skip = @asm.uniq
-          if i.float? then @asm.fmov_imm(d, 0.0); @asm.bhs(skip); @asm.fldr_idx(d, ra, ri)
+          if i.float? then @asm.bhs(skip); @asm.fldr_idx(d, ra, ri)
           else
             i.ty == :int? ? @asm.emit(0xD2F00000 | d) : @asm.mov_imm(d, 0) # nil: sentinel for ints, null for pointers
             @asm.bhs(skip); @asm.ldr_idx(d, ra, ri)

@@ -22,6 +22,16 @@ module Indus
     def self.run(unit)
       mem = place(unit.code)
       heap = MMAP.call(nil, 1 << 28, 3, 0x1002, -1, 0)
+      if GC.enabled?
+        size = (ENV["INDUS_HEAP_MB"] || 64).to_i << 20
+        from = heap.to_i + 4096
+        to = MMAP.call(nil, size, 3, 0x1002, -1, 0).to_i
+        bitmap = MMAP.call(nil, size / 128 + 4096, 3, 0x1002, -1, 0).to_i
+        work = MMAP.call(nil, 1 << 26, 3, 0x1002, -1, 0).to_i
+        g = unit.globals
+        { __gc_limit: from + size - (1 << 20), __gc_from: from, __gc_from_end: from + size,
+          __gc_to: to, __gc_to_end: to + size, __gc_bitmap: bitmap, __gc_work: work }.each { |k, v| heap[g.fetch(k), 8] = [v].pack("Q") }
+      end
       unless unit.seams.empty?
         # the resident compiler, reachable from machine code
         cb = Fiddle::Closure::BlockCaller.new(Fiddle::TYPE_LONG, [Fiddle::TYPE_LONG]) do |id|
@@ -39,8 +49,14 @@ module Indus
       end
       r = Fiddle::Function.new(mem, [Fiddle::TYPE_VOIDP], Fiddle::TYPE_LONG).call(heap)
       if ENV["HEAP"] && (off = unit.globals[:__heap_end])
-        used = heap[off, 8].unpack1("Q") - heap.to_i - 4096
-        $stderr.puts "indus: heap #{used >= 1 << 20 ? "#{(used / 1048576.0).round(1)} MB" : "#{used / 1024} KB"}"
+        if GC.enabled?
+          endp = heap[off, 8].unpack1("Q"); from = heap[unit.globals[:__gc_from], 8].unpack1("Q")
+          used = endp - from; n = heap[unit.globals[:__gc_count], 8].unpack1("Q")
+          $stderr.puts "indus: heap #{used >= 1 << 20 ? "#{(used / 1048576.0).round(1)} MB" : "#{used / 1024} KB"} live-ish after #{n} collections"
+        else
+          used = heap[off, 8].unpack1("Q") - heap.to_i - 4096
+          $stderr.puts "indus: heap #{used >= 1 << 20 ? "#{(used / 1048576.0).round(1)} MB" : "#{used / 1024} KB"}"
+        end
       end
       r
     end

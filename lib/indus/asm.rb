@@ -2,16 +2,48 @@
 module Indus
   class Asm
     attr_reader :words
+    attr_accessor :gc_table, :gc_frames, :gc_globals
     def initialize
       @words, @labels, @fixups, @data, @seams = [], {}, [], [], []
+      @gc_frames, @gc_globals = [], []
       global(:__write_fn) # offset 0: the runtime blob calls write through [x27]
+      # fixed global slots the collector uses (offsets 8..)
+      %i[__gc_limit __gc_from __gc_from_end __gc_to __gc_to_end __gc_bitmap __gc_work __gc_count __gc_free __gc_wtop].each { global(_1) }
+      label(:__text_base)
+    end
+
+    # if the bump pointer passed the limit, collect before allocating
+    def gc_safepoint
+      ok = uniq
+      ldr_off(16, GBASE, global(:__gc_limit))
+      emit(0xEB10039F)                 # cmp x28, x16
+      bcond(:lo, ok)
+      bl(:rt_gc)
+      label(ok)
+    end
+
+    # the collector's tables, as data: type descriptors, frame maps, global roots
+    def emit_gc_tables
+      t = gc_table.words
+      frames = gc_frames.flat_map { |(start, stop, slots)| [[:lbl, start], [:lbl, stop], slots.size, *slots.flatten] }
+      globals = gc_globals.flatten
+      words = [t.size, *t, gc_frames.size, *frames, gc_globals.size, *globals]
+      emit 0 while pos % 2 != 0
+      label(:__gc_tables)
+      words.each do |w|
+        if w.is_a?(Array) then fix(w[1], :abs32); emit(0) # code offset of a label, in bytes
+        else emit(w & 0xFFFFFFFF) end
+      end
     end
 
     # the assembled runtime (lib/indus/runtime.s): drop it in, name its entry points
     def emit_runtime_blob
       base = pos
       RuntimeBlob::LABELS.each { |n, off| @labels[n] = base + off / 4 }
+      RuntimeBlob::RELOCS.each { |idx, sym| @fixups << [base + idx, sym, :b26] }
       @words.concat(RuntimeBlob::WORDS)
+      # without the collector compiled in, its entry is unreachable (no safepoints are emitted)
+      (label(:__gc_run); emit(0xD4200000)) unless @labels[:__gc_run] || GC.enabled?
     end
 
     # a string literal: [cap][len][bytes] in the data area; label at the bytes
@@ -100,7 +132,7 @@ module Indus
     def subi(rd, rn, i) = emit(0xD1000000 | (i << 10) | (rn << 5) | rd)
     def cmp(rn, rm) = emit(0xEB00001F | (rm << 16) | (rn << 5))
     def cmpi(rn, i) = emit(0xF100001F | (i << 10) | (rn << 5))
-    COND = { eq: 0x0, ne: 0x1, ge: 0xA, lt: 0xB, gt: 0xC, le: 0xD, mi: 0x4, pl: 0x5, ls: 0x9, hi: 0x8,
+    COND = { eq: 0x0, ne: 0x1, ge: 0xA, lt: 0xB, gt: 0xC, le: 0xD, mi: 0x4, pl: 0x5, ls: 0x9, hi: 0x8, lo: 0x3,
              # float compares: unordered must be false for < <= (mi/ls), true for != (ne)
              feq: 0x0, fne: 0x1, flt: 0x4, fle: 0x9, fgt: 0xC, fge: 0xA }
     INV = { eq: :ne, ne: :eq, ge: :lt, lt: :ge, gt: :le, le: :gt, mi: :pl, pl: :mi, ls: :hi, hi: :ls,
@@ -185,11 +217,13 @@ module Indus
         @words.concat(padded.unpack("V*"))
       end
       @fixups.each do |at, n, k|
+        raise "fixup #{n} (#{k}) at word #{at} beyond code (#{@words.size})" if @words[at].nil?
         off = @labels.fetch(n) { raise "undefined #{n}" } - at
         @words[at] |= case k
                       when :b19 then (off & 0x7FFFF) << 5
                       when :b26 then off & 0x3FFFFFF
                       when :adr then bo = off * 4; ((bo & 3) << 29) | (((bo >> 2) & 0x7FFFF) << 5)
+                      when :abs32 then @labels.fetch(n) * 4 # byte offset from the text base
                       end
       end
       @words.pack("V*")

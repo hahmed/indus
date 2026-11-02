@@ -18,7 +18,7 @@
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir lower types passes peephole escape runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir lower types passes peephole escape gc runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # everything a compiled program knows about itself: enough for the
@@ -30,20 +30,26 @@ module Indus
   end
 
   # standalone: nil (run in-process via libc write), :darwin or :linux
+  PRELUDE_GC = File.read(File.join(__dir__, "indus/prelude/gc.rb"))
+
   def self.compile(src, standalone: nil)
+    src = PRELUDE_GC + "\n" + src if GC.enabled? # the collector rides along as Ruby
     lower = Lower.new(src)
     funcs = lower.run
+    funcs.each { Passes.trivial_phis(_1) } # dead statement-valued phis would confuse typing
     Types.run(funcs, lower.classes, lower)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     funcs.each { Peephole.run(_1) unless ENV["NOPEEP"] }
     Escape.run(funcs, lower.classes) unless ENV["NOESCAPE"]
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]
     asm = Asm.new
+    asm.gc_table = GC::Table.new(lower.classes)
     asm.write_addr = Metal::LIBC["write"].to_i unless standalone
     asm.libm = %i[sin cos pow].to_h { [_1, Metal::LIBC[_1.to_s].to_i] } unless standalone
     asm.emit_start_linux if standalone == :linux
     funcs.each { Codegen.new(asm, lower.classes).func(_1) }
     asm.emit_runtime_blob
+    asm.emit_gc_tables if GC.enabled?
     asm.emit_syscalls(standalone) if standalone
     raise "this program has a seam (class_eval); a standalone binary needs the resident compiler" if standalone && !asm.seams.empty?
     Unit.new(asm.resolve!, asm, lower, funcs)
@@ -60,6 +66,7 @@ module Indus
     Passes.run(f)
     raise "redefinition changed #{f.name}'s signature" unless f.ptypes == old.ptypes && f.rtype == old.rtype
     asm = Asm.new
+    asm.gc_table = unit.asm.gc_table
     asm.write_addr = Metal::LIBC["write"].to_i
     asm.externs = unit.asm.labels.transform_values { base + _1 * 4 }
     asm.instance_variable_set(:@globals, unit.globals) # same slots

@@ -22,7 +22,7 @@ module Indus
     FCALLEE = (8..15).to_a
     FCALLER = (16..29).to_a  # d30, d31 scratch
 
-    Interval = Struct.new(:v, :start, :stop, :crosses_call, :hint)
+    Interval = Struct.new(:v, :start, :stop, :crosses_call, :hint, :gc_slot)
 
     attr_reader :used, :fused, :nslots
 
@@ -42,7 +42,7 @@ module Indus
         bend[b] = n - 1
       end
       f.params.each { pos[_1] = -1 }
-      skip = ->(i) { i.term? || %i[const fconst puts_s puts_i puts_str puts_bool puts_opt puts_nil putc gset fld_set seam hrestore].include?(i.op) || (i.op == :cmp && fused?(i)) }
+      skip = ->(i) { i.term? || %i[const fconst puts_s puts_i puts_str puts_bool puts_opt puts_nil putc gset fld_set seam hrestore rawst].include?(i.op) || (i.op == :cmp && fused?(i)) }
       value = ->(x) { x.is_a?(Inst) && !skip.(x) && !%i[const fconst].include?(x.op) }
 
       # ---- liveness
@@ -91,6 +91,10 @@ module Indus
       calls = blocks.flat_map { |b| b.insts.select(&:call?).map { pos[_1] } }
       # a call at the interval's last use consumes the value before clobbering: not a crossing
       iv.each_value { |it| it.crosses_call = calls.any? { |c| c > it.start && c < it.stop } }
+      # GC mode: a pointer that is live at a call -- including as that call's argument, since a
+      # collection may run before the callee sees it -- must sit in a frame slot the collector can find
+      gc = GC.enabled?
+      iv.each_value { |it| it.gc_slot = gc && GC.pointer?(it.v.ty) && calls.any? { |c| c > it.start && c <= it.stop } }
       # phi hints: phi <-> its args
       blocks.each do |b|
         b.phis.each do |p|
@@ -113,6 +117,7 @@ module Indus
       spill = ->(it) { it.v.slot = @nslots; @nslots += 1 }
 
       intervals.each do |it|
+        if it.gc_slot then spill.(it); next end
         # expire
         active.reject! do |a|
           if a.stop < it.start
