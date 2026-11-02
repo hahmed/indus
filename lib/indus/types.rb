@@ -33,8 +33,8 @@ module Indus
     def self.arr(t) = t.is_a?(Array) && t[0] == :arr
     def self.hsh(t) = t.is_a?(Array) && t[0] == :hash
 
-    def self.run(funcs, classes)
-      @classes = classes
+    def self.run(funcs, classes, lower = nil)
+      @classes = classes; @lower = lower || @lower
       @ivars = Hash.new { |h, k| h[k] = {} } # class name -> ivar index -> type
       @consts = {}
       funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = f.cls.name if f.cls }
@@ -44,6 +44,7 @@ module Indus
         funcs.each do |f|
           f.all.each do |i|
             bind(f, i) if i.op == :mcall
+            dsend(f, i) if i.op == :dsend
             index(f, i) if i.op == :idx || i.op == :idx_set
             t = infer(f, i)
             set.(i.ty, t) { i.ty = _1 }
@@ -59,6 +60,15 @@ module Indus
                   payload.ptypes[0] = klass.name
                   args.each_with_index { |a, k| set.(payload.ptypes[k + 1], of(f, a)) { payload.ptypes[k + 1] = _1 } }
                 when :fld_set then set.(@ivars[klass.name][payload], of(f, args[0])) { @ivars[klass.name][payload] = _1 }
+                end
+              end
+            when :sendsw
+              arms, _, recv, *args = i.args
+              arms.each do |_, kind, payload|
+                case kind
+                when :call
+                  args.each_with_index { |a, k| set.(payload.ptypes[k + 1], of(f, a)) { payload.ptypes[k + 1] = _1 } }
+                when :fld_set then k = of(f, recv); set.(@ivars[k][payload], of(f, args[0])) { @ivars[k][payload] = _1 } if k
                 end
               end
             when :ret then set.(f.rtype, of(f, i.args[0])) { f.rtype = _1 }
@@ -122,11 +132,53 @@ module Indus
         return
       end
       return unless t.is_a?(Symbol) && (klass = @classes[t])
-      kind, payload = resolve(klass, name, args.size)
+      kind, payload = resolve(klass, name, args.size, allow_missing: true)
       case kind
       when :fld_get then i.op = :fld_get; i.args = [recv, payload]
       when :fld_set then i.op = :fld_set; i.args = [recv, payload, args[0]]
       when :call then i.op = :call; i.args = [payload, recv, *args]
+      when :missing # method_missing(name, *args): the name is a compile-time symbol, args packed
+        i.op = :call; i.args = [payload, recv, sym_const(i, name), pack_args(i, args)]
+      end
+    end
+
+    def self.sym_const(at, name)
+      c = Inst.new(:const, [@lower.sym_id(name)]); c.ty = :sym; c.block = at.block
+      at.block.insts.insert(at.block.insts.index(at), c); c
+    end
+
+    # *args as a fresh array built just before the call
+    def self.pack_args(at, args)
+      ins = ->(op, a, ty) { x = Inst.new(op, a); x.ty = ty; x.block = at.block; at.block.insts.insert(at.block.insts.index(at), x); x }
+      n = ins.(:const, [args.size], :int)
+      nilc = ins.(:const, [0], :nil)
+      arr = ins.(:anew, [n, nilc], [:arr, nil])
+      args.each_with_index { |a, k| arr = ins.(:aset, [arr, ins.(:const, [k], :int), a], nil) }
+      arr
+    end
+
+    # send with a computed symbol: one arm per method of the class (and attrs)
+    # whose arity matches; dispatch compares symbol ids
+    def self.dsend(f, i)
+      name_v, recv, *args = i.args
+      t = of(f, recv)
+      return unless t.is_a?(Symbol) && (klass = @classes[t])
+      arms = []
+      each_method(klass) do |mname, kind, payload, arity|
+        next unless arity == args.size
+        arms << [@lower.sym_id(mname), kind, payload]
+      end
+      i.op = :sendsw; i.args = [arms, name_v, recv, *args]
+    end
+
+    def self.each_method(klass, &b)
+      seen = {}
+      k = klass
+      while k
+        k.readers.each { |n, iv| next if seen[n]; seen[n] = true; b.(n, :fld_get, klass.ivar(iv), 0) }
+        k.writers.each { |n, iv| next if seen[n]; seen[n] = true; b.(n, :fld_set, klass.ivar(iv), 1) }
+        k.methods.each { |n, m| next if seen[n] || n == :initialize || n == :method_missing; seen[n] = true; b.(n, :call, m, m.params.size - 1) }
+        k = k.superclass
       end
     end
 
@@ -142,11 +194,20 @@ module Indus
       else raise "[] on #{t.inspect}" end
     end
 
-    def self.resolve(klass, name, nargs)
+    def self.resolve(klass, name, nargs, allow_missing: false)
       if (iv = klass.find_reader(name)) && nargs == 0 then [:fld_get, klass.ivar(iv)]
       elsif (iv = klass.find_writer(name)) && nargs == 1 then [:fld_set, klass.ivar(iv)]
       elsif (m = klass.find_method(name)) then [:call, m]
+      elsif allow_missing && (mm = klass.find_method(:method_missing)) then [:missing, mm]
       else raise "no method #{name} on #{klass.name}"
+      end
+    end
+
+    def self.sw_arm_type(f, i, kind, payload)
+      case kind
+      when :fld_get then @ivars[of(f, i.args[2])][payload]
+      when :fld_set then of(f, i.args[3])
+      when :call then payload.rtype
       end
     end
 
@@ -163,7 +224,7 @@ module Indus
     def self.infer(f, i)
       a = i.args
       case i.op
-      when :const then i.ty == :nil ? :nil : :int
+      when :const then %i[nil sym].include?(i.ty) ? i.ty : :int
       when :fconst then :float
       when :sconst, :scat, :sappend, :itos then :str
       when :seq then :bool
@@ -175,6 +236,8 @@ module Indus
       when :and, :or, :xor, :shl, :shr, :mod, :to_i, :alen, :ipow then :int
       when :cmp then :bool
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
+      when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
+      when :dsend then nil
       when :to_f, :fsqrt, :libm then :float
       when :pow then join(narrow(of(f, a[0])), narrow(of(f, a[1]))) == :float ? :float : :int
       when :seq_char then :bool

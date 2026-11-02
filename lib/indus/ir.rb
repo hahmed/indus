@@ -6,7 +6,7 @@ module Indus
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
     def term? = %i[br condbr ret].include?(op)
-    def call? = %i[call mcall pcall puts_i puts_s puts_str puts_bool puts_opt puts_nil putc anew aset onew ipow seam sconst scat sappend seq itos libm fpow hnew hget hset hkey hkeys ssub].include?(op)
+    def call? = %i[call mcall pcall dsend sendsw puts_i puts_s puts_str puts_bool puts_opt puts_nil putc anew aset onew ipow seam sconst scat sappend seq itos libm fpow hnew hget hset hkey hkeys ssub].include?(op)
     def float? = ty == :float
     def to_s = "v#{id}"
   end
@@ -45,7 +45,7 @@ module Indus
   end
 
   class Func
-    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other
+    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :rest
     def initialize(name, nparams)
       @name, @params, @blocks = name, Array.new(nparams) { Inst.new(:param) }, [Block.new(:entry)]
     end
@@ -68,7 +68,7 @@ module Indus
           a = i.args.map do |x|
             case x
             when Block, Func, Klass then x.name
-            when Array then x.map { |arm| arm.is_a?(Array) ? "#{arm[0].name}->#{arm[2].is_a?(Func) ? arm[2].name : arm[2]}" : arm.to_s }.join(" | ")
+            when Array then x.map { |arm| arm.is_a?(Array) ? "#{arm[0].respond_to?(:name) ? arm[0].name : arm[0]}->#{arm[2].is_a?(Func) ? arm[2].name : arm[2]}" : arm.to_s }.join(" | ")
             else x.to_s
             end
           end.join(", ")

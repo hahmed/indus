@@ -7,7 +7,9 @@ module Indus
     CMP = { :== => :eq, :!= => :ne, :< => :lt, :<= => :le, :> => :gt, :>= => :ge }
     ARITH = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :% => :mod, :& => :and, :| => :or, :^ => :xor, :<< => :shl, :>> => :shr }
 
-    attr_reader :classes
+    attr_reader :classes, :syms
+    # symbols are small integers, interned at compile time
+    def sym_id(name) = (@syms ||= {})[name.to_sym] ||= @syms.size + 1
 
     def initialize(src) = (@ast, @funcs, @classes, @consts = Prism.parse(src).value, {}, {}, {})
 
@@ -30,14 +32,11 @@ module Indus
           case st
           when Prism::DefNode
             if yields?(st) then @yielders[st.name] = [k, st]; next end # inlined only
-            f = Func.new(:"#{k.name}##{st.name}", 1 + (st.parameters&.requireds&.size || 0))
+            f = Func.new(:"#{k.name}##{st.name}", 1 + (st.parameters&.requireds&.size || 0) + (st.parameters&.rest ? 1 : 0))
+            f.rest = true if st.parameters&.rest
             f.cls = k; k.methods[st.name] = f; methods << [k, st, f]
-          when Prism::CallNode # attr_accessor / attr_reader / attr_writer
-            st.arguments.arguments.each do |sym|
-              n = sym.unescaped.to_sym; k.ivar(:"@#{n}")
-              k.readers[n] = :"@#{n}" if %i[attr_accessor attr_reader].include?(st.name)
-              k.writers[:"#{n}="] = :"@#{n}" if %i[attr_accessor attr_writer].include?(st.name)
-            end
+          when Prism::CallNode
+            class_body_call(k, st, {}, methods)
           else raise "unsupported in class body: #{st.class}"
           end
         end
@@ -45,8 +44,16 @@ module Indus
       main = Func.new(:main, 0)
       lower_body(main, [], top)
       defs.each { |d| lower_body(@funcs[d.name], d.parameters&.requireds&.map(&:name) || [], d.body&.body || []) if @funcs[d.name] }
-      methods.each { |k, d, f| lower_body(f, [:self, *(d.parameters&.requireds&.map(&:name) || [])], d.body&.body || [], k) }
-      all = [main, *@funcs.values, *methods.map(&:last)]
+      methods.each do |k, d, f, names, body, ct|
+        if d
+          names = [:self, *(d.parameters&.requireds&.map(&:name) || [])]
+          names << d.parameters.rest.name if d.parameters&.rest # *args arrives as an array
+          lower_body(f, names, d.body&.body || [], k)
+        else
+          lower_body(f, names, body, k, ct)
+        end
+      end
+      all = [main, *@funcs.values, *methods.map { _1[2] }]
       all.each { prune(_1) }
       all
     end
@@ -75,8 +82,56 @@ module Indus
 
     private
 
-    def lower_body(f, names, stmts, klass = nil)
-      @f, @locals, @cur, @klass = f, names.zip(f.params).to_h, f.entry, klass
+    # Class-body metaprogramming is evaluated at compile time. `ct` is the
+    # compile-time environment: block variables bound to literal symbols by
+    # an unrolled `[:a, :b].each do |f| ... end`.
+    def class_body_call(k, st, ct, methods)
+      args = st.arguments&.arguments || []
+      case st.name
+      when :attr_accessor, :attr_reader, :attr_writer
+        args.each do |sym|
+          n = ct_symbol(sym, ct); k.ivar(:"@#{n}")
+          k.readers[n] = :"@#{n}" if %i[attr_accessor attr_reader].include?(st.name)
+          k.writers[:"#{n}="] = :"@#{n}" if %i[attr_accessor attr_writer].include?(st.name)
+        end
+      when :define_method
+        name = ct_symbol(args[0], ct)
+        blk = st.block or raise "define_method without a block"
+        params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+        f = Func.new(:"#{k.name}##{name}", 1 + params.size)
+        f.cls = k; k.methods[name] = f
+        methods << [k, nil, f, [:self, *params], blk.body&.body || [], ct.dup]
+      when :each # [:a, :b].each do |f| ... end  -> unrolled at compile time
+        recv = st.receiver
+        raise "class-body each over a non-literal array" unless recv.is_a?(Prism::ArrayNode)
+        blk = st.block; var = blk.parameters.parameters.requireds[0].name
+        recv.elements.each do |el|
+          env = ct.merge(var => ct_symbol(el, ct))
+          (blk.body&.body || []).each { |inner| class_body_call(k, inner, env, methods) }
+        end
+      else raise "unsupported in class body: #{st.name}"
+      end
+    end
+
+    # a Symbol known at compile time: literal, interpolated from ct, or a ct variable
+    def ct_symbol(node, ct)
+      case node
+      when Prism::SymbolNode then node.unescaped.to_sym
+      when Prism::StringNode then node.unescaped.to_sym
+      when Prism::LocalVariableReadNode then ct.fetch(node.name) { raise "#{node.name} is not a compile-time symbol" }
+      when Prism::InterpolatedSymbolNode
+        node.parts.map do |part|
+          case part
+          when Prism::StringNode then part.unescaped
+          when Prism::EmbeddedStatementsNode then ct_symbol(part.statements.body.last, ct).to_s
+          end
+        end.join.to_sym
+      else raise "not a compile-time symbol: #{node.class}"
+      end
+    end
+
+    def lower_body(f, names, stmts, klass = nil, ct = {})
+      @f, @locals, @cur, @klass, @ct = f, names.zip(f.params).to_h, f.entry, klass, ct
       last = nil
       stmts.each { last = expr(_1) }
       emit(:ret, [last || const(0)]) unless @cur.term
@@ -115,8 +170,6 @@ module Indus
     # (lowering an argument may move @cur: loops, inlining)
     def emit(op, args = [], cond = nil) = (@cur << Inst.new(op, args, cond))
     def const(v) = emit(:const, [v])
-    def sym_id(name) = (@syms ||= {})[name.to_sym] ||= @syms.size + 1
-    attr_reader :syms
     def yields?(d) = d.body && d.body.body.any? { |st| contains_yield?(st) }
     def contains_yield?(node)
       return false unless node.is_a?(Prism::Node)
@@ -153,7 +206,9 @@ module Indus
       when Prism::ConstantReadNode then emit(:gget, [n.name])
       when Prism::ConstantWriteNode
         v = expr(n.value); emit(:gset, [n.name, v]); v
-      when Prism::LocalVariableReadNode then @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" }
+      when Prism::LocalVariableReadNode
+        if @ct&.key?(n.name) then (c = const(sym_id(@ct[n.name])); c.ty = :sym; c) # compile-time symbol
+        else @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" } end
       when Prism::LocalVariableWriteNode
         v = expr(n.value) # value first: loops replace @locals
         (@kinds ||= {})[lname(n.name)] = kind_of(n.value)
@@ -245,6 +300,14 @@ module Indus
         r = emit(:lshift_or_append, [a, v])
         emit(:fld_set, [@locals.fetch(:self), @klass.ivar(n.receiver.name), r]); return r
       end
+      if n.name == :send || n.name == :public_send
+        name, *rest = args
+        recv_v = n.receiver ? expr(n.receiver) : me_val
+        if name.is_a?(Prism::SymbolNode) # send(:literal) is a plain call
+          return emit(:mcall, [name.unescaped.to_sym, recv_v, *rest.map { expr(_1) }])
+        end
+        return emit(:dsend, [expr(name), recv_v, *rest.map { expr(_1) }]) # switch over the class's methods
+      end
       if (op = ARITH[n.name])
         l = expr(n.receiver); r = expr(args[0])
         emit(op, [l, r])
@@ -296,10 +359,14 @@ module Indus
       elsif n.name == :[] # array / hash / string: Types decides
         emit(:idx, [expr(n.receiver), *args.map { expr(_1) }])
       elsif n.name == :[]=
-        # a[i] = v may grow a: the result is the (possibly new) container, rebound to the local
-        raise "[]= on non-local receiver" unless n.receiver.is_a?(Prism::LocalVariableReadNode)
+        # a[i] = v may grow a: the result is the (possibly new) container, rebound to its home
         a = expr(n.receiver); i = expr(args[0]); v = expr(args[1])
-        @locals[n.receiver.name] = emit(:idx_set, [a, i, v])
+        r = emit(:idx_set, [a, i, v])
+        case n.receiver
+        when Prism::LocalVariableReadNode then @locals[lname(n.receiver.name)] = r
+        when Prism::InstanceVariableReadNode then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
+        else raise "[]= on #{n.receiver.class}"
+        end
         v
       elsif (n.name == :key? || n.name == :has_key?) && args.size == 1 && n.receiver
         emit(:hkey, [expr(n.receiver), expr(args[0])])

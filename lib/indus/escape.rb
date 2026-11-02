@@ -59,6 +59,14 @@ module Indus
             when :fld_set then mark.(args[0])
             end
           end
+        when :sendsw
+          arms, _, recv, *args = i.args
+          arms.each do |_, kind, payload|
+            case kind
+            when :call then [recv, *args].each_with_index { |a, k| mark.(a) if payload.leaks[k] }
+            when :fld_set then mark.(args[0])
+            end
+          end
         end
       end
       # propagate backwards through phis and forwards into them
@@ -94,7 +102,7 @@ module Indus
           callee, *args = i.args
           so ||= callee.stores_other
           args.each_with_index { |a, k| into.(a) if callee.stores_param[k] }
-        when :pcall then so = true # conservative
+        when :pcall, :sendsw then so = true # conservative
         end
       end
       [sp, so]
@@ -149,7 +157,7 @@ module Indus
             callee, *args = i.args
             return false if callee.stores_other
             args.each_with_index { |a, k| return false if callee.stores_param[k] && !fresh[a] }
-          when :pcall then return false
+          when :pcall, :sendsw then return false
           when :hsave, :hrestore then return false # already a region at this level
           end
           # a fresh value used outside the body survives the loop

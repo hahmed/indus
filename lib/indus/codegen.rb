@@ -146,6 +146,29 @@ module Indus
         when :mod # Ruby modulo: floor division remainder
           l, r = i.args
           @asm.sdiv_floor(16, reg(l), reg(r, 9)); @asm.emit(0x9B008000 | (reg(r, 9) << 16) | (reg(l) << 10) | (16 << 5) | d) # msub d, x16, r, l
+        when :sendsw # send(name): compare the symbol id against each candidate, direct call
+          arms, name_v, recv, *args = i.args
+          rn = reg(name_v)
+          done = @asm.uniq
+          arms.each do |sid, kind, payload|
+            nxt = @asm.uniq
+            @asm.cmpi(rn, sid); @asm.bcond(:ne, nxt)
+            case kind
+            when :call
+              xi = fi = 0
+              [recv, *args].each { |v| v.float? ? (@asm.fmov(fi, freg(v, fi)); fi += 1) : (@asm.mov(xi, reg(v, xi)); xi += 1) }
+              @asm.bl(payload.name); i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
+            when :fld_get
+              off = @classes[recv.ty].base + payload * 8
+              i.float? ? @asm.fldr_off(d, reg(recv), off) : @asm.ldr_off(d, reg(recv), off)
+            when :fld_set
+              off = @classes[recv.ty].base + payload * 8; v = args[0]
+              v.float? ? @asm.fstr_off(freg(v), reg(recv), off) : @asm.str_off(reg(v, 9), reg(recv), off)
+            end
+            @asm.b(done); @asm.label(nxt)
+          end
+          @asm.emit(0xD4200000) # brk #0: no such method
+          @asm.label(done)
         when :pcall # dispatch on the class id in word 0; one arm per class, each a direct call or a field access
           arms, recv, *args = i.args
           rr = reg(recv); @asm.ldr_off(16, rr, 0)

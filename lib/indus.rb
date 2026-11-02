@@ -33,7 +33,7 @@ module Indus
   def self.compile(src, standalone: nil)
     lower = Lower.new(src)
     funcs = lower.run
-    Types.run(funcs, lower.classes)
+    Types.run(funcs, lower.classes, lower)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     funcs.each { Peephole.run(_1) unless ENV["NOPEEP"] }
     Escape.run(funcs, lower.classes) unless ENV["NOESCAPE"]
