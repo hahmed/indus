@@ -31,6 +31,7 @@ module Indus
       __onew: 0x00000000000007b8,
       __ipow: 0x00000000000007e4,
       rt_gc: 0x0000000000000800,
+      rt_mmap: 0x00000000000008d4,
     }
     # external calls: word index -> symbol, fixed up by Asm against compiled code
     RELOCS = {
@@ -601,6 +602,17 @@ module Indus
       0xa94947f0,
       0xf94053f2,
       0xa8cb7bfd,
+      0xd65f03c0,
+      0xa9bf7bfd,
+      0xaa0003e1,
+      0xd2800000,
+      0xd2800062,
+      0xd2800443,
+      0x92800004,
+      0xd2800005,
+      0xf9402f70,
+      0xd63f0200,
+      0xa8c17bfd,
       0xd65f03c0,
     ]
   end

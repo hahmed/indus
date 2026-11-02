@@ -21,7 +21,7 @@ module Indus
   module GC
     # on by default; INDUS_NOGC=1 turns it off
     def self.enabled? = !ENV["INDUS_NOGC"]
-    def self.semispace_bytes = (ENV["INDUS_HEAP_MB"] || 64).to_i << 20
+    def self.semispace_bytes = (ENV["INDUS_HEAP_MB"] || 4).to_i << 20 # start small; the collector doubles it on demand
 
     def self.pointer?(t) = Types.heap_pointer?(t)
 

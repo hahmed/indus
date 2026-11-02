@@ -459,6 +459,7 @@ module Indus
       when :__adr_tables then emit(:adrlbl, [:__gc_tables])
       when :__adr_text then emit(:adrlbl, [:__text_base])
       when :__dbg then emit(:puts_i, [expr(args[0])])
+      when :__mmap then emit(:rawmmap, [expr(args[0])])
       else raise "unknown intrinsic #{name}"
       end
     end

@@ -8,7 +8,7 @@ module Indus
       @gc_frames, @gc_globals = [], []
       global(:__write_fn) # offset 0: the runtime blob calls write through [x27]
       # fixed global slots the collector uses (offsets 8..)
-      %i[__gc_limit __gc_from __gc_from_end __gc_to __gc_to_end __gc_bitmap __gc_work __gc_count __gc_free __gc_wtop].each { global(_1) }
+      %i[__gc_limit __gc_from __gc_from_end __gc_to __gc_to_end __gc_bitmap __gc_work __gc_count __gc_free __gc_wtop __mmap_fn].each { global(_1) }
       label(:__text_base)
     end
 
@@ -206,6 +206,7 @@ module Indus
     # x0 = value. Builds decimal + "\n" in a 32-byte stack buffer, calls write.
     attr_accessor :write_addr # nil => bl __write (syscall stub)
     attr_accessor :libm       # name -> address, in-process only
+    attr_accessor :mmap_addr  # libc mmap in-process; nil => syscall stub
     def ldrb_idx(rt, rn, rm) = emit(0x38606800 | (rm << 16) | (rn << 5) | rt) # ldrb wt, [xn, xm]
     def call_write = write_addr ? (mov_imm(16, write_addr); blr(16)) : bl(:__write)
 
@@ -217,6 +218,17 @@ module Indus
       case os
       when :darwin then emit 0xD2800090; emit 0xD4001001; ret      # mov x16,#4 ; svc #0x80
       when :linux  then emit 0xD2800808; emit 0xD4000001; ret      # mov x8,#64 ; svc #0
+      end
+      # mmap as a function (rt_mmap sets the arguments): in-process on darwin fix
+      # the flags and jump to libc; standalone, the raw syscall
+      if mmap_addr
+        label(:__mmap_fn_entry); emit 0xD2820043; mov_imm(16, mmap_addr); emit 0xD61F0200 # mov x3,#0x1002 ; br x16
+      else
+        label(:__mmap_fn_entry)
+        case os
+        when :darwin then emit 0xD2820043; emit 0xD28018B0; emit 0xD4001001; ret # mov x3,#0x1002 ; mov x16,#197 ; svc
+        when :linux  then emit 0xD2801BC8; emit 0xD4000001; ret                   # mov x8,#222 ; svc #0
+        end
       end
     end
 

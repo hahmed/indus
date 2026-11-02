@@ -46,12 +46,13 @@ module Indus
     asm = Asm.new
     asm.gc_table = GC::Table.new(lower.classes)
     asm.write_addr = Metal::LIBC["write"].to_i unless standalone
+    asm.mmap_addr = Metal::LIBC["mmap"].to_i unless standalone
     asm.libm = %i[sin cos pow].to_h { [_1, Metal::LIBC[_1.to_s].to_i] } unless standalone
     asm.emit_start_linux if standalone == :linux
     funcs.each { Codegen.new(asm, lower.classes).func(_1) }
     asm.emit_runtime_blob
     asm.emit_gc_tables if GC.enabled?
-    asm.emit_syscalls(standalone) if standalone
+    asm.emit_syscalls(standalone || :darwin) # write/mmap entry points exist in-process too
     raise "this program has a seam (class_eval); a standalone binary needs the resident compiler" if standalone && !asm.seams.empty?
     Unit.new(asm.resolve!, asm, lower, funcs)
   end

@@ -55,6 +55,7 @@ module Indus
         # [x27] = write(2): libc in-process, our syscall stub standalone
         @asm.write_addr ? @asm.mov_imm(16, @asm.write_addr) : @asm.adr(16, :__write)
         @asm.str_off(16, Asm::GBASE, 0)
+        @asm.adr(16, :__mmap_fn_entry); @asm.str_off(16, Asm::GBASE, @asm.global(:__mmap_fn))
         # patchable methods start out pointing at their static code
         @classes.each_value do |k|
           k.methods.each_value do |m|
@@ -161,6 +162,7 @@ module Indus
         when :rawld32 then @asm.emit(0xB9400000 | (reg(i.args[0]) << 5) | d)      # ldr wd, [xn]
         when :rawst then @asm.str_off(reg(i.args[1], 9), reg(i.args[0]), 0)
         when :gbase then @asm.mov(d, Asm::GBASE)
+        when :rawmmap then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_mmap); @asm.mov(d, 0)
         when :adrlbl then @asm.adr(d, i.args[0])
         when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer
         when :hrestore # ...and drop the iteration's garbage

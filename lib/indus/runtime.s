@@ -662,3 +662,18 @@ rt_gc:
         ldr     x18, [sp, #160]
         ldp     x29, x30, [sp], #176
         ret
+
+// rt_mmap(x0 bytes) -> address. Through the slot [x27+88] like write:
+// libc mmap in-process, the syscall stub in a standalone binary.
+rt_mmap:
+        stp     x29, x30, [sp, #-16]!
+        mov     x1, x0                          // size
+        mov     x0, #0
+        mov     x2, #3                          // RW
+        mov     x3, #0x22                       // PRIVATE|ANON (linux); darwin uses 0x1002, stub below adapts
+        mov     x4, #-1
+        mov     x5, #0
+        ldr     x16, [x27, #88]
+        blr     x16
+        ldp     x29, x30, [sp], #16
+        ret

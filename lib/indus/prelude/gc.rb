@@ -112,8 +112,21 @@ def __gc_run(fp)
   to_end = __ld(g + 40)
   __st(g + 16, to)
   __st(g + 24, to_end)
-  __st(g + 32, from)
-  __st(g + 40, from_end)
+  live = free - to
+  cap = to_end - to
+  if live * 2 > cap
+    # more than half full after collecting: the next to-space is twice the size
+    # (the old from-space is abandoned; the bitmap must cover the new from-space
+    # at the collection after next, so size it for the bigger space now)
+    ncap = cap * 2
+    nto = __mmap(ncap)
+    __st(g + 32, nto)
+    __st(g + 40, nto + ncap)
+    __st(g + 48, __mmap(ncap / 128 + 4096))
+  else
+    __st(g + 32, from)
+    __st(g + 40, from_end)
+  end
   __st(g + 8, to_end - 1048576)
   __st(g + 64, __ld(g + 64) + 1)
   free
