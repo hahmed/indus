@@ -5,7 +5,8 @@
 #   lib/indus/types.rb    type inference (int/float/arrays/classes/poly), conversions
 #   lib/indus/passes.rb   SSA passes (trivial phis, return sinking, accumulator loops)
 #   lib/indus/escape.rb   escape analysis -> stack objects, loop regions
-#   lib/indus/asm.rb      arm64 encoder + hand-written runtime routines
+#   lib/indus/runtime.s   runtime routines in assembly -> runtime_blob.rb (tools/build_runtime.sh)
+#   lib/indus/asm.rb      arm64 encoder + the older hand-encoded routines
 #   lib/indus/regalloc.rb linear-scan register allocation over dataflow liveness
 #   lib/indus/codegen.rb  layout, frames, instruction selection
 #   lib/indus/metal.rb    run in-process; hosts the resident compiler for seams
@@ -16,7 +17,7 @@
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir lower types passes escape asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir lower types passes escape runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # everything a compiled program knows about itself: enough for the
@@ -45,6 +46,7 @@ module Indus
     asm.emit_array_set_slow
     asm.emit_object_new
     asm.emit_ipow
+    asm.emit_runtime_blob
     asm.emit_syscalls(standalone) if standalone
     raise "this program has a seam (class_eval); a standalone binary needs the resident compiler" if standalone && !asm.seams.empty?
     Unit.new(asm.resolve!, asm, lower, funcs)

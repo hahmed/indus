@@ -73,6 +73,20 @@ module Indus
       funcs.each { |f| f.all.each { tag.(_1.ty) }; f.ptypes.each { tag.(_1) }; tag.(f.rtype) }
       @ivars.each_value { |h| h.each_value { tag.(_1) } }
       funcs.each { convert(_1) }
+      funcs.each { strings(_1) }
+    end
+
+    # generic ops whose operands turned out to be strings
+    def self.strings(f)
+      f.all.each do |i|
+        case i.op
+        when :add then i.op = :scat if of(f, i.args[0]) == :str
+        when :cmp then (i.op = :seq; i.cond = nil) if of(f, i.args[0]) == :str && i.cond == :eq
+        when :to_s then i.op = of(f, i.args[0]) == :str ? :nop : :itos
+        when :puts_v then i.op = { str: :puts_str, bool: :puts_bool }.fetch(of(f, i.args[0]), :puts_i)
+        when :lshift_or_append then i.op = of(f, i.args[0]) == :int ? :shl : :sappend
+        end
+      end
     end
 
     # :mcall name, recv, args -> :call Func / :fld_get / :fld_set
@@ -116,8 +130,15 @@ module Indus
       case i.op
       when :const then i.ty == :nil ? :nil : :int
       when :fconst then :float
+      when :sconst, :scat, :sappend, :itos then :str
+      when :seq then :bool
+      when :puts_i, :puts_str, :puts_bool then :int
+      when :lshift_or_append then (t = of(f, a[0])) && (t == :int ? :int : t)
+      when :to_s then (t = of(f, a[0])) && (t == :str ? :str : t == :int ? :str : nil)
+      when :puts_v then of(f, a[0]) && :int
       when :add, :sub, :mul, :div then join(of(f, a[0]), of(f, a[1]))
-      when :and, :or, :xor, :shl, :shr, :mod, :cmp, :to_i, :alen, :ipow then :int
+      when :and, :or, :xor, :shl, :shr, :mod, :to_i, :alen, :ipow then :int
+      when :cmp then :bool
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :to_f, :fsqrt then :float
       when :anew then (t = of(f, a[1])) && t != :nil ? [:arr, t] : nil

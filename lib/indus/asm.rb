@@ -2,7 +2,22 @@
 module Indus
   class Asm
     attr_reader :words
-    def initialize = (@words, @labels, @fixups, @data, @seams = [], {}, [], [], [])
+    def initialize
+      @words, @labels, @fixups, @data, @seams = [], {}, [], [], []
+      global(:__write_fn) # offset 0: the runtime blob calls write through [x27]
+    end
+
+    # the assembled runtime (lib/indus/runtime.s): drop it in, name its entry points
+    def emit_runtime_blob
+      base = pos
+      RuntimeBlob::LABELS.each { |n, off| @labels[n] = base + off / 4 }
+      @words.concat(RuntimeBlob::WORDS)
+    end
+
+    # a string literal: [cap][len][bytes] in the data area; label at the bytes
+    def str_data(name, str)
+      @data << [name, [str.bytesize, str.bytesize].pack("QQ") + str, 16] unless @data.any? { _1[0] == name }
+    end
     def pos = @words.size
     def emit(w) = @words << (w & 0xFFFFFFFF)
     def label(n) = (@labels[n] = pos)
@@ -293,8 +308,9 @@ module Indus
     def resolve!
       # place data after code, 8-aligned
       emit 0 while pos % 2 != 0
-      @data.each do |name, bytes|
-        label(name)
+      @data.each do |name, bytes, label_off|
+        emit 0 while pos % 4 != 0 if label_off # 16-byte align headers
+        @labels[name] = pos + (label_off || 0) / 4
         padded = bytes + "\0" * ((4 - bytes.bytesize % 4) % 4)
         @words.concat(padded.unpack("V*"))
       end

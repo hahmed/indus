@@ -43,6 +43,9 @@ module Indus
       fused.each_slice(2).with_index { |(a, b), i| @asm.fstp(a, b, fsave + i * 16) }
       if f.name == :main # heap base arrives in x0: globals in the first 4K, bump pointer after
         @asm.mov(Asm::GBASE, 0); @asm.addi(Asm::HEAP, 0, 4096)
+        # [x27] = write(2): libc in-process, our syscall stub standalone
+        @asm.write_addr ? @asm.mov_imm(16, @asm.write_addr) : @asm.adr(16, :__write)
+        @asm.str_off(16, Asm::GBASE, 0)
         # patchable methods start out pointing at their static code
         @classes.each_value do |k|
           k.methods.each_value do |m|
@@ -124,6 +127,7 @@ module Indus
             (@asm.mov_imm(TMP, k.id); @asm.str_off(TMP, 0, 0)) if k.tagged # class id in word 0
             @asm.mov(d, 0)
           end
+        when :nop then @asm.mov(d, reg(i.args[0]))
         when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer
         when :hrestore then @asm.mov(Asm::HEAP, reg(i.args[0])) # ...and drop the iteration's garbage
         when :mod # Ruby modulo: floor division remainder
@@ -219,6 +223,19 @@ module Indus
         when :puts_i
           @asm.mov(0, reg(i.args[0], 0))
           @asm.bl(:__puts_i)
+        when :sconst # a literal evaluates to a fresh mutable copy (as in Ruby)
+          name = :"str#{i.id}"; @asm.str_data(name, i.args[0])
+          @asm.adr(0, name); @asm.mov_imm(1, i.args[0].bytesize); @asm.bl(:rt_str_new); @asm.mov(d, 0)
+        when :scat then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_cat); @asm.mov(d, 0)
+        when :sappend then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_append); @asm.mov(d, 0)
+        when :seq then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_eq); @asm.mov(d, 0)
+        when :itos then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_itos); @asm.mov(d, 0)
+        when :puts_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_puts_str)
+        when :puts_bool
+          @asm.str_data(:__true, "true"); @asm.str_data(:__false, "false")
+          f_ = @asm.uniq; dn = @asm.uniq
+          @asm.cbz(reg(i.args[0]), f_); @asm.adr(0, :__true); @asm.b(dn); @asm.label(f_); @asm.adr(0, :__false); @asm.label(dn)
+          @asm.bl(:rt_puts_str)
         when :puts_s
           s = i.args[0] + "\n"; name = :"str#{i.id}"
           @asm.data(name, s)

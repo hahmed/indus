@@ -13,7 +13,7 @@
 # fresh this iteration (Node.new(l, r) -> initialize writes @left) are fine.
 module Indus
   module Escape
-    def self.heap?(t) = t.is_a?(Symbol) && !%i[int float nil].include?(t) || (t.is_a?(Array) && %i[arr poly].include?(t[0]))
+    def self.heap?(t) = t.is_a?(Symbol) && !%i[int float nil].include?(t) || (t.is_a?(Array) && %i[arr poly].include?(t[0])) # :str and classes are heap
     def self.ty(f, v) = v.op == :param ? f.ptypes[f.params.index(v)] : v.ty
 
     def self.run(funcs, classes)

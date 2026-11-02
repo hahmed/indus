@@ -78,6 +78,8 @@ module Indus
     end
 
     def const(v) = (@cur << Inst.new(:const, [v]))
+    # x.to_s: strings pass through, integers convert; resolved after typing for others
+    def to_s(v) = (@cur << Inst.new(:to_s, [v]))
     def fconst(v) = (@cur << Inst.new(:fconst, [v]))
 
     def expr(n)
@@ -116,7 +118,16 @@ module Indus
         @cur = @f.new_block(:dead); const(0)
       when Prism::StatementsNode then n.body.map { expr(_1) }.last
       when Prism::ParenthesesNode then n.body.body.map { expr(_1) }.last
-      when Prism::StringNode then n # handled by puts
+      when Prism::StringNode then @cur << Inst.new(:sconst, [n.unescaped])
+      when Prism::InterpolatedStringNode # "a#{x}b" -> concat chain
+        parts = n.parts.map do |part|
+          case part
+          when Prism::StringNode then @cur << Inst.new(:sconst, [part.unescaped])
+          when Prism::EmbeddedStatementsNode then to_s(expr(part.statements.body.last))
+          else raise "unsupported interpolation part #{part.class}"
+          end
+        end
+        parts.reduce { |a, b| @cur << Inst.new(:scat, [a, b]) }
       when Prism::IfNode then if_expr(n)
       when Prism::WhileNode then while_stmt(n)
       when Prism::CallNode then call(n)
@@ -151,6 +162,15 @@ module Indus
 
     def call(n)
       args = n.arguments&.arguments || []
+      if n.name == :<< && n.receiver.is_a?(Prism::LocalVariableReadNode) && !@int_locals&.include?(n.receiver.name)
+        # `<<` is append on strings/arrays and shift on integers; Types fixes up a misguess
+        a = expr(n.receiver); v = expr(args[0])
+        return @locals[n.receiver.name] = @cur << Inst.new(:lshift_or_append, [a, v])
+      elsif n.name == :<< && n.receiver.is_a?(Prism::InstanceVariableReadNode)
+        a = expr(n.receiver); v = expr(args[0])
+        r = @cur << Inst.new(:lshift_or_append, [a, v])
+        @cur << Inst.new(:fld_set, [@locals.fetch(:self), @klass.ivar(n.receiver.name), r]); return r
+      end
       if (op = ARITH[n.name])
         l = expr(n.receiver); r = expr(args[0])
         @cur << Inst.new(op, [l, r])
@@ -166,7 +186,9 @@ module Indus
       elsif n.name == :puts
         a = args[0]
         if a.is_a?(Prism::StringNode) then @cur << Inst.new(:puts_s, [a.unescaped])
-        else @cur << Inst.new(:puts_i, [expr(a)]) end
+        else @cur << Inst.new(:puts_v, [expr(a)]) end # Types picks puts_i / puts_str
+      elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
+      elsif n.name == :+@ && args.empty? then expr(n.receiver) # +"" : literals are already fresh copies
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array
         len = expr(args[0]); fill = args[1] ? expr(args[1]) : const(0)
         @cur << Inst.new(:anew, [len, fill])
