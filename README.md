@@ -10,8 +10,11 @@ at runtime, what can happen earlier, and what can disappear entirely.
 Ruby source  →  SSA  →  arm64
 ```
 
-No C, no LLVM, no assembler, no linker, no runtime library. The compiler is
-written in Ruby and produces standalone executables for macOS and Linux.
+Compiling a program invokes no C compiler, LLVM, assembler or linker, and
+links no external runtime: the small runtime it needs (allocation, strings,
+hashes, a collector written in Ruby) is embedded in the executable. The
+compiler is written in Ruby and produces standalone executables for macOS
+and Linux.
 
 Named after the Indus Valley: source, flow, execution.
 
