@@ -32,10 +32,13 @@ module Indus
       used.sort!; fused.sort!
       fsave = 16 + ((used.size + 1) / 2) * 16
       @spill_base = fsave + ((fused.size + 1) / 2) * 16
-      frame = @spill_base + ((nslots + 1) / 2) * 16
-      raise "frame too large" if frame > 504
+      # tier-0 objects live in the frame after the spill slots
+      @stack_objs = {}; obj_base = @spill_base + ((nslots + 1) / 2) * 16
+      f.all.each { |i| next unless i.op == :onew && i.stack; @stack_objs[i] = obj_base; obj_base += (([i.args[0].size, 8].max + 15) / 16) * 16 }
+      frame = obj_base
+      raise "frame too large (#{frame})" if frame > 4080
       @asm.label(f.name)
-      @asm.stp_pre(29, 30, frame); @asm.mov_fp_sp
+      @asm.sub_sp(frame); @asm.stp(29, 30, 0); @asm.mov_fp_sp
       used.each_slice(2).with_index { |(a, b), i| @asm.stp(a, b, 16 + i * 16) }
       fused.each_slice(2).with_index { |(a, b), i| @asm.fstp(a, b, fsave + i * 16) }
       if f.name == :main # heap base arrives in x0: globals in the first 4K, bump pointer after
@@ -53,9 +56,10 @@ module Indus
       f.params.each { |p| p.float? ? (@asm.fmov(p.reg, fi); fi += 1) : (@asm.mov(p.reg, xi); xi += 1) }
       f.blocks.each { block(_1) }
       @asm.label(:"#{f.name}_ret")
+      @asm.str_off(Asm::HEAP, Asm::GBASE, @asm.global(:__heap_end)) if f.name == :main
       fused.each_slice(2).with_index { |(a, b), i| @asm.fldp(a, b, fsave + i * 16) }
       used.each_slice(2).with_index { |(a, b), i| @asm.ldp(a, b, 16 + i * 16) }
-      @asm.ldp_post(29, 30, frame); @asm.ret
+      @asm.ldp(29, 30, 0); @asm.add_sp(frame); @asm.ret
     end
 
     def fused?(c)
@@ -110,9 +114,18 @@ module Indus
         when :alen then @asm.ldur(d, reg(i.args[0]), -8)
         when :onew
           k = i.args[0]
-          @asm.mov_imm(0, [k.size, 8].max); @asm.bl(:__onew)
-          (@asm.mov_imm(TMP, k.id); @asm.str_off(TMP, 0, 0)) if k.tagged # class id in word 0
-          @asm.mov(d, 0)
+          if i.stack # tier 0: in the frame, zeroed here, gone at ret
+            off = @stack_objs.fetch(i)
+            @asm.addi(d, 31, off)
+            (k.size / 8).times { |w| @asm.str_off(31, d, w * 8) }
+            (@asm.mov_imm(TMP, k.id); @asm.str_off(TMP, d, 0)) if k.tagged
+          else
+            @asm.mov_imm(0, [k.size, 8].max); @asm.bl(:__onew)
+            (@asm.mov_imm(TMP, k.id); @asm.str_off(TMP, 0, 0)) if k.tagged # class id in word 0
+            @asm.mov(d, 0)
+          end
+        when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer
+        when :hrestore then @asm.mov(Asm::HEAP, reg(i.args[0])) # ...and drop the iteration's garbage
         when :mod # Ruby modulo: floor division remainder
           l, r = i.args
           @asm.sdiv_floor(16, reg(l), reg(r, 9)); @asm.emit(0x9B008000 | (reg(r, 9) << 16) | (reg(l) << 10) | (16 << 5) | d) # msub d, x16, r, l

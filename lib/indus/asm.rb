@@ -217,6 +217,8 @@ module Indus
     def stp_pre(t1, t2, sz) = emit(0xA9800000 | (((-sz / 8) & 0x7F) << 15) | (t2 << 10) | (31 << 5) | t1)
     def ldp_post(t1, t2, sz) = emit(0xA8C00000 | ((sz / 8) << 15) | (t2 << 10) | (31 << 5) | t1)
     def mov_fp_sp = emit(0x910003FD)
+    def sub_sp(n) = emit(0xD10003FF | (n << 10))   # sub sp, sp, #n   (n < 4096, multiple of 16)
+    def add_sp(n) = emit(0x910003FF | (n << 10))
 
     # data: bytes placed after the code, addressed with adr
     def data(name, bytes) = @data << [name, bytes]

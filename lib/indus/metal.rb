@@ -37,7 +37,12 @@ module Indus
         heap[unit.globals.fetch(:__seam_cb), 8] = [cb.to_i].pack("Q")
         @keep = cb # must outlive the run
       end
-      Fiddle::Function.new(mem, [Fiddle::TYPE_VOIDP], Fiddle::TYPE_LONG).call(heap)
+      r = Fiddle::Function.new(mem, [Fiddle::TYPE_VOIDP], Fiddle::TYPE_LONG).call(heap)
+      if ENV["HEAP"] && (off = unit.globals[:__heap_end])
+        used = heap[off, 8].unpack1("Q") - heap.to_i - 4096
+        $stderr.puts "indus: heap #{used >= 1 << 20 ? "#{(used / 1048576.0).round(1)} MB" : "#{used / 1024} KB"}"
+      end
+      r
     end
   end
 end

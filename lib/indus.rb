@@ -4,6 +4,7 @@
 #   lib/indus/lower.rb    Prism AST -> SSA
 #   lib/indus/types.rb    type inference (int/float/arrays/classes/poly), conversions
 #   lib/indus/passes.rb   SSA passes (trivial phis, return sinking, accumulator loops)
+#   lib/indus/escape.rb   escape analysis -> stack objects, loop regions
 #   lib/indus/asm.rb      arm64 encoder + hand-written runtime routines
 #   lib/indus/regalloc.rb linear-scan register allocation over dataflow liveness
 #   lib/indus/codegen.rb  layout, frames, instruction selection
@@ -15,7 +16,7 @@
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir lower types passes asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir lower types passes escape asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # everything a compiled program knows about itself: enough for the
@@ -32,6 +33,7 @@ module Indus
     funcs = lower.run
     Types.run(funcs, lower.classes)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
+    Escape.run(funcs, lower.classes) unless ENV["NOESCAPE"]
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]
     asm = Asm.new
     asm.write_addr = Metal::LIBC["write"].to_i unless standalone
