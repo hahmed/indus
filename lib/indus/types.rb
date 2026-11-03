@@ -83,9 +83,18 @@ module Indus
             when :phi then i.args.each { |(_, v)| dynflow.(f, v, i.ty) }
             end
             bind(f, i) if i.op == :mcall
+            if i.op == :lshift_or_append && arr(of(f, i.args[0])) # a << v on an array is push: aset at the length
+              raise "#{f.name}: `<<` on parameter #{i.args[0]} would not be seen by the caller after growth; not supported yet" if i.args[0].op == :param
+              len = Inst.new(:alen, [i.args[0]]); len.ty = :int; len.block = i.block
+              i.block.insts.insert(i.block.insts.index(i), len)
+              i.op = :aset; i.args = [i.args[0], len, i.args[1]]; changed = true
+            end
             dsend(f, i) if i.op == :dsend
             float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
             # printing/inspecting by type is irreversible, so it waits for the types to settle (below)
+            if i.op == :mul && of(f, i.args[0]) == :str # "ab" * n
+              fn = @lower.funcs.fetch(:__str_times); i.op = :call; i.args = [fn, *i.args]; changed = true
+            end
             if @settled
               dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
               dyn_print(f, i) if %i[puts_v p_v print_v inspect_v].include?(i.op) && of(f, i.args[0]) == :dyn
@@ -205,7 +214,17 @@ module Indus
                  when :p_v then { str: :p_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil_word }.fetch(t, :puts_i)
                  else { str: :print_str }.fetch(t, :print_i)
                  end
-        when :lshift_or_append then i.op = of(f, i.args[0]) == :int ? :shl : :sappend
+        when :lshift_or_append
+          t = of(f, i.args[0])
+          if t == :int then i.op = :shl
+          elsif t
+            if i.args[0].op == :param || (i.args[0].op == :phi && i.args[0].args.any? { |(_, v)| v.op == :param })
+              # the callee's home is rebound, the caller's is not: once the buffer grows they diverge.
+              # Needs stable handles for aliased-and-appended values (notes/31). Refuse rather than diverge.
+              raise "#{f.name}: `<<` on parameter #{i.args[0]} would not be seen by the caller after growth; not supported yet"
+            end
+            i.op = :sappend
+          end
         end
       end
     end
@@ -267,6 +286,12 @@ module Indus
         arms = t[1].map { |c| [@classes[c], *resolve(@classes[c], name, args.size)] }
         i.op = :pcall; i.args = [arms, recv, *args]
         return
+      end
+      if t == :str && (fn = @lower.funcs[:"__str_#{name.to_s.sub('?', '_p')}"]) # String methods written in the prelude
+        i.op = :call; i.args = [fn, recv, *args]; return
+      end
+      if arr(t) && (fn = @lower.funcs[:"__arr_#{name.to_s.sub('?', '_p')}"])
+        i.op = :call; i.args = [fn, recv, *args]; return
       end
       return unless t.is_a?(Symbol) && (klass = @classes[t])
       kind, payload = resolve(klass, name, args.size, allow_missing: true)
@@ -372,7 +397,9 @@ module Indus
       case i.op
       when :const then %i[nil sym bool lambda].include?(i.ty) ? i.ty : :int
       when :fconst then :float
-      when :sconst, :scat, :sappend, :itos, :bool_to_s, :chr then :str
+      when :sconst, :scat, :sappend, :itos, :bool_to_s, :chr, :sdup then :str
+      when :rawld8 then :int
+      when :apop then (t = of(f, a[0])) && arr(t) ? t[1] : nil
       when :hcap then :int
       when :hkey_at then (t = of(f, a[0])) && hsh(t) ? t[1] : nil
       when :hval_at then (t = of(f, a[0])) && hsh(t) ? t[2] : nil

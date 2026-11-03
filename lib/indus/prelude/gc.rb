@@ -183,7 +183,7 @@ def __gc_size(p, desc, types)
   elsif kind == 1
     16 + __ld(p - 16) * 8
   elsif kind == 2
-    16 + __ld(p - 16) * 16
+    16 + __ld(p - 16) * 24
   elsif kind == 3
     __ld32(desc + 4)
   else

@@ -217,12 +217,15 @@ rt_str_hash:
 1:      mov     x0, x1
         ret
 
-// rt_hash_new(x0 cap) -> handle, zeroed
+// rt_hash_new(x0 cap) -> handle. Layout: [key,val] slots * cap (open
+// addressing, zeroed), then cap words of slot indices in insertion order,
+// so iteration follows Ruby's order. Header: [-16] cap, [-8] count.
 rt_hash_new:
         stp     x29, x30, [sp, #-32]!
         str     x19, [sp, #16]
         mov     x19, x0
         lsl     x0, x0, #4
+        add     x0, x0, x19, lsl #3
         bl      rt_alloc
         stur    x19, [x0, #-16]
         stur    xzr, [x0, #-8]
@@ -369,21 +372,30 @@ rt_hashs_set:
         lsl     x0, x22, #1
         bl      rt_hash_new
         mov     x24, x0                 // new handle
-        mov     x22, #0                 // i
-0:      ldur    x1, [x19, #-16]
-        cmp     x22, x1
+        mov     x22, #0                 // i over the old order list
+0:      cmp     x22, x23
         b.hs    2f
-        add     x1, x19, x22, lsl #4
+        ldur    x1, [x19, #-16]
+        add     x1, x19, x1, lsl #4     // old order list
+        ldr     x1, [x1, x22, lsl #3]   // old slot index
+        add     x1, x19, x1, lsl #4     // old entry
         ldr     x2, [x1]
-        cbz     x2, 3f
         mov     x0, x24
         mov     x1, x2
         bl      rt_hashs_find
-        add     x1, x19, x22, lsl #4
+        ldur    x1, [x19, #-16]
+        add     x1, x19, x1, lsl #4
+        ldr     x1, [x1, x22, lsl #3]
+        add     x1, x19, x1, lsl #4
         ldr     x2, [x1]
         ldr     x3, [x1, #8]
         stp     x2, x3, [x0]
-3:      add     x22, x22, #1
+        sub     x0, x0, x24             // new slot index, appended in the same order
+        lsr     x0, x0, #4
+        ldur    x1, [x24, #-16]
+        add     x1, x24, x1, lsl #4
+        str     x0, [x1, x22, lsl #3]
+        add     x22, x22, #1
         b       0b
 2:      stur    x23, [x24, #-8]
         mov     x19, x24
@@ -392,6 +404,11 @@ rt_hashs_set:
         bl      rt_hashs_find
         ldr     x1, [x0]
         cbnz    x1, 4f
+        sub     x1, x0, x19             // a new key: record its slot in the order list
+        lsr     x1, x1, #4
+        ldur    x2, [x19, #-16]
+        add     x2, x19, x2, lsl #4
+        str     x1, [x2, x23, lsl #3]
         add     x23, x23, #1
         stur    x23, [x19, #-8]
 4:      stp     x20, x21, [x0]
@@ -418,22 +435,31 @@ rt_hashi_set:
         b.ls    1f
         lsl     x0, x22, #1
         bl      rt_hash_new
-        mov     x24, x0
-        mov     x22, #0
-0:      ldur    x1, [x19, #-16]
-        cmp     x22, x1
+        mov     x24, x0                 // new handle
+        mov     x22, #0                 // i over the old order list
+0:      cmp     x22, x23
         b.hs    2f
-        add     x1, x19, x22, lsl #4
+        ldur    x1, [x19, #-16]
+        add     x1, x19, x1, lsl #4     // old order list
+        ldr     x1, [x1, x22, lsl #3]   // old slot index
+        add     x1, x19, x1, lsl #4     // old entry
         ldr     x2, [x1]
-        cbz     x2, 3f
         mov     x0, x24
         mov     x1, x2
         bl      rt_hashi_find
-        add     x1, x19, x22, lsl #4
+        ldur    x1, [x19, #-16]
+        add     x1, x19, x1, lsl #4
+        ldr     x1, [x1, x22, lsl #3]
+        add     x1, x19, x1, lsl #4
         ldr     x2, [x1]
         ldr     x3, [x1, #8]
         stp     x2, x3, [x0]
-3:      add     x22, x22, #1
+        sub     x0, x0, x24             // new slot index, appended in the same order
+        lsr     x0, x0, #4
+        ldur    x1, [x24, #-16]
+        add     x1, x24, x1, lsl #4
+        str     x0, [x1, x22, lsl #3]
+        add     x22, x22, #1
         b       0b
 2:      stur    x23, [x24, #-8]
         mov     x19, x24
@@ -442,6 +468,11 @@ rt_hashi_set:
         bl      rt_hashi_find
         ldr     x1, [x0]
         cbnz    x1, 4f
+        sub     x1, x0, x19             // a new key: record its slot in the order list
+        lsr     x1, x1, #4
+        ldur    x2, [x19, #-16]
+        add     x2, x19, x2, lsl #4
+        str     x1, [x2, x23, lsl #3]
         add     x23, x23, #1
         stur    x23, [x19, #-8]
 4:      stp     x20, x21, [x0]
@@ -466,13 +497,14 @@ rt_hash_keys:
         mov     x21, x0                 // out
         mov     x22, #0                 // i
         ldur    x3, [x19, #-16]         // cap
-0:      cmp     x22, x3
+        add     x3, x19, x3, lsl #4     // order list
+0:      cmp     x22, x20
         b.hs    1f
-        add     x1, x19, x22, lsl #4
+        ldr     x1, [x3, x22, lsl #3]
+        add     x1, x19, x1, lsl #4
         ldr     x2, [x1]
-        cbz     x2, 2f
         str     x2, [x0], #8
-2:      add     x22, x22, #1
+        add     x22, x22, #1
         b       0b
 1:      mov     x0, x21
         ldp     x21, x22, [sp, #32]

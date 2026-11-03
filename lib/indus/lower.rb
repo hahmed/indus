@@ -511,6 +511,7 @@ module Indus
       elsif n.name == :chr && args.empty? && n.receiver then emit(:chr, [expr(n.receiver)])
       elsif n.name == :printf && n.receiver.nil? && args[0].is_a?(Prism::StringNode)
         return printf_lower(args[0].unescaped, args[1..].map { expr(_1) })
+      elsif n.name == :pop && args.empty? && n.receiver then emit(:apop, [expr(n.receiver)])
       elsif n.name == :push && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode))
         a = expr(n.receiver); v = expr(args[0]); len = emit(:alen, [a])
         r = emit(:aset, [a, len, v]) # may grow: rebind the home
@@ -583,6 +584,9 @@ module Indus
       case name
       when :__ld then emit(:rawld, [expr(args[0])])
       when :__ld32 then emit(:rawld32, [expr(args[0])])
+      when :__ld8 then emit(:rawld8, [expr(args[0]), expr(args[1])])          # byte i of string s
+      when :__st8 then (a = expr(args[0]); ix = expr(args[1]); v = expr(args[2]); emit(:rawst8, [a, ix, v]); v)
+      when :__sdup then emit(:sdup, [expr(args[0])])
       when :__st then (a = expr(args[0]); v = expr(args[1]); emit(:rawst, [a, v]); v)
       when :__gbase then emit(:gbase, [])
       when :__adr_tables then emit(:adrlbl, [:__gc_tables])
@@ -747,14 +751,13 @@ module Indus
       const(0)
     end
 
-    # h.each { |k, v| }: walk the table's slots; the body runs only for used slots
+    # h.each { |k, v| }: the i-th inserted entry, for i < count (Ruby's insertion order)
     def hash_each(h, params, body)
       cap = emit(:hcap, [h])
       counted_loop(const(0), cap, :lt, [], body) do |i, _ps, pfx|
         key = emit(:hkey_at, [h, i]); val = emit(:hval_at, [h, i])
         @locals[:"#{pfx}#{params[0]}"] = key if params[0]
         @locals[:"#{pfx}#{params[1]}"] = val if params[1]
-        @body_guard = key # counted_loop wraps the body in `if guard`
       end
     end
 

@@ -42,6 +42,7 @@ module Indus
     funcs = lower.run
     funcs.each { Passes.trivial_phis(_1) } # dead statement-valued phis would confuse typing
     Types.run(funcs, lower.classes, lower)
+    funcs = Passes.prune(funcs)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     funcs.each { Peephole.run(_1) unless ENV["NOPEEP"] }
     GC.mark_allocators(funcs)

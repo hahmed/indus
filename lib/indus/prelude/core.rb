@@ -247,3 +247,166 @@ end
 def __dyn_ge(a, b)
   __dyn_le(b, a)
 end
+
+# String methods, in Ruby over the byte primitives __ld8 / __st8 / __sdup.
+def __str_getbyte(s, i)
+  __trap if i < 0 || i >= s.length
+  __ld8(s, i)
+end
+
+def __str_setbyte(s, i, v)
+  __trap if i < 0 || i >= s.length
+  __st8(s, i, v)
+  v
+end
+
+def __str_dup(s)
+  __sdup(s)
+end
+
+def __str_b(s)
+  __sdup(s)
+end
+
+def __str_bytes(s)
+  out = []
+  i = 0
+  while i < s.length
+    out.push(__ld8(s, i))
+    i = i + 1
+  end
+  out
+end
+
+def __str_match_at(s, pat, at)
+  j = 0
+  while j < pat.length
+    return false if __ld8(s, at + j) != __ld8(pat, j)
+    j = j + 1
+  end
+  true
+end
+
+def __str_index_from(s, pat, from)
+  i = from
+  last = s.length - pat.length
+  while i <= last
+    return i if __str_match_at(s, pat, i)
+    i = i + 1
+  end
+  -1
+end
+
+def __str_include_p(s, pat)
+  __str_index_from(s, pat, 0) >= 0
+end
+
+def __str_start_with_p(s, pat)
+  return false if pat.length > s.length
+  __str_match_at(s, pat, 0)
+end
+
+def __str_end_with_p(s, pat)
+  return false if pat.length > s.length
+  __str_match_at(s, pat, s.length - pat.length)
+end
+
+def __str_index(s, pat)
+  r = __str_index_from(s, pat, 0)
+  return nil if r < 0
+  r
+end
+
+# split(","): fields between separators; trailing empty fields dropped like Ruby.
+# split(" ") is awk-style: runs of whitespace, leading/trailing ignored.
+def __str_split(s, sep)
+  out = []
+  if sep == " "
+    i = 0
+    while i < s.length
+      while i < s.length && __str_space(__ld8(s, i))
+        i = i + 1
+      end
+      start = i
+      while i < s.length && !__str_space(__ld8(s, i))
+        i = i + 1
+      end
+      out.push(s[start, i - start]) if i > start
+    end
+    return out
+  end
+  start = 0
+  i = 0
+  while i <= s.length - sep.length
+    if __str_match_at(s, sep, i)
+      out.push(s[start, i - start])
+      i = i + sep.length
+      start = i
+    else
+      i = i + 1
+    end
+  end
+  out.push(s[start, s.length - start])
+  while out.length > 0 && out[out.length - 1].length == 0
+    out.pop
+  end
+  out
+end
+
+def __str_space(c)
+  c == 32 || c == 9 || c == 10 || c == 13
+end
+
+def __str_gsub(s, pat, rep)
+  out = ""
+  i = 0
+  start = 0
+  while i <= s.length - pat.length
+    if __str_match_at(s, pat, i)
+      out = out + s[start, i - start] + rep
+      i = i + pat.length
+      start = i
+    else
+      i = i + 1
+    end
+  end
+  out + s[start, s.length - start]
+end
+
+def __str_succ(s)
+  r = __sdup(s)
+  i = r.length - 1
+  while i >= 0
+    c = __ld8(r, i)
+    if c == 122
+      __st8(r, i, 97)
+    elsif c == 90
+      __st8(r, i, 65)
+    elsif c == 57
+      __st8(r, i, 48)
+    else
+      __st8(r, i, c + 1)
+      return r
+    end
+    i = i - 1
+  end
+  # carried past the front: prepend the right first character
+  c = __ld8(r, 0)
+  if c == 97
+    "a" + r
+  elsif c == 65
+    "A" + r
+  else
+    "1" + r
+  end
+end
+
+def __str_times(s, n)
+  out = ""
+  i = 0
+  while i < n
+    out = out + s
+    i = i + 1
+  end
+  out
+end

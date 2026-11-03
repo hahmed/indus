@@ -7,7 +7,7 @@
 #   TYPES  one descriptor per heap type:
 #          kind 0 STR            size = 16 + cap            no pointers
 #          kind 1 ARR  elem_tid  size = 16 + cap*8          elems if elem_tid >= 0
-#          kind 2 HASH k_tid v_tid  size = 16 + cap*16      keys/vals if tid >= 0
+#          kind 2 HASH k_tid v_tid  size = 16 + cap*24      keys/vals if tid >= 0 (then the order list)
 #          kind 3 OBJ  size nfields [field_off, tid]...     (base 8 if tagged)
 #          kind 4 POLY npairs [class_id, tid]...            tag in word 0 -> class
 #          kind 5 DYN  str arr hash floatbox npairs [class_id, tid]...  by the value's low-bit tag
@@ -29,7 +29,7 @@ module Indus
     def self.dyn_classes(classes) = classes.values.select(&:tagged)
 
     # ops that bump the heap themselves (calls are decided by their callee)
-    DIRECT_ALLOC = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos box chr].freeze
+    DIRECT_ALLOC = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos box chr sdup].freeze
 
     # Func#allocates: can running this function (transitively) allocate? A call
     # to a function that cannot needs no safepoint. Patchable methods may be

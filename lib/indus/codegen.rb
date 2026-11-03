@@ -146,10 +146,18 @@ module Indus
           @asm.ldrb_idx(16, rs, ri); @asm.cmpi(16, byte); @asm.cset(d, :eq); @asm.b(dn)
           @asm.label(no); @asm.mov_imm(d, 0); @asm.label(dn)
         when :alen then @asm.ldur(d, reg(i.args[0]), -8)
-        when :hcap then @asm.ldur(d, reg(i.args[0]), -16)
-        when :hkey_at, :hval_at # entries are [key, val] at handle + i*16
-          ri = reg(i.args[1], 9)
-          @asm.emit(0x8B000000 | (ri << 16) | (4 << 10) | (reg(i.args[0]) << 5) | 16) # add x16, h, i, lsl #4
+        when :apop # len -= 1; d = a[len]  (traps on empty)
+          r = reg(i.args[0]); ok = @asm.uniq
+          @asm.ldur(16, r, -8); @asm.cbnz(16, ok); @asm.emit(0xD4200000); @asm.label(ok) # pop of [] traps
+          @asm.subi(16, 16, 1); @asm.stur(16, r, -8)
+          i.float? ? @asm.emit(0xFC607800 | (16 << 16) | (r << 5) | d) : @asm.emit(0xF8607800 | (16 << 16) | (r << 5) | d) # ldr d, [r, x16, lsl #3]
+        when :hcap then @asm.ldur(d, reg(i.args[0]), -8) # iteration bound: the count (entries come from the order list)
+        when :hkey_at, :hval_at # the i-th inserted entry: slot = order[i]; entry = h + slot*16
+          ri = reg(i.args[1], 9); rh = reg(i.args[0])
+          @asm.ldur(16, rh, -16)
+          @asm.emit(0x8B000000 | (16 << 16) | (4 << 10) | (rh << 5) | 16)   # add x16, h, cap, lsl #4  (order list)
+          @asm.emit(0xF8607800 | (ri << 16) | (16 << 5) | 16)               # ldr x16, [x16, i, lsl #3]
+          @asm.emit(0x8B000000 | (16 << 16) | (4 << 10) | (rh << 5) | 16)   # add x16, h, slot, lsl #4
           off = i.op == :hkey_at ? 0 : 8
           i.float? ? @asm.fldr_off(d, 16, off) : @asm.ldr_off(d, 16, off)
         when :chr then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_chr); @asm.mov(d, 0)
@@ -167,6 +175,9 @@ module Indus
           end
         when :nop then @asm.mov(d, reg(i.args[0]))
         when :rawld then @asm.ldr_off(d, reg(i.args[0]), 0)
+        when :rawld8 then @asm.emit(0x38606800 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d)   # ldrb wd, [s, i]
+        when :rawst8 then @asm.emit(0x38206800 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | reg(i.args[2], 10)) # strb
+        when :sdup then @asm.mov(0, reg(i.args[0], 0)); @asm.ldur(1, 0, -8); @asm.bl(:rt_str_new); @asm.mov(d, 0)
         when :rawld32 then @asm.emit(0xB9400000 | (reg(i.args[0]) << 5) | d)      # ldr wd, [xn]
         when :rawst then @asm.str_off(reg(i.args[1], 9), reg(i.args[0]), 0)
         when :gbase then @asm.mov(d, Asm::GBASE)

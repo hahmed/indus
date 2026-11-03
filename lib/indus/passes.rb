@@ -2,6 +2,30 @@
 module Indus
   module Passes
     # phi whose args are all itself or one value v -> v
+    # functions no call reaches from main are dropped: the preludes carry every
+    # String/Float/dyn helper, most of which a given program never uses (and
+    # an unused helper has untyped params, which codegen cannot take). A
+    # program with seams keeps everything: the resident compiler may call any.
+    def self.prune(funcs)
+      seams = funcs.any? { |f| f.all.any? { _1.op == :seam } }
+      live = {}; work = funcs.select { |f| f.name == :main || f.name == :__gc_run }
+      until work.empty?
+        f = work.pop
+        next if live[f]
+        live[f] = true
+        f.all.each do |i|
+          case i.op
+          when :call then work << i.args[0]
+          when :pcall, :sendsw then i.args[0].each { |(_, kind, payload)| work << payload if kind == :call }
+          when :dsend then i.args.each { |a| work << a if a.is_a?(Func) }
+          end
+          i.args.each { |a| work << a if a.is_a?(Func) } if i.op == :const || i.op == :lambda || i.op == :adrlbl
+        end
+      end
+      # with seams, keep every typed function too: the resident compiler may call it later
+      funcs.select { |f| live[f] || (seams && f.ptypes.none?(&:nil?)) }
+    end
+
     def self.trivial_phis(f)
       loop do
         changed = false
