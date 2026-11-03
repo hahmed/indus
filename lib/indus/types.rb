@@ -143,6 +143,8 @@ module Indus
         when :to_s then i.op = of(f, i.args[0]) == :str ? :nop : :itos
         when :to_i then i.op = :stoi if of(f, i.args[0]) == :str
         when :puts_v then i.op = { str: :puts_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil }.fetch(of(f, i.args[0]), :puts_i)
+        when :p_v then i.op = { str: :p_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil_word }.fetch(of(f, i.args[0]), :puts_i)
+        when :print_v then i.op = { str: :print_str }.fetch(of(f, i.args[0]), :print_i)
         when :lshift_or_append then i.op = of(f, i.args[0]) == :int ? :shl : :sappend
         end
       end
@@ -254,7 +256,8 @@ module Indus
       when :fconst then :float
       when :sconst, :scat, :sappend, :itos then :str
       when :seq, :sne, :scmp then :bool
-      when :puts_i, :puts_str, :puts_bool, :puts_opt, :puts_nil then :int
+      when :puts_i, :puts_str, :puts_bool, :puts_opt, :puts_nil, :print_i, :print_str, :p_str then :int
+      when :p_v, :print_v then of(f, a[0]) && :int
       when :idx, :idx_set, :dsend, :mcall then nil
       when :lshift_or_append then (t = of(f, a[0])) && (t == :int ? :int : t)
       when :to_s then (t = of(f, a[0])) && (t == :str ? :str : narrow(t) == :int ? :str : nil)

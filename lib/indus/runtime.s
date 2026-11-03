@@ -784,3 +784,49 @@ rt_str_to_i:
         neg     x3, x3
 9:      mov     x0, x3
         ret
+
+// rt_print_str(x0 s): write without newline
+rt_print_str:
+        stp     x29, x30, [sp, #-16]!
+        ldur    x2, [x0, #-8]
+        mov     x1, x0
+        mov     x0, #1
+        ldr     x16, [x27]
+        blr     x16
+        ldp     x29, x30, [sp], #16
+        ret
+
+// rt_print_i(x0 n): decimal, no newline (via rt_itos then rt_print_str)
+rt_print_i:
+        stp     x29, x30, [sp, #-16]!
+        bl      rt_itos
+        bl      rt_print_str
+        ldp     x29, x30, [sp], #16
+        ret
+
+// rt_p_str(x0 s): "s" with a newline (inspect, without escapes for now)
+rt_p_str:
+        stp     x29, x30, [sp, #-32]!
+        str     x19, [sp, #16]
+        mov     x19, x0
+        mov     w3, #34
+        strb    w3, [sp, #24]
+        add     x1, sp, #24
+        mov     x2, #1
+        mov     x0, #1
+        ldr     x16, [x27]
+        blr     x16                     // "
+        mov     x0, x19
+        bl      rt_print_str            // s
+        mov     w3, #34
+        strb    w3, [sp, #24]
+        mov     w3, #10
+        strb    w3, [sp, #25]
+        add     x1, sp, #24
+        mov     x2, #2
+        mov     x0, #1
+        ldr     x16, [x27]
+        blr     x16                     // "\n
+        ldr     x19, [sp, #16]
+        ldp     x29, x30, [sp], #32
+        ret

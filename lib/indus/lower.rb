@@ -244,7 +244,9 @@ module Indus
         v = expr(n.value)
         ((@ivar_kinds ||= {})[[@klass&.name, n.name]] ||= kind_of(n.value)) if @klass
         emit(:fld_set, [me_val, @klass.ivar(n.name), v]); v
-      when Prism::ConstantReadNode then emit(:gget, [n.name])
+      when Prism::ConstantReadNode
+        if n.name == :ARGV then (c = const(0); c.ty = :nil; c) # no arguments: every ARGV[k] is nil
+        else emit(:gget, [n.name]) end
       when Prism::ConstantWriteNode
         v = expr(n.value); emit(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode
@@ -304,10 +306,25 @@ module Indus
       when Prism::IfNode then if_expr(n)
       when Prism::WhileNode then while_stmt(n)
       when Prism::CallNode then call(n)
-      when Prism::AndNode, Prism::OrNode then bool_expr(n)
+      when Prism::OrNode
+        l = expr(n.left)
+        if l.ty == :nil then expr(n.right)                       # nil || y  ->  y, at compile time
+        else or_value(l) { expr(n.right) } end
+      when Prism::AndNode then bool_expr(n)
       when Prism::IndexTargetNode then raise "unsupported index target"
       else raise "unsupported: #{n.class}"
       end
+    end
+
+    # l || <right>: l if truthy else right, as a value
+    def or_value(l)
+      tb, eb, mb = @f.new_block(:ort), @f.new_block(:orf), @f.new_block(:orm)
+      emit(:condbr, [l, tb, eb])
+      @cur = tb; emit(:br, [mb])
+      before = @locals.dup
+      @cur = eb; r = yield; eend, el = @cur, @locals; emit(:br, [mb])
+      @cur = mb; @locals = merge_locals(mb, [[tb, before], [eend, el]])
+      p = mb.phi; p.args = [[tb, l], [eend, r]]; p
     end
 
     # a && b / a || b as a value: control flow + phi
@@ -379,6 +396,14 @@ module Indus
         a = args[0]
         if a.is_a?(Prism::StringNode) then emit(:puts_s, [a.unescaped])
         else emit(:puts_v, [expr(a)]) end # Types picks puts_i / puts_str
+      elsif n.name == :p && n.receiver.nil? && args.size == 1
+        emit(:p_v, [expr(args[0])])       # inspect form: strings quoted, nil as "nil"
+      elsif n.name == :print && n.receiver.nil? && args.size == 1
+        emit(:print_v, [expr(args[0])])   # no newline
+      elsif n.name == :Integer && n.receiver.nil? && args.size == 1
+        emit(:to_i, [expr(args[0])])      # Integer(x): the parse, no exception on junk (yet)
+      elsif n.name == :nil? && args.empty? && n.receiver
+        v = expr(n.receiver); emit(:cmp, [v, (c = const(0); c.ty = :nil; c)], :eq)
       elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
       elsif n.name == :+@ && args.empty? then expr(n.receiver) # +"" : literals are already fresh copies
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array
@@ -415,7 +440,9 @@ module Indus
         else emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
         r
       elsif n.name == :[] # array / hash / string: Types decides
-        emit(:idx, [expr(n.receiver), *args.map { expr(_1) }])
+        r = expr(n.receiver)
+        return (c = const(0); c.ty = :nil; c) if r.ty == :nil # nil[k] (ARGV) is nil at compile time
+        emit(:idx, [r, *args.map { expr(_1) }])
       elsif n.name == :[]=
         # a[i] = v may grow a: the result is the (possibly new) container, rebound to its home
         a = expr(n.receiver); i = expr(args[0]); v = expr(args[1])
@@ -494,6 +521,18 @@ module Indus
       body = blk.body&.body || []
       recv = n.receiver
       case n.name
+      when :new # Array.new(n) { |i| v }
+        raise "block passed to #{recv&.name}.new" unless recv.is_a?(Prism::ConstantReadNode) && recv.name == :Array
+        len = expr(args[0])
+        fill = const(0); fill.ty = :nil
+        arr = emit(:anew, [len, fill])
+        outv = :"anew#{@f.blocks.size}:out"
+        @locals[outv] = arr
+        counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
+          @locals[:"#{pfx}#{ps[0]}"] = i if ps[0]
+          @map_target = [outv, i]
+        end
+        return @locals.delete(outv)
       when :times then counted_loop(const(0), expr(recv), :lt, params, body)
       when :upto then counted_loop(expr(recv), expr(args[0]), :le, params, body)
       when :each, :map, :each_with_index

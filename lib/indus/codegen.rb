@@ -327,6 +327,10 @@ module Indus
           op = i.op.to_s.sub("h", ""); op = "geti" if i.op == :hget && i.ty == :int? # int values: miss -> sentinel
           @asm.bl(:"rt_hash#{kind}_#{op}"); @asm.mov(d, 0)
         when :puts_nil then @asm.str_data(:__nl, ""); @asm.adr(0, :__nl); @asm.bl(:rt_puts_str)
+        when :puts_nil_word then @asm.str_data(:__nilw, "nil"); @asm.adr(0, :__nilw); @asm.bl(:rt_puts_str)
+        when :p_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_p_str)
+        when :print_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_print_str)
+        when :print_i then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_print_i)
         when :puts_opt # nullable int: blank line for nil
           @asm.str_data(:__nl, "")
           nl = @asm.uniq; dn = @asm.uniq
