@@ -37,6 +37,7 @@ module Indus
       rt_print_str: 0x0000000000000a88,
       rt_print_i: 0x0000000000000aa8,
       rt_p_str: 0x0000000000000abc,
+      rt_chr: 0x0000000000000b1c,
     }
     # external calls: word index -> symbol, fixed up by Asm against compiled code
     RELOCS = {
@@ -752,6 +753,13 @@ module Indus
       0xf9400370,
       0xd63f0200,
       0xf9400bf3,
+      0xa8c27bfd,
+      0xd65f03c0,
+      0xa9be7bfd,
+      0x390043e0,
+      0x910043e0,
+      0xd2800021,
+      0x97fffd4b,
       0xa8c27bfd,
       0xd65f03c0,
     ]

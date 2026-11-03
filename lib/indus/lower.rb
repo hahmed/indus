@@ -319,7 +319,12 @@ module Indus
         @cur = @f.new_block(:dead); const(0)
       when Prism::StatementsNode then n.body.map { expr(_1) }.last
       when Prism::NextNode
-        raise "next outside a block" unless @loop&.[](:next)
+        raise "next outside a loop" unless @loop
+        if @loop[:next].nil? # a plain while: jump to the header
+          @loop[:nexts] << [@cur, @locals.dup] if @loop[:nexts]
+          emit(:br, [@loop[:head]])
+          @cur = @f.new_block(:dead); return const(0)
+        end
         @loop[:nexts] << [@cur, @locals.dup]
         emit(:br, [@loop[:next]])
         @cur = @f.new_block(:dead); const(0)
@@ -495,7 +500,12 @@ module Indus
       elsif %i[sin cos].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
         emit(:libm, [n.name, expr(args[0])])
       elsif n.name == :** then emit(:pow, [expr(n.receiver), expr(args[0])]) # ipow or libm pow, by type
-      elsif n.name == :length && args.empty? && n.receiver then emit(:alen, [expr(n.receiver)])
+      elsif %i[length size bytesize].include?(n.name) && args.empty? && n.receiver then emit(:alen, [expr(n.receiver)])
+      elsif (n.name == :even? || n.name == :odd?) && args.empty? && n.receiver
+        emit(:cmp, [emit(:and, [expr(n.receiver), const(1)]), const(0)], n.name == :even? ? :eq : :ne)
+      elsif n.name == :chr && args.empty? && n.receiver then emit(:chr, [expr(n.receiver)])
+      elsif n.name == :printf && n.receiver.nil? && args[0].is_a?(Prism::StringNode)
+        return printf_lower(args[0].unescaped, args[1..].map { expr(_1) })
       elsif n.name == :push && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode))
         a = expr(n.receiver); v = expr(args[0]); len = emit(:alen, [a])
         r = emit(:aset, [a, len, v]) # may grow: rebind the home
@@ -526,6 +536,8 @@ module Indus
       elsif @klass && @klass.find_method(n.name) && !@funcs[n.name]
         me = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
         emit(:call, [@klass.find_method(n.name), me, *args.map { expr(_1) }])
+      elsif @klass && args.empty? && n.receiver.nil? && (iv = @klass.find_reader(n.name)) && !@funcs[n.name]
+        emit(:fld_get, [me_val, @klass.ivar(iv)]) # a bare attr_reader call inside a method
       else
         f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
         kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
@@ -618,6 +630,18 @@ module Indus
         return @locals.delete(outv)
       when :times then counted_loop(const(0), expr(recv), :lt, params, body)
       when :upto then counted_loop(expr(recv), expr(args[0]), :le, params, body)
+      when :sum, :count # accumulate the block's value / truthiness
+        accv = :"acc#{@f.blocks.size}:v"
+        @locals[accv] = const(0)
+        r = recv.is_a?(Prism::ParenthesesNode) ? recv.body.body.last : recv
+        iter = ->(i, ps, pfx) { @locals[:"#{pfx}#{ps[0]}"] = i if ps[0]; @sum_target = [accv, n.name] }
+        if r.is_a?(Prism::RangeNode)
+          counted_loop(expr(r.left), expr(r.right), r.exclude_end? ? :lt : :le, params, body, &iter)
+        else
+          arr = expr(recv); len = emit(:alen, [arr])
+          counted_loop(const(0), len, :lt, params, body) { |i, ps, pfx| @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]; @sum_target = [accv, n.name] }
+        end
+        return @locals.delete(accv)
       when :each, :map, :each_with_index
         r = recv.is_a?(Prism::ParenthesesNode) ? recv.body.body.last : recv
         if r.is_a?(Prism::RangeNode)
@@ -635,6 +659,9 @@ module Indus
             return @locals.delete(outv)
           end
           return counted_loop(lo, hi, r.exclude_end? ? :lt : :le, params, body)
+        end
+        if n.name == :each && recv && @pre && (pk = @pre[recv]).is_a?(Array) && pk[0] == :hash
+          return hash_each(expr(recv), params, body)
         end
         k = recv ? kind_of(recv) : (@klass&.name) # receiverless: self
         y = @yielders[n.name]
@@ -666,11 +693,27 @@ module Indus
       each ? each.call(@locals[ivar], params, pfx) : (@locals[:"#{pfx}#{params[0]}"] = @locals[ivar] if params[0])
       @blk_pfx = (@blk_pfx || []) << pfx
       last = nil
-      body.each { last = expr(_1) }
+      if (guard = @body_guard) # hash iteration: run the body only for used slots
+        @body_guard = nil
+        tb, eb, mb = @f.new_block(:gthen), @f.new_block(:gelse), @f.new_block(:gmerge)
+        emit(:condbr, [guard, tb, eb])
+        before = @locals.dup
+        @cur = tb; body.each { last = expr(_1) }; tend, tl = @cur, @locals; emit(:br, [mb]) unless @cur.term
+        @cur = eb; @locals = before.dup; emit(:br, [mb])
+        @cur = mb; @locals = merge_locals(mb, [[tend, tl], [eb, before]])
+      else
+        body.each { last = expr(_1) }
+      end
       @blk_pfx.pop
       if @map_target && @map_target[0] && @locals[@map_target[0]]
         outv, idx = @map_target; @map_target = nil
         @locals[outv] = emit(:aset, [@locals[outv], idx, last || const(0)])
+      end
+      if @sum_target # sum { } adds the body's value; count { } adds 1 when it is truthy
+        accv, kind = @sum_target; @sum_target = nil
+        v = last || const(0)
+        v = emit(:and, [emit(:cmp, [v, const(0)], :ne), const(1)]) if kind == :count
+        @locals[accv] = emit(:add, [@locals[accv], v])
       end
       emit(:br, [lb]) unless @cur.term
       @loop[:nexts] << [@cur, @locals.dup] unless @cur.name.to_s.start_with?("dead")
@@ -686,6 +729,30 @@ module Indus
       @cur = xb
       @locals = breaks.empty? ? phis.dup : merge_locals(xb, [[hb, phis.dup], *breaks])
       @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
+      const(0)
+    end
+
+    # h.each { |k, v| }: walk the table's slots; the body runs only for used slots
+    def hash_each(h, params, body)
+      cap = emit(:hcap, [h])
+      counted_loop(const(0), cap, :lt, [], body) do |i, _ps, pfx|
+        key = emit(:hkey_at, [h, i]); val = emit(:hval_at, [h, i])
+        @locals[:"#{pfx}#{params[0]}"] = key if params[0]
+        @locals[:"#{pfx}#{params[1]}"] = val if params[1]
+        @body_guard = key # counted_loop wraps the body in `if guard`
+      end
+    end
+
+    # printf with a literal format: %d %s %f and literal text, as a chain of prints
+    def printf_lower(fmt, vals)
+      parts = fmt.split(/(%[-0-9.]*[dsf]|%%)/)
+      vi = 0
+      parts.each do |part|
+        next if part.empty?
+        if part == "%%" then emit(:print_v, [emit(:sconst, ["%"])])
+        elsif part.start_with?("%") then emit(:print_v, [vals[vi]]); vi += 1
+        else emit(:print_v, [emit(:sconst, [part])]) end
+      end
       const(0)
     end
 
@@ -874,12 +941,13 @@ module Indus
       @locals = phis.dup
       @cur = hb
       negate ? cond_branch(n.predicate, xb, bb) : cond_branch(n.predicate, bb, xb)
-      outer, @loop = @loop, { exit: xb, breaks: [] }
+      outer, @loop = @loop, { exit: xb, breaks: [], head: hb, nexts: [] }
       @cur = bb
       (n.statements&.body || []).each { expr(_1) }
       bend = @cur
       emit(:br, [hb]) unless @cur.term
-      phis.each { |nm, ph| ph.args << [bend, @locals[nm]] }
+      phis.each { |nm, ph| ph.args << [bend, @locals[nm]] unless @cur.name.to_s.start_with?("dead") && bend.succs.empty? }
+      @loop[:nexts].each { |(b, l)| phis.each { |nm, ph| ph.args << [b, l.fetch(nm)] } } # `next` sites also reach the header
       breaks = @loop[:breaks]; @loop = outer
       @cur = xb
       # exit sees the header's values, or a break site's

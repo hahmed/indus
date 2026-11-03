@@ -830,3 +830,13 @@ rt_p_str:
         ldr     x19, [sp, #16]
         ldp     x29, x30, [sp], #32
         ret
+
+// rt_chr(x0 byte) -> a fresh one-byte string
+rt_chr:
+        stp     x29, x30, [sp, #-32]!
+        strb    w0, [sp, #16]
+        add     x0, sp, #16
+        mov     x1, #1
+        bl      rt_str_new
+        ldp     x29, x30, [sp], #32
+        ret

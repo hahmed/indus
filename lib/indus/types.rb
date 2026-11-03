@@ -304,7 +304,10 @@ module Indus
       case i.op
       when :const then %i[nil sym bool lambda].include?(i.ty) ? i.ty : :int
       when :fconst then :float
-      when :sconst, :scat, :sappend, :itos, :bool_to_s then :str
+      when :sconst, :scat, :sappend, :itos, :bool_to_s, :chr then :str
+      when :hcap then :int
+      when :hkey_at then (t = of(f, a[0])) && hsh(t) ? t[1] : nil
+      when :hval_at then (t = of(f, a[0])) && hsh(t) ? t[2] : nil
       when :seq, :sne, :scmp then :bool
       when :puts_i, :puts_str, :puts_bool, :puts_opt, :puts_nil, :print_i, :print_str, :p_str then :int
       when :p_v, :print_v then of(f, a[0]) && :int

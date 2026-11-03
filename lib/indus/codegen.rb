@@ -146,6 +146,13 @@ module Indus
           @asm.ldrb_idx(16, rs, ri); @asm.cmpi(16, byte); @asm.cset(d, :eq); @asm.b(dn)
           @asm.label(no); @asm.mov_imm(d, 0); @asm.label(dn)
         when :alen then @asm.ldur(d, reg(i.args[0]), -8)
+        when :hcap then @asm.ldur(d, reg(i.args[0]), -16)
+        when :hkey_at, :hval_at # entries are [key, val] at handle + i*16
+          ri = reg(i.args[1], 9)
+          @asm.emit(0x8B000000 | (ri << 16) | (4 << 10) | (reg(i.args[0]) << 5) | 16) # add x16, h, i, lsl #4
+          off = i.op == :hkey_at ? 0 : 8
+          i.float? ? @asm.fldr_off(d, 16, off) : @asm.ldr_off(d, 16, off)
+        when :chr then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_chr); @asm.mov(d, 0)
         when :onew
           k = i.args[0]
           if i.stack # tier 0: in the frame, zeroed here, gone at ret
