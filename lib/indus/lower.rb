@@ -365,6 +365,10 @@ module Indus
       if n.receiver.nil? && n.name.to_s.start_with?("__") && !@funcs[n.name] && !(@klass && @klass.find_method(n.name))
         return intrinsic(n.name, args) # the GC prelude's raw memory access
       end
+      if n.name == :-@ && args.empty? # unary minus: 0 - x
+        v = expr(n.receiver)
+        return emit(:sub, [v.ty == :float ? fconst(0.0) : const(0), v])
+      end
       if n.name == :! && args.empty?
         v = expr(n.receiver)
         return emit(:cmp, [v, const(0)], :eq) # !x : true iff x is nil/false (0)
@@ -502,6 +506,18 @@ module Indus
       when :__dbg then emit(:puts_i, [expr(args[0])])
       when :__mmap then emit(:rawmmap, [expr(args[0])])
       when :__trap then emit(:trap, [])
+      # unsigned / wrapping 64-bit arithmetic for the float printer
+      when :__fbits then emit(:fbits, [expr(args[0])])
+      when :__lsr then emit(:lsr, [expr(args[0]), expr(args[1])])
+      when :__clz then emit(:clz, [expr(args[0])])
+      when :__umulh then emit(:umulh, [expr(args[0]), expr(args[1])])
+      when :__wmul then emit(:wmul, [expr(args[0]), expr(args[1])])
+      when :__wadd then emit(:wadd, [expr(args[0]), expr(args[1])])
+      when :__wsub then emit(:wsub, [expr(args[0]), expr(args[1])])
+      when :__ult then emit(:ucmp, [expr(args[0]), expr(args[1])], :lo)
+      when :__ule then emit(:ucmp, [expr(args[0]), expr(args[1])], :ls)
+      when :__gset_int then (v = expr(args[1]); emit(:gset, [args[0].unescaped.to_sym, v]); v)
+      when :__gget_int then emit(:gget, [args[0].unescaped.to_sym])
       else raise "unknown intrinsic #{name}"
       end
     end

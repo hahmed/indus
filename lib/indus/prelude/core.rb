@@ -1,7 +1,6 @@
 # Core routines written in the Indus subset and compiled into every program.
 # Testable with plain Ruby: `ruby -r ./lib/indus/prelude/core.rb`.
 
-def __trap = raise("indus: trap") # the intrinsic traps in compiled code; plain Ruby raises
 
 # Float#to_s: the shortest decimal that parses back to the same double.
 # Tries 1..17 significant digits; digits come from scaling by a power of ten
@@ -63,60 +62,20 @@ def __float_to_s(f)
   if a > 1.7976931348623157e308
     return neg ? "-Infinity" : "Infinity"
   end
-  # denormals: 10**-324 is not representable; lift into the normal range first
-  # (inexact in the last place for the very smallest values -- a known limit)
-  lift = 0
-  if a < 1.0e-290
-    a = a * 1.0e100
-    lift = 100
-  end
-  e = __dec_exp(a)
-  digits = 0
-  p = 1
-  found = 0
-  while p <= 17 && found == 0
-    # the integer with p significant digits nearest to a: k = e-p+1 is the
-    # power of ten to strip. Multiply or divide by an *exact* power of ten so
-    # both the scaling and the parse-back are correctly rounded.
-    k = e - p + 1
-    q = k >= 0 ? a / __pow10(k) : a * __pow10(0 - k)
-    n = __round_f(q)
-    e2 = e
-    if n >= __pow10(p).to_i
-      # rounding carried into a new digit (9.95 -> 10 at p=2): for this try only
-      n = n / 10
-      e2 = e + 1
-      k = k + 1
-    end
-    # double rounding can land one off: try the neighbours too (nearest first)
-    c = 0
-    while c < 3 && found == 0
-      m = c == 0 ? n : (c == 1 ? n - 1 : n + 1)
-      back = k >= 0 ? m.to_f * __pow10(k) : m.to_f / __pow10(0 - k)
-      # the check is only meaningful when m and 10**|k| are exact doubles
-      if back == a && m > 0 && m < 9007199254740992 && k <= 22 && k >= -22
-        digits = m
-        e = e2
-        found = 1
-      end
-      c = c + 1
-    end
-    p = p + 1 if found == 0
-  end
-  if found == 0
-    # 17 significant digits cannot be produced exactly with double arithmetic;
-    # printing an approximation would be a wrong answer. Fail noisily until the
-    # exact algorithm (Grisu) lands.
-    __trap
-  end
-  e = e - lift
+  digits = __grisu(a)
+  kexp = __grisu_k
   ds = digits.to_s
-  # strip trailing zeros from the significand
+  # strip trailing zeros from the significand; e is the decimal exponent of
+  # the first digit: value = 0.ds * 10**(e+1) with digits * 10**kexp
   while ds.length > 1 && ds[ds.length - 1] == "0"
     ds = ds[0, ds.length - 1]
+    kexp = kexp + 1
   end
+  e = digits.to_s.length + kexp - 1
   out = ""
-  if e >= -4 && e < 15
+  # Ruby: fixed notation for decpt (= e+1) in -3..15, and at decpt 16 only when
+  # fractional digits remain (2660891052749272.5 is fixed, 1.0e+15 is not)
+  if e >= -4 && (e < 15 || (e == 15 && ds.length > 16))
     if e >= 0
       if ds.length > e + 1
         out = ds[0, e + 1] + "." + ds[e + 1, ds.length - e - 1]

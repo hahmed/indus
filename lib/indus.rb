@@ -32,7 +32,7 @@ module Indus
 
   # standalone: nil (run in-process via libc write), :darwin or :linux
   PRELUDE_GC = File.read(File.join(__dir__, "indus/prelude/gc.rb"))
-  PRELUDE_CORE = File.read(File.join(__dir__, "indus/prelude/core.rb")).sub(/^def __trap = .*$/, "")
+  PRELUDE_CORE = File.read(File.join(__dir__, "indus/prelude/grisu.rb")) + "\n" + File.read(File.join(__dir__, "indus/prelude/core.rb"))
 
   def self.compile(src, standalone: nil)
     src = PRELUDE_CORE + "\n" + src          # Float#to_s and friends, in Ruby

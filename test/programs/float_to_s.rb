@@ -14,3 +14,9 @@ puts x
 puts 1e15
 puts 123456789012345.0
 puts 0.0
+puts 100.0 / 3.0
+puts 2.0 / 3.0
+x = 0.1 + 0.2
+puts x
+puts 5e-324
+puts 1.7976931348623157e308

@@ -178,10 +178,10 @@ module Indus
     def subi(rd, rn, i) = emit(0xD1000000 | (i << 10) | (rn << 5) | rd)
     def cmp(rn, rm) = emit(0xEB00001F | (rm << 16) | (rn << 5))
     def cmpi(rn, i) = emit(0xF100001F | (i << 10) | (rn << 5))
-    COND = { eq: 0x0, ne: 0x1, ge: 0xA, lt: 0xB, gt: 0xC, le: 0xD, mi: 0x4, pl: 0x5, ls: 0x9, hi: 0x8, lo: 0x3,
+    COND = { eq: 0x0, ne: 0x1, ge: 0xA, lt: 0xB, gt: 0xC, le: 0xD, mi: 0x4, pl: 0x5, ls: 0x9, hi: 0x8, lo: 0x3, hs: 0x2,
              # float compares: unordered must be false for < <= (mi/ls), true for != (ne)
              feq: 0x0, fne: 0x1, flt: 0x4, fle: 0x9, fgt: 0xC, fge: 0xA }
-    INV = { eq: :ne, ne: :eq, ge: :lt, lt: :ge, gt: :le, le: :gt, mi: :pl, pl: :mi, ls: :hi, hi: :ls,
+    INV = { eq: :ne, ne: :eq, ge: :lt, lt: :ge, gt: :le, le: :gt, mi: :pl, pl: :mi, ls: :hi, hi: :ls, lo: :hs, hs: :lo,
             feq: :fne, fne: :feq, flt: :pl, fle: :hi, fgt: :fle_u, fge: :flt_u }
     COND[:fle_u] = 0xD; COND[:flt_u] = 0xB # le / lt (true on unordered), the inverses of gt / ge
     def cset(rd, c) = emit(0x9A9F07E0 | (COND[INV[c]] << 12) | rd)

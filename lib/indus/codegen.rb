@@ -164,6 +164,14 @@ module Indus
         when :rawst then @asm.str_off(reg(i.args[1], 9), reg(i.args[0]), 0)
         when :gbase then @asm.mov(d, Asm::GBASE)
         when :trap then @asm.emit(0xD4200000) # brk #0: heap exhausted
+        when :ucmp then @asm.cmp(reg(i.args[0]), reg(i.args[1], 9)); @asm.cset(d, i.cond)
+        when :fbits then @asm.emit(0x9E660000 | (freg(i.args[0]) << 5) | d)                       # fmov d, dn
+        when :lsr then @asm.emit(0x9AC02400 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d) # lsrv
+        when :clz then @asm.emit(0xDAC01000 | (reg(i.args[0]) << 5) | d)
+        when :umulh then @asm.emit(0x9BC07C00 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d)
+        when :wmul then @asm.mul(d, reg(i.args[0]), reg(i.args[1], 9))
+        when :wadd then @asm.add(d, reg(i.args[0]), reg(i.args[1], 9))
+        when :wsub then @asm.sub(d, reg(i.args[0]), reg(i.args[1], 9))
         when :rawmmap then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_mmap); @asm.mov(d, 0)
         when :adrlbl then @asm.adr(d, i.args[0])
         when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer
