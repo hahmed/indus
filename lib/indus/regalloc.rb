@@ -42,7 +42,7 @@ module Indus
         bend[b] = n - 1
       end
       f.params.each { pos[_1] = -1 }
-      skip = ->(i) { i.term? || %i[const fconst puts_s puts_i puts_str puts_bool puts_opt puts_nil putc gset fld_set seam hrestore rawst].include?(i.op) || (i.op == :cmp && fused?(i)) }
+      skip = ->(i) { i.term? || %i[const fconst puts_s puts_i puts_str puts_bool puts_opt puts_nil putc gset fld_set seam hrestore rawst trap].include?(i.op) || (i.op == :cmp && fused?(i)) }
       value = ->(x) { x.is_a?(Inst) && !skip.(x) && !%i[const fconst].include?(x.op) }
 
       # ---- liveness

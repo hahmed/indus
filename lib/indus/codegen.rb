@@ -162,6 +162,7 @@ module Indus
         when :rawld32 then @asm.emit(0xB9400000 | (reg(i.args[0]) << 5) | d)      # ldr wd, [xn]
         when :rawst then @asm.str_off(reg(i.args[1], 9), reg(i.args[0]), 0)
         when :gbase then @asm.mov(d, Asm::GBASE)
+        when :trap then @asm.emit(0xD4200000) # brk #0: heap exhausted
         when :rawmmap then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_mmap); @asm.mov(d, 0)
         when :adrlbl then @asm.adr(d, i.args[0])
         when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer

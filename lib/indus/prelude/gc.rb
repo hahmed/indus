@@ -156,7 +156,9 @@ def __gc_run(fp)
   live = free - to
   cap = to_end - to
   if live * 2 > cap
-    # more than half full after collecting: the next to-space is twice the size
+    # more than half full after collecting: the next to-space is twice the size.
+    # Hard cap (1 GB per semispace): past it, fail noisily rather than eat the machine.
+    __trap if cap >= 1073741824
     # (the old from-space is abandoned; the bitmap must cover the new from-space
     # at the collection after next, so size it for the bigger space now)
     ncap = cap * 2

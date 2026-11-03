@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 # indus file.rb            compile and run in-process (JIT-style)
 # indus file.rb -o out     write a standalone executable (Mach-O; --linux for ELF)
+# indus file.rb --check    compile only; exit 0 if Indus accepts the program
 require_relative "../lib/indus"
 require_relative "../lib/indus/macho"
 require_relative "../lib/indus/elf"
@@ -9,6 +10,15 @@ file = ARGV[0] or abort "usage: indus file.rb [-o out]"
 out = ARGV[ARGV.index("-o") + 1] if ARGV.include?("-o")
 src = File.read(file)
 
+if ARGV.include?("--check")
+  begin
+    Indus.compile(src)
+  rescue => e
+    $stderr.puts "indus: #{e.message.lines.first.strip}"
+    exit 1
+  end
+  exit 0
+end
 if out
   os = ARGV.include?("--linux") ? :linux : :darwin
   unit = Indus.compile(src, standalone: os)
