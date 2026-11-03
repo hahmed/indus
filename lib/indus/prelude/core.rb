@@ -108,3 +108,142 @@ end
 def __quote(s)
   "\"" + s + "\""
 end
+
+# Tagged scalars (:dyn): to_s / inspect by tag. Tags: 0 nil, odd fixnum,
+# 2 String, 4 Array, 6 Hash, 8 object, 10 bool, 12 symbol, 14 Float box.
+def __dyn_to_s(v)
+  t = __tag(v)
+  if __same(v, 0)
+    return ""
+  end
+  if t & 1 == 1
+    return __unbox_int(v).to_s
+  end
+  if t == 2
+    return __unbox_str(v)
+  end
+  if t == 14
+    return __float_to_s(__unbox_float(v))
+  end
+  if t == 10
+    return __unbox_bool(v) ? "true" : "false"
+  end
+  if t == 4
+    return __dyn_arr_inspect(__unbox_arr(v))
+  end
+  "#<object>"
+end
+
+def __dyn_inspect(v)
+  t = __tag(v)
+  if __same(v, 0)
+    return "nil"
+  end
+  if t == 2
+    return __quote(__unbox_str(v))
+  end
+  __dyn_to_s(v)
+end
+
+def __dyn_arr_inspect(a)
+  out = "["
+  i = 0
+  while i < a.length
+    out = out + ", " if i > 0
+    out = out + __dyn_inspect(a[i])
+    i = i + 1
+  end
+  out + "]"
+end
+
+# Operators on tagged scalars. Integer/Integer and Float mixes, String +.
+# Anything else traps: a wrong answer is worse than a refusal.
+def __dyn_num(v)
+  t = __tag(v)
+  if t & 1 == 1
+    return __unbox_int(v).to_f
+  end
+  if t == 14
+    return __unbox_float(v)
+  end
+  __trap
+  0.0
+end
+
+def __dyn_both_int(a, b)
+  (__tag(a) & 1 == 1) && (__tag(b) & 1 == 1)
+end
+
+def __dyn_add(a, b)
+  if __dyn_both_int(a, b)
+    return __box_int(__unbox_int(a) + __unbox_int(b))
+  end
+  if __tag(a) == 2 && __tag(b) == 2
+    return __box_str(__unbox_str(a) + __unbox_str(b))
+  end
+  __box_float(__dyn_num(a) + __dyn_num(b))
+end
+
+def __dyn_sub(a, b)
+  if __dyn_both_int(a, b)
+    return __box_int(__unbox_int(a) - __unbox_int(b))
+  end
+  __box_float(__dyn_num(a) - __dyn_num(b))
+end
+
+def __dyn_mul(a, b)
+  if __dyn_both_int(a, b)
+    return __box_int(__unbox_int(a) * __unbox_int(b))
+  end
+  __box_float(__dyn_num(a) * __dyn_num(b))
+end
+
+def __dyn_div(a, b)
+  if __dyn_both_int(a, b)
+    return __box_int(__unbox_int(a) / __unbox_int(b))
+  end
+  __box_float(__dyn_num(a) / __dyn_num(b))
+end
+
+def __dyn_eq(a, b)
+  if __tag(a) == 2 && __tag(b) == 2
+    return __unbox_str(a) == __unbox_str(b)
+  end
+  if __dyn_both_int(a, b)
+    return __same(a, b)
+  end
+  if __dyn_numeric(a) && __dyn_numeric(b)
+    return __dyn_num(a) == __dyn_num(b)
+  end
+  __same(a, b)
+end
+
+def __dyn_numeric(v)
+  (__tag(v) & 1 == 1) || __tag(v) == 14
+end
+
+def __dyn_ne(a, b)
+  !__dyn_eq(a, b)
+end
+
+def __dyn_lt(a, b)
+  if __dyn_both_int(a, b)
+    return __unbox_int(a) < __unbox_int(b)
+  end
+  __dyn_num(a) < __dyn_num(b)
+end
+
+def __dyn_le(a, b)
+  if __dyn_both_int(a, b)
+    return __unbox_int(a) <= __unbox_int(b)
+  end
+  __dyn_num(a) <= __dyn_num(b)
+end
+
+def __dyn_gt(a, b)
+  __dyn_lt(b, a)
+end
+
+def __dyn_ge(a, b)
+  __dyn_le(b, a)
+end

@@ -10,6 +10,7 @@
 #          kind 2 HASH k_tid v_tid  size = 16 + cap*16      keys/vals if tid >= 0
 #          kind 3 OBJ  size nfields [field_off, tid]...     (base 8 if tagged)
 #          kind 4 POLY npairs [class_id, tid]...            tag in word 0 -> class
+#          kind 5 DYN  str arr hash floatbox npairs [class_id, tid]...  by the value's low-bit tag
 #   FRAMES one entry per function: [code_start, code_end, nslots, slot_off, tid...]
 #          (code offsets relative to the text base; slots relative to that frame's sp)
 #
@@ -21,12 +22,14 @@ module Indus
   module GC
     # on by default; INDUS_NOGC=1 turns it off
     def self.enabled? = !ENV["INDUS_NOGC"]
-    def self.semispace_bytes = (ENV["INDUS_HEAP_MB"] || 4).to_i << 20 # start small; the collector doubles it on demand
+    def self.semispace_bytes = [(ENV["INDUS_HEAP_MB"] || 4).to_i, 1].max << 20 # start small (never 0); the collector doubles it on demand
 
     def self.pointer?(t) = Types.heap_pointer?(t)
+    # classes reachable through a :dyn slot need their id in word 0
+    def self.dyn_classes(classes) = classes.values.select(&:tagged)
 
     # ops that bump the heap themselves (calls are decided by their callee)
-    DIRECT_ALLOC = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos].freeze
+    DIRECT_ALLOC = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos box chr].freeze
 
     # Func#allocates: can running this function (transitively) allocate? A call
     # to a function that cannot needs no safepoint. Patchable methods may be
@@ -74,6 +77,9 @@ module Indus
         @types[id] =
           case
           when t == :str then [0]
+          when t == :dyn # a tagged scalar: the concrete type is known only at run time, by tag
+            boxed = @classes.values.select(&:boxed)
+            [5, tid(:str), tid([:arr, :dyn]), tid([:hash, :dyn, :dyn]), tid(:str), boxed.size, *boxed.flat_map { |k| [k.id, tid(k.name)] }]
           when t.is_a?(Array) && t[0] == :arr then [1, tid(t[1])]
           when t.is_a?(Array) && t[0] == :hash then [2, tid(t[1]), tid(t[2])]
           when t.is_a?(Array) && t[0] == :poly then [4, t[1].size, *t[1].flat_map { |c| [@classes[c].id, tid(c)] }]

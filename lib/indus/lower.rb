@@ -157,6 +157,11 @@ module Indus
       end
     end
 
+    # the type a constant names, for refinement
+    def kind_for(cname)
+      { Integer: :int, Float: :float, String: :str, Array: [:arr, :dyn], Hash: [:hash, :dyn, :dyn], Symbol: :sym }.fetch(cname) { @classes[cname] ? cname : raise("is_a?(#{cname}): unknown class") }
+    end
+
     def struct_new?(v) = v.is_a?(Prism::CallNode) && v.name == :new && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Struct
 
     def lower_body(f, names, stmts, klass = nil, ct = {})
@@ -595,6 +600,16 @@ module Indus
       when :__wsub then emit(:wsub, [expr(args[0]), expr(args[1])])
       when :__ult then emit(:ucmp, [expr(args[0]), expr(args[1])], :lo)
       when :__ule then emit(:ucmp, [expr(args[0]), expr(args[1])], :ls)
+      when :__tag then emit(:dyn_tag, [expr(args[0])])                      # low 4 bits
+      when :__same then emit(:ucmp, [expr(args[0]), expr(args[1])], :eq) # raw word identity, never rewritten
+      when :__box_int then emit(:box, [expr(args[0]), :int])
+      when :__box_str then emit(:box, [expr(args[0]), :str])
+      when :__box_float then emit(:box, [expr(args[0]), :float])
+      when :__unbox_int then emit(:unbox, [expr(args[0]), :int])
+      when :__unbox_str then emit(:unbox, [expr(args[0]), :str])
+      when :__unbox_arr then emit(:unbox, [expr(args[0]), [:arr, :dyn]])
+      when :__unbox_float then emit(:unbox, [expr(args[0]), :float])
+      when :__unbox_bool then emit(:unbox, [expr(args[0]), :bool])
       when :__gset_int then (v = expr(args[1]); emit(:gset, [args[0].unescaped.to_sym, v]); v)
       when :__gget_int then emit(:gget, [args[0].unescaped.to_sym])
       else raise "unknown intrinsic #{name}"
@@ -833,8 +848,20 @@ module Indus
       tb, eb, mb = @f.new_block(:then), @f.new_block(:else), @f.new_block(:merge)
       negate ? cond_branch(n.predicate, eb, tb) : cond_branch(n.predicate, tb, eb)
       before = @locals.dup
+      # `if v.is_a?(K)`: inside the branch, v is a K (unbox: Types makes it a nop for an already-typed v)
+      pr = n.predicate
+      if pr.is_a?(Prism::CallNode) && pr.name == :is_a? && pr.receiver.is_a?(Prism::LocalVariableReadNode) && pr.arguments&.arguments&.first.is_a?(Prism::ConstantReadNode)
+        refine = [lname(pr.receiver.name), pr.arguments.arguments.first.name]
+      end
 
-      @cur = tb; tv = (n.statements&.body || []).map { expr(_1) }.last || const(0)
+      @cur = tb
+      if refine && (negate == false)
+        nm, cname = refine
+        @locals[nm] = emit(:unbox, [@locals.fetch(nm), kind_for(cname)]) # a new SSA name for v inside the branch
+      end
+      tv = (n.statements&.body || []).map { expr(_1) }.last || const(0)
+      # the refined name was only a view: if the branch did not assign it, hand the original back to the merge
+      @locals[refine[0]] = before[refine[0]] if refine && negate == false && @locals[refine[0]]&.op == :unbox
       tend, tlocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
 
       @cur = eb; @locals = before.dup

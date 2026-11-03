@@ -172,6 +172,49 @@ module Indus
         when :gbase then @asm.mov(d, Asm::GBASE)
         when :trap then @asm.emit(0xD4200000) # brk #0: heap exhausted
         when :isa_tag then @asm.ldr_off(16, reg(i.args[0]), 0); @asm.cmpi(16, i.args[1]); @asm.cset(d, :eq)
+        when :box # tag a typed value: see notes/29_tagged_scalars_design.md
+          v, t = i.args; r = v.float? ? nil : reg(v)
+          case t
+          when :int, :int? then @asm.emit(0xD37FF800 | (r << 5) | d) ; @asm.emit(0xB2400000 | (d << 5) | d) # lsl d, r, #1 ; orr d, d, #1
+          when :str then @asm.emit(0xB27F0000 | (r << 5) | d)                            # orr d, r, #2
+          when :bool then @asm.emit(0xD37CEC00 | (r << 5) | d); @asm.emit(0xB27D0000 | (d << 5) | d); @asm.emit(0xB27F0000 | (d << 5) | d) # (<<4) |8 |2 = 10
+          when :sym then @asm.emit(0xD37CEC00 | (r << 5) | d); @asm.emit(0xB27E0400 | (d << 5) | d) # (<<4) |12
+          when :nil then @asm.mov_imm(d, 0)
+          when :float # box: 16 bytes, bits in word 0
+            @asm.emit(0x9E660000 | (freg(v) << 5) | 16); @asm.emit(0xF81F0FF0) # fmov x16, dv ; str x16, [sp, #-16]!
+            @asm.addi(0, 31, 0); @asm.mov_imm(1, 8); @asm.bl(:rt_str_new)     # an 8-byte leaf object (STR descriptor)
+            @asm.emit(0x910043FF)                                              # add sp, sp, #16
+            @asm.emit(0xB27F0800 | (0 << 5) | d)                               # orr d, x0, #14
+          else
+            if t.is_a?(Array) && t[0] == :arr then @asm.emit(0xB27E0000 | (r << 5) | d)      # orr d, r, #4
+            elsif t.is_a?(Array) && t[0] == :hash then @asm.emit(0xB27F0400 | (r << 5) | d)   # orr d, r, #6
+            else @asm.emit(0xB27D0000 | (r << 5) | d) end                                   # object: orr d, r, #8
+          end
+        when :unbox
+          v, t = i.args; r = reg(v)
+          case t
+          when :int, :int? then @asm.emit(0x9341FC00 | (r << 5) | d)            # asr d, r, #1
+          when :bool, :sym then @asm.emit(0x9344FC00 | (r << 5) | d)            # asr d, r, #4
+          when :float then @asm.emit(0x927CEC00 | (r << 5) | 16); @asm.fldr_off(d, 16, 0) # and x16, r, #~15 ; ldr d, [x16]
+          else @asm.emit(0x927CEC00 | (r << 5) | d)                             # and d, r, #~15 (handles are 16-aligned)
+          end
+        when :dyn_tag then @asm.emit(0x92400C00 | (reg(i.args[0]) << 5) | d)  # and d, r, #15
+        when :isa_dyn
+          v, cname = i.args; r = reg(v)
+          case cname
+          when :Integer then @asm.emit(0x92400000 | (r << 5) | 16); @asm.cmpi(16, 1); @asm.cset(d, :eq)        # bit 0
+          when :NilClass then @asm.cmpi(r, 0); @asm.cset(d, :eq)
+          else
+            tag = { String: 2, Array: 4, Hash: 6, Float: 14, TrueClass: 10, FalseClass: 10, Symbol: 12 }[cname]
+            if tag
+              @asm.emit(0x92400C00 | (r << 5) | 16); @asm.cmpi(16, tag); @asm.cset(d, :eq)
+            else # a user class: tag 8 and class id in word 0
+              k = @classes.fetch(cname); no = @asm.uniq; dn = @asm.uniq
+              @asm.emit(0x92400C00 | (r << 5) | 16); @asm.cmpi(16, 8); @asm.bcond(:ne, no)
+              @asm.emit(0x927CEC00 | (r << 5) | 16); @asm.ldr_off(16, 16, 0); @asm.cmpi(16, k.id); @asm.cset(d, :eq); @asm.b(dn)
+              @asm.label(no); @asm.mov_imm(d, 0); @asm.label(dn)
+            end
+          end
         when :ucmp then @asm.cmp(reg(i.args[0]), reg(i.args[1], 9)); @asm.cset(d, i.cond)
         when :fbits then @asm.emit(0x9E660000 | (freg(i.args[0]) << 5) | d)                       # fmov d, dn
         when :lsr then @asm.emit(0x9AC02400 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d) # lsrv
@@ -380,6 +423,8 @@ module Indus
           if c.op == :cmp && fused?(c)
             if nb == e then @asm.bcond(c.cond, lbl(t))
             else @asm.bcond(Asm::INV[c.cond], lbl(e)); @asm.b(lbl(t)) unless nb == t end
+          elsif c.ty == :dyn # nil (0) and false (10) are the falsy words
+            r = reg(c); @asm.cbz(r, lbl(e)); @asm.cmpi(r, 10); @asm.bcond(:eq, lbl(e)); @asm.b(lbl(t)) unless nb == t
           else
             @asm.cbz(reg(c), lbl(e)); @asm.b(lbl(t)) unless nb == t
           end

@@ -17,13 +17,21 @@ module Indus
       return a if b == :nil
       return :float if (a == :int && b == :float) || (a == :float && b == :int)
       return :int? if (a == :int? && b == :nil) || (a == :nil && b == :int?)
-      return [:arr, join(a[1], b[1])] if arr(a) && arr(b)
-      return [:hash, join(a[1], b[1]), join(a[2], b[2])] if hsh(a) && hsh(b)
+      return [:arr, join_elem(a[1], b[1])] if arr(a) && arr(b)
+      return [:hash, join_elem(a[1], b[1]), join_elem(a[2], b[2])] if hsh(a) && hsh(b)
       # two classes meet: a closed poly set (whole program, so it is finite)
       ca, cb = classes_of(a), classes_of(b)
       return [:poly, (ca | cb).sort] if ca && cb
+      # anything else meeting: a tagged scalar (see notes/29_tagged_scalars_design.md)
+      return :dyn if a == :dyn || b == :dyn || dynable?(a) && dynable?(b)
       raise "type clash: #{a.inspect} vs #{b.inspect}"
     end
+    # container elements keep their identity: an Integer stored next to a Float stays an Integer
+    def self.join_elem(a, b)
+      return :dyn if (a == :int && b == :float) || (a == :float && b == :int)
+      join(a, b)
+    end
+    def self.dynable?(t) = %i[int int? float str bool sym nil lambda].include?(t) || arr(t) || hsh(t) || poly?(t) || (t.is_a?(Symbol) && @classes&.[](t))
     def self.classes_of(t)
       return t[1] if poly?(t)
       [t] if t.is_a?(Symbol) && @classes[t]
@@ -33,7 +41,7 @@ module Indus
     def self.arr(t) = t.is_a?(Array) && t[0] == :arr
     # does a value of this type hold a heap pointer the collector must follow?
     def self.heap_pointer?(t)
-      return true if t == :str
+      return true if t == :str || t == :dyn
       return true if t.is_a?(Array) && %i[arr hash poly].include?(t[0])
       t.is_a?(Symbol) && !!@classes&.[](t)
     end
@@ -53,12 +61,36 @@ module Indus
       loop do
         changed = false
         set = ->(cur, nt, &w) { (w.call(join(cur, nt)); changed = true) if nt && join(cur, nt) != cur }
+        # a container that flows into a :dyn slot must itself hold :dyn elements, so that
+        # whoever unboxes it later finds tagged values: widen it at its origin
+        dynflow = ->(f, v, dest) {
+          next unless dest == :dyn && v.is_a?(Inst)
+          t = of(f, v)
+          nt = arr(t) ? [:arr, :dyn] : hsh(t) ? [:hash, :dyn, :dyn] : nil
+          next if nt.nil? || t == nt
+          v = v.args[0] while %i[aset hset].include?(v.op)
+          v.op == :param ? f.ptypes[f.params.index(v)] = nt : v.ty = nt; changed = true
+        }
         funcs.each do |f|
           f.all.each do |i|
+            case i.op
+            when :aset then dynflow.(f, i.args[2], arr(of(f, i.args[0])) && of(f, i.args[0])[1])
+            when :hset then (dynflow.(f, i.args[1], hsh(of(f, i.args[0])) && of(f, i.args[0])[1]); dynflow.(f, i.args[2], hsh(of(f, i.args[0])) && of(f, i.args[0])[2]))
+            when :fld_set then dynflow.(f, i.args[2], ivar_type(of(f, i.args[0]), i.args[1]))
+            when :gset then dynflow.(f, i.args[1], @consts[i.args[0]])
+            when :call then i.args[1..].each_with_index { |v, k| dynflow.(f, v, i.args[0].ptypes[k]) }
+            when :ret then dynflow.(f, i.args[0], f.rtype)
+            when :phi then i.args.each { |(_, v)| dynflow.(f, v, i.ty) }
+            end
             bind(f, i) if i.op == :mcall
             dsend(f, i) if i.op == :dsend
             float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
-            inspect_v(f, i) if i.op == :inspect_v && of(f, i.args[0])
+            # printing/inspecting by type is irreversible, so it waits for the types to settle (below)
+            if @settled
+              dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
+              dyn_print(f, i) if %i[puts_v p_v print_v inspect_v].include?(i.op) && of(f, i.args[0]) == :dyn
+              inspect_v(f, i) if i.op == :inspect_v && of(f, i.args[0])
+            end
             index(f, i) if i.op == :idx || i.op == :idx_set
             t = infer(f, i)
             set.(i.ty, t) { i.ty = _1 }
@@ -91,6 +123,7 @@ module Indus
               nt = [:arr, of(f, v)]
               cur = of(f, a)
               if of(f, v) && (cur.nil? || (arr(cur) && join(cur, nt) != cur))
+                a = a.args[0] while a.op == :aset # widen the container at its origin, so earlier stores see it too
                 a.op == :param ? f.ptypes[f.params.index(a)] = join(cur, nt) : a.ty = join(cur, nt); changed = true
               end
             when :hset
@@ -99,6 +132,7 @@ module Indus
               if kt && vt && vt != :nil
                 nt = [:hash, kt, vt]; cur = of(f, h)
                 if cur.nil? || join(cur, nt) != cur
+                  h = h.args[0] while h.op == :hset
                   h.op == :param ? f.ptypes[f.params.index(h)] = join(cur, nt) : h.ty = join(cur, nt); changed = true
                 end
               end
@@ -109,10 +143,16 @@ module Indus
             end
           end
         end
-        break unless changed
+        unless changed
+          break if @settled # second convergence: prints resolved and types stable
+          @settled = true; changed = true # one more round with the by-type rewrites enabled
+        end
       end
+      @settled = false
       # classes that appear in any poly type carry a tag word
       tag = ->(t) { classes_of(t)&.each { @classes[_1].tagged = true } if poly?(t) || arr(t) && poly?(t[1]) }
+      # a user object boxed into a :dyn must carry its class id: tag every class that is boxed
+      funcs.each { |f| f.all.each { |i| (c = @classes[i.args[1]]) && (c.tagged = true) if i.op == :box && i.args[1].is_a?(Symbol) } }
       funcs.each { |f| f.all.each { tag.(_1.ty) }; f.ptypes.each { tag.(_1) }; tag.(f.rtype) }
       @ivars.each_value { |h| h.each_value { tag.(_1) } }
       funcs.each { convert(_1) }
@@ -126,7 +166,9 @@ module Indus
         next unless i.op == :isa
         v, cname = i.args; t = of(f, v)
         want = { Integer: :int, Float: :float, String: :str, Array: :arr, Hash: :hash }[cname]
-        if poly?(t) && @classes[cname]
+        if t == :dyn
+          i.op = :isa_dyn; i.args = [v, cname] # tag test, or class id for user classes
+        elsif poly?(t) && @classes[cname]
           i.op = :isa_tag; i.args = [v, @classes[cname].id] # compare the class id in word 0
         else
           yes = want ? (want == :arr || want == :hash ? (t.is_a?(Array) && t[0] == want) : t == want || (want == :int && t == :int?)) : (t == cname || (t.is_a?(Symbol) && @classes[t] && ancestor?(@classes[t], cname)))
@@ -177,6 +219,32 @@ module Indus
       i.args = [c]
       i.op = :print_v if i.op == :print_v
       i.op = :puts_v if i.op == :p_v # p of a float is unquoted
+    end
+
+    # an operator on a tagged scalar: the prelude dispatches on the tags.
+    # cmp.eq/ne give a bool; the ordering compares and arithmetic give a :dyn
+    # (Integer + Integer may be Float + ..., String + String is a String).
+    DYN_OPS = { add: :__dyn_add, sub: :__dyn_sub, mul: :__dyn_mul, div: :__dyn_div,
+                eq: :__dyn_eq, ne: :__dyn_ne, lt: :__dyn_lt, le: :__dyn_le, gt: :__dyn_gt, ge: :__dyn_ge }.freeze
+    def self.dyn_op(f, i)
+      name = i.op == :cmp ? DYN_OPS.fetch(i.cond) : DYN_OPS.fetch(i.op)
+      fn = @lower.funcs[name] or raise "#{name} needs the core prelude"
+      fn.ptypes[0] = fn.ptypes[1] = :dyn
+      i.op = :call; i.args = [fn, *i.args]; i.cond = nil
+      i.ty = fn.rtype
+    end
+
+    # puts/p/inspect of a tagged scalar: the prelude dispatches on the tag
+    def self.dyn_print(f, i)
+      name = i.op == :inspect_v || i.op == :p_v ? :__dyn_inspect : :__dyn_to_s
+      fn = @lower.funcs[name] or raise "#{name} needs the core prelude"
+      if i.op == :inspect_v # the value itself becomes the call
+        i.op = :call; i.args = [fn, i.args[0]]; i.ty = :str
+      else
+        c = Inst.new(:call, [fn, i.args[0]]); c.block = i.block; c.ty = :str
+        i.block.insts.insert(i.block.insts.index(i), c)
+        i.args = [c]; i.op = i.op == :print_v ? :print_str : :puts_str
+      end
     end
 
     # inspect of one value, by type: int -> to_s, float -> __float_to_s, str -> __quote
@@ -319,7 +387,10 @@ module Indus
       when :add, :sub, :mul, :div then join(narrow(of(f, a[0])), narrow(of(f, a[1])))
       when :and, :or then (of(f, a[0]) == :bool && of(f, a[1]) == :bool) ? :bool : :int
       when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub then :int
-      when :cmp, :ucmp, :isa then :bool
+      when :cmp, :ucmp, :isa, :isa_dyn then :bool
+      when :box then :dyn
+      when :unbox then a[1]
+      when :dyn_tag then :int
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
       when :dsend then nil
@@ -352,12 +423,47 @@ module Indus
       [klass, *@classes.values.select { |c| c.superclass == klass }].map { @ivars[_1.name][ix] }.reduce(nil) { join(_1, _2) }
     end
 
-    # insert itof where an int flows into a float position
+    # insert itof where an int flows into a float position, and box where a
+    # typed value flows into a :dyn position
     def self.convert(f)
       cvt = ->(blk, before, v) {
         c = Inst.new(:itof, [v]); c.ty = :float; c.block = blk
         blk.insts.insert(blk.insts.index(before), c); c
       }
+      box = ->(blk, before, v) {
+        t = of(f, v)
+        next v if t == :dyn || t.nil?
+        c = Inst.new(:box, [v, t]); c.ty = :dyn; c.block = blk
+        blk.insts.insert(blk.insts.index(before), c); c
+      }
+      f.blocks.each do |b|
+        b.insts.dup.each do |i|
+          case i.op
+          when :aset
+            a, _, v = i.args
+            i.args[2] = box.(b, i, v) if arr(of(f, a)) && of(f, a)[1] == :dyn && of(f, v) != :dyn
+          when :hset
+            h, k, v = i.args
+            t = of(f, h)
+            if hsh(t)
+              i.args[1] = box.(b, i, k) if t[1] == :dyn && of(f, k) != :dyn
+              i.args[2] = box.(b, i, v) if t[2] == :dyn && of(f, v) != :dyn
+            end
+          when :fld_set
+            o, ix, v = i.args
+            i.args[2] = box.(b, i, v) if ivar_type(of(f, o), ix) == :dyn && of(f, v) != :dyn
+          when :gset then i.args[1] = box.(b, i, i.args[1]) if @consts[i.args[0]] == :dyn && of(f, i.args[1]) != :dyn
+          when :call
+            callee = i.args[0]
+            i.args[1..].each_with_index { |v, k| i.args[k + 1] = box.(b, i, v) if callee.ptypes[k] == :dyn && of(f, v) != :dyn }
+          when :ret then i.args[0] = box.(b, i, i.args[0]) if f.rtype == :dyn && of(f, i.args[0]) != :dyn
+          end
+        end
+        b.phis.each do |p|
+          next unless p.ty == :dyn
+          p.args.map! { |(pred, v)| of(f, v) != :dyn ? [pred, box.(pred, pred.term, v)] : [pred, v] }
+        end
+      end
       f.blocks.each do |b|
         b.insts.dup.each do |i|
           case i.op

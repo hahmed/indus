@@ -219,6 +219,43 @@ def __gc_forward(slot, tid, from, from_end, free, wtop, bitmap, types)
     __st(g + 80, wtop)
     return 0
   end
+  desc0 = __gc_desc(types, tid)
+  if __ld32(desc0) == 5
+    # a tagged scalar: nil/fixnum/bool/symbol hold no pointer; otherwise strip
+    # the tag, forward the bare handle through its real descriptor, re-tag.
+    tag = p & 15
+    if (tag & 1) == 1 || tag == 10 || tag == 12
+      __st(g + 72, free)
+      __st(g + 80, wtop)
+      return 0
+    end
+    ctid = -1
+    if tag == 2
+      ctid = __ld32(desc0 + 4)
+    elsif tag == 4
+      ctid = __ld32(desc0 + 8)
+    elsif tag == 6
+      ctid = __ld32(desc0 + 12)
+    elsif tag == 14
+      ctid = __ld32(desc0 + 16)
+    else
+      cid = __ld(p - 8)
+      np = __ld32(desc0 + 20)
+      n = 0
+      while n < np
+        if __ld32(desc0 + 24 + n * 8) == cid
+          ctid = __ld32(desc0 + 28 + n * 8)
+          n = np
+        end
+        n = n + 1
+      end
+    end
+    __trap if ctid < 0
+    __st(slot, p - tag)
+    __gc_forward(slot, ctid, from, from_end, free, wtop, bitmap, types)
+    __st(slot, __ld(slot) + tag)
+    return 0
+  end
   if p < from || p >= from_end
     __st(g + 72, free)
     __st(g + 80, wtop)
