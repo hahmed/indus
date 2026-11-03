@@ -716,3 +716,71 @@ rt_mmap:
         blr     x16
         ldp     x29, x30, [sp], #16
         ret
+
+// rt_str_cmp(x0 a, x1 b) -> -1 / 0 / 1 (bytewise, then by length; Ruby's <=>)
+rt_str_cmp:
+        ldur    x2, [x0, #-8]
+        ldur    x3, [x1, #-8]
+        cmp     x2, x3
+        csel    x4, x2, x3, lo                  // n = min(len)
+0:      cbz     x4, 1f
+        ldrb    w5, [x0], #1
+        ldrb    w6, [x1], #1
+        cmp     w5, w6
+        b.lo    8f
+        b.hi    9f
+        sub     x4, x4, #1
+        b       0b
+1:      cmp     x2, x3
+        b.lo    8f
+        b.hi    9f
+        mov     x0, #0
+        ret
+8:      mov     x0, #-1
+        ret
+9:      mov     x0, #1
+        ret
+
+// rt_str_to_i(x0 s) -> integer. Ruby's String#to_i: skip leading whitespace,
+// optional sign, digits (underscores allowed between digits), stop at anything else; 0 if none.
+rt_str_to_i:
+        ldur    x2, [x0, #-8]           // len
+        mov     x3, #0                  // result
+        mov     x4, #0                  // negative?
+0:      cbz     x2, 9f                  // skip whitespace
+        ldrb    w5, [x0]
+        cmp     w5, #32
+        b.eq    1f
+        cmp     w5, #9
+        b.lo    2f
+        cmp     w5, #13
+        b.hi    2f
+1:      add     x0, x0, #1
+        sub     x2, x2, #1
+        b       0b
+2:      cmp     w5, #45                 // '-'
+        b.ne    3f
+        mov     x4, #1
+        add     x0, x0, #1
+        sub     x2, x2, #1
+        b       4f
+3:      cmp     w5, #43                 // '+'
+        b.ne    4f
+        add     x0, x0, #1
+        sub     x2, x2, #1
+4:      cbz     x2, 8f
+        ldrb    w5, [x0]
+        cmp     w5, #95                 // '_' between digits
+        b.eq    5f
+        sub     w5, w5, #48
+        cmp     w5, #9
+        b.hi    8f
+        mov     x6, #10
+        madd    x3, x3, x6, x5
+5:      add     x0, x0, #1
+        sub     x2, x2, #1
+        b       4b
+8:      cbz     x4, 9f
+        neg     x3, x3
+9:      mov     x0, x3
+        ret

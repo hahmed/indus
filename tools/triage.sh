@@ -3,6 +3,8 @@
 # refusals ranked by how many programs they block. Drives library/syntax work.
 #   tools/triage.sh file.rb ...
 cd "$(dirname "$0")/.."
+# never leave a compiled program running behind us: generated code ignores SIGTERM
+trap 'pkill -9 -P $$ 2>/dev/null' EXIT INT TERM
 for f in "$@"; do
   msg=$(timeout -k 2 60 bin/indus "$f" --check 2>&1 >/dev/null | head -1 | sed 's/^indus: //; s/ (RuntimeError)$//; s/ (NoMethodError)$//')
   [ -z "$msg" ] && msg="OK"

@@ -131,10 +131,17 @@ module Indus
         when :add then i.op = :scat if of(f, i.args[0]) == :str
         when :cmp
           l, r = i.args
-          (i.op = :seq; i.cond = nil) if of(f, l) == :str && of(f, r) == :str && i.cond == :eq # nil stays a pointer compare
+          if of(f, l) == :str && of(f, r) == :str # nil stays a pointer compare
+            case i.cond
+            when :eq then i.op = :seq; i.cond = nil
+            when :ne then i.op = :sne; i.cond = nil
+            else i.op = :scmp # ordering: rt_str_cmp then compare the sign with cond
+            end
+          end
           if of(f, l) == :int? && of(f, r) == :nil then r.args[0] = INT_NIL; r.ty = :int
           elsif of(f, r) == :int? && of(f, l) == :nil then l.args[0] = INT_NIL; l.ty = :int end
         when :to_s then i.op = of(f, i.args[0]) == :str ? :nop : :itos
+        when :to_i then i.op = :stoi if of(f, i.args[0]) == :str
         when :puts_v then i.op = { str: :puts_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil }.fetch(of(f, i.args[0]), :puts_i)
         when :lshift_or_append then i.op = of(f, i.args[0]) == :int ? :shl : :sappend
         end
@@ -246,7 +253,7 @@ module Indus
       when :const then %i[nil sym bool lambda].include?(i.ty) ? i.ty : :int
       when :fconst then :float
       when :sconst, :scat, :sappend, :itos then :str
-      when :seq then :bool
+      when :seq, :sne, :scmp then :bool
       when :puts_i, :puts_str, :puts_bool, :puts_opt, :puts_nil then :int
       when :idx, :idx_set, :dsend, :mcall then nil
       when :lshift_or_append then (t = of(f, a[0])) && (t == :int ? :int : t)

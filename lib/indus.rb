@@ -53,6 +53,7 @@ module Indus
     asm.emit_start_linux if standalone == :linux
     funcs.each { Codegen.new(asm, lower.classes).func(_1) }
     asm.emit_runtime_blob
+    asm.emit_overflow_trap
     asm.emit_gc_tables if GC.enabled?
     asm.emit_syscalls(standalone || :darwin) # write/mmap entry points exist in-process too
     raise "this program has a seam (class_eval); a standalone binary needs the resident compiler" if standalone && !asm.seams.empty?
@@ -93,6 +94,7 @@ module Indus
     f.name = :"#{old.name}@#{unit.seams.size}" # fresh label
     asm.label(:__text_base)
     Codegen.new(asm, unit.lower.classes).func(f)
+    asm.emit_overflow_trap            # checked arithmetic branches here (b.vs is pc-relative: per unit)
     asm.emit_gc_tables if GC.enabled? # this unit's frame maps, with the (grown) type table
     code = asm.resolve!
     [code, asm.labels.fetch(f.name) * 4, f, GC.enabled? ? asm.labels.fetch(:__gc_tables) * 4 : nil]

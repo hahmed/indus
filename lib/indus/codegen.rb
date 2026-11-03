@@ -126,9 +126,9 @@ module Indus
             @asm.send({ add: :fadd, sub: :fsub, mul: :fmul, div: :fdiv }[i.op], d, freg(l), freg(r, FTMP2))
           elsif i.op == :div && r.op == :const && r.args[0] >= 2 then @asm.divmod_const(d, reg(l), r.args[0], :div)
           elsif i.op == :div then @asm.sdiv_floor(d, reg(l), reg(r, 9))
-          elsif i.op == :mul then @asm.mul(d, reg(l), reg(r, 9))
-          elsif imm?(r) then @asm.send(i.op == :add ? :addi : :subi, d, reg(l), r.args[0])
-          else @asm.send(i.op, d, reg(l), reg(r, 9)) end
+          elsif i.op == :mul then Asm::CHECKED ? @asm.muls(d, reg(l), reg(r, 9)) : @asm.mul(d, reg(l), reg(r, 9))
+          elsif imm?(r) then @asm.send(Asm::CHECKED ? (i.op == :add ? :addsi : :subsi) : (i.op == :add ? :addi : :subi), d, reg(l), r.args[0])
+          else @asm.send(Asm::CHECKED ? (i.op == :add ? :adds : :subs) : i.op, d, reg(l), reg(r, 9)) end
         when :itof then @asm.scvtf(d, reg(i.args[0]))
         when :fsqrt then @asm.fsqrt(d, freg(i.args[0]))
         when :libm, :fpow # in-process: call libm by absolute address (d0[, d1] -> d0)
@@ -241,7 +241,10 @@ module Indus
           @asm.gc_globals << [off, @asm.gc_table.tid(v.ty)] if GC.enabled? && GC.pointer?(v.ty) && @asm.gc_globals.none? { _1[0] == off }
           v.float? ? @asm.fstr_off(freg(v), Asm::GBASE, off) : @asm.str_off(reg(v, 9), Asm::GBASE, off)
         when :to_f then @asm.scvtf(d, reg(i.args[0]))
-        when :to_i then i.args[0].float? ? @asm.fcvtzs(d, freg(i.args[0])) : @asm.mov(d, reg(i.args[0]))
+        when :to_i
+          raise "to_i on #{i.args[0].ty.inspect}" unless i.args[0].float? || %i[int int?].include?(i.args[0].ty) || i.args[0].ty.nil?
+          i.args[0].float? ? @asm.fcvtzs(d, freg(i.args[0])) : @asm.mov(d, reg(i.args[0]))
+        when :stoi then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_str_to_i); @asm.mov(d, 0)
         when :putc
           @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:__putc)
         when :and then @asm.and_(d, reg(i.args[0]), reg(i.args[1], 9))
@@ -309,6 +312,10 @@ module Indus
         when :scat then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_cat); @asm.mov(d, 0)
         when :sappend then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_append); @asm.mov(d, 0)
         when :seq then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_eq); @asm.mov(d, 0)
+        when :sne then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_eq); @asm.emit(0xD2400000 | d) # eor d, x0, #1
+        when :scmp # a <=> b, then the sign against the original condition
+          @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_cmp)
+          @asm.cmpi(0, 0); @asm.cset(d, i.cond)
         when :itos then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_itos); @asm.mov(d, 0)
         when :puts_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_puts_str)
         when :hnew then @asm.mov_imm(0, 8); @asm.bl(:rt_hash_new); @asm.mov(d, 0)

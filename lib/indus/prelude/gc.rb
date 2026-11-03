@@ -223,9 +223,9 @@ def __gc_forward(slot, tid, from, from_end, free, wtop, bitmap, types)
     __st(g + 72, free)
     __st(g + 80, wtop)
     if p >= __ld(g + 32) && p < __ld(g + 40)
-      # a pointer into to-space can only be stale: a dead slot still holding
-      # an address from two collections ago. Clear it, never follow it.
-      __st(slot, 0)
+      # a pointer into to-space is either already updated this collection (an
+      # in-place object reached twice: a stack object held by two frames) or a
+      # stale address in a dead slot. In both cases: leave it, never follow it.
       return 0
     end
     # outside both spaces: a stack object or a large object. Scan in place.

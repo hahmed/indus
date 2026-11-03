@@ -80,6 +80,23 @@ module Indus
     def add(rd, rn, rm) = emit(0x8B000000 | (rm << 16) | (rn << 5) | rd)
     def sub(rd, rn, rm) = emit(0xCB000000 | (rm << 16) | (rn << 5) | rd)
     def mul(rd, rn, rm) = emit(0x9B007C00 | (rm << 16) | (rn << 5) | rd)
+    # checked integer arithmetic: Ruby integers never wrap (they become Bignums,
+    # which Indus does not have), so an overflow traps instead of returning a
+    # wrong number. INDUS_INT_WRAP=1 restores silent wrapping for measurement.
+    CHECKED = !ENV["INDUS_INT_WRAP"]
+    def adds(rd, rn, rm) = (emit(0xAB000000 | (rm << 16) | (rn << 5) | rd); bvs_trap)
+    def subs(rd, rn, rm) = (emit(0xEB000000 | (rm << 16) | (rn << 5) | rd); bvs_trap)
+    def addsi(rd, rn, i) = (emit(0xB1000000 | (i << 10) | (rn << 5) | rd); bvs_trap)
+    def subsi(rd, rn, i) = (emit(0xF1000000 | (i << 10) | (rn << 5) | rd); bvs_trap)
+    def muls(rd, rn, rm) # smulh must equal the sign extension of the low word
+      emit(0x9B407C00 | (rm << 16) | (rn << 5) | 16)             # smulh x16, rn, rm
+      mul(rd, rn, rm)
+      emit(0xEB80FE1F | (rd << 16))                              # cmp x16, rd, asr #63
+      bne_trap
+    end
+    def bvs_trap = (fix(:__overflow, :b19); emit(0x54000006))   # b.vs __overflow
+    def bne_trap = (fix(:__overflow, :b19); emit(0x54000001))   # b.ne __overflow
+    def emit_overflow_trap = (label(:__overflow); emit(0xD4200000)) # brk #0: integer overflow
     def and_(rd, rn, rm) = emit(0x8A000000 | (rm << 16) | (rn << 5) | rd)
     def orr(rd, rn, rm) = emit(0xAA000000 | (rm << 16) | (rn << 5) | rd)
     def eor(rd, rn, rm) = emit(0xCA000000 | (rm << 16) | (rn << 5) | rd)
