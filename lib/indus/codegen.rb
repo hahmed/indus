@@ -26,6 +26,7 @@ module Indus
     def func(f)
       @f = f
       layout(f)
+      f.count_uses!
       f.params.each_with_index { |p, k| p.ty = f.ptypes[k] || :int }
       ra = RegAlloc.new(f).run
       used, fused, nslots = ra.used.dup, ra.fused.dup, ra.nslots
@@ -80,7 +81,7 @@ module Indus
 
     def fused?(c)
       nxt = c.block.insts[c.block.insts.index(c) + 1]
-      nxt&.op == :condbr && nxt.args[0] == c
+      nxt&.op == :condbr && nxt.args[0] == c && c.uses == 1 # a compare used elsewhere must be materialized
     end
 
     def imm?(v) = v.op == :const && (0..4095).cover?(v.args[0])

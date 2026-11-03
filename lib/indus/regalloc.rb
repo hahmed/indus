@@ -172,7 +172,7 @@ module Indus
 
     def fused?(c)
       nxt = c.block.insts[c.block.insts.index(c) + 1]
-      nxt&.op == :condbr && nxt.args[0] == c
+      nxt&.op == :condbr && nxt.args[0] == c && c.uses == 1 # a compare used elsewhere must be materialized
     end
   end
 end

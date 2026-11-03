@@ -57,6 +57,7 @@ module Indus
           f.all.each do |i|
             bind(f, i) if i.op == :mcall
             dsend(f, i) if i.op == :dsend
+            float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
             index(f, i) if i.op == :idx || i.op == :idx_set
             t = infer(f, i)
             set.(i.ty, t) { i.ty = _1 }
@@ -142,12 +143,27 @@ module Indus
           elsif of(f, r) == :int? && of(f, l) == :nil then l.args[0] = INT_NIL; l.ty = :int end
         when :to_s then i.op = of(f, i.args[0]) == :str ? :nop : :itos
         when :to_i then i.op = :stoi if of(f, i.args[0]) == :str
-        when :puts_v then i.op = { str: :puts_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil }.fetch(of(f, i.args[0]), :puts_i)
-        when :p_v then i.op = { str: :p_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil_word }.fetch(of(f, i.args[0]), :puts_i)
-        when :print_v then i.op = { str: :print_str }.fetch(of(f, i.args[0]), :print_i)
+        when :puts_v, :p_v, :print_v
+          t = of(f, i.args[0])
+          i.op = case i.op
+                 when :puts_v then { str: :puts_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil }.fetch(t, :puts_i)
+                 when :p_v then { str: :p_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil_word }.fetch(t, :puts_i)
+                 else { str: :print_str }.fetch(t, :print_i)
+                 end
         when :lshift_or_append then i.op = of(f, i.args[0]) == :int ? :shl : :sappend
         end
       end
+    end
+
+    # puts/p/print of a Float: format with the prelude's __float_to_s (a call,
+    # typed by this same fixpoint), then print the string
+    def self.float_print(f, i)
+      fts = @lower.funcs[:__float_to_s] or raise "Float#to_s needs the core prelude"
+      c = Inst.new(:call, [fts, i.args[0]]); c.block = i.block
+      i.block.insts.insert(i.block.insts.index(i), c)
+      i.args = [c]
+      i.op = :print_v if i.op == :print_v
+      i.op = :puts_v if i.op == :p_v # p of a float is unquoted
     end
 
     # :mcall name, recv, args -> :call Func / :fld_get / :fld_set

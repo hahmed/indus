@@ -1,7 +1,7 @@
 # SSA IR: values, blocks, functions.
 module Indus
   class Inst
-    attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home
+    attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home, :uses
     attr_reader :id
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
@@ -57,6 +57,13 @@ module Indus
       all.each do |i|
         i.op == :phi ? i.args.map! { |(bb, v)| [bb, v == from ? to : v] } : i.args.map! { |a| a == from ? to : a }
       end
+    end
+
+    # use counts, for decisions like fusing a compare into its branch
+    def count_uses!
+      all.each { _1.uses = 0 }
+      params.each { _1.uses = 0 }
+      all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { _1.uses += 1 if _1.is_a?(Inst) && _1.uses } }
     end
 
     def dump

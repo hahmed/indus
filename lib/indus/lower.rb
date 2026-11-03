@@ -7,7 +7,7 @@ module Indus
     CMP = { :== => :eq, :!= => :ne, :< => :lt, :<= => :le, :> => :gt, :>= => :ge }
     ARITH = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :% => :mod, :& => :and, :| => :or, :^ => :xor, :<< => :shl, :>> => :shr }
 
-    attr_reader :classes, :syms
+    attr_reader :classes, :syms, :funcs
     # symbols are small integers, interned at compile time
     def sym_id(name) = (@syms ||= {})[name.to_sym] ||= @syms.size + 1
 
