@@ -30,7 +30,8 @@ module Indus
       @defs_by_func = {}
       defs.each do |d|
         next if yields?(d)
-        f = @funcs[d.name] = Func.new(d.name, (d.parameters&.requireds&.size || 0) + (d.parameters&.optionals&.size || 0))
+        ps = d.parameters
+        f = @funcs[d.name] = Func.new(d.name, (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0))
         @defs_by_func[f] = d
       end
       methods = [] # [klass, def, func]
@@ -54,7 +55,7 @@ module Indus
       @pre = Pretype.new(@ast, @classes) # receiver kinds for the structural decisions below
       main = Func.new(:main, 0)
       lower_body(main, [], top)
-      defs.each { |d| lower_body(@funcs[d.name], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []), d.body&.body || []) if @funcs[d.name] }
+      defs.each { |d| lower_body(@funcs[d.name], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || []) if @funcs[d.name] }
       methods.each do |k, d, f, names, body, ct|
         if d
           names = [:self, *(d.parameters&.requireds&.map(&:name) || [])]
@@ -220,6 +221,16 @@ module Indus
         else cond_assign(cur, false, -> { expr(n.value) }, ->(v) { @locals[lname(n.name)] = v }) end
       when Prism::LocalVariableAndWriteNode # x &&= v
         cond_assign(@locals.fetch(lname(n.name)), true, -> { expr(n.value) }, ->(v) { @locals[lname(n.name)] = v })
+      when Prism::IndexOperatorWriteNode # a[i] += v
+        recv = expr(n.receiver); k = expr(n.arguments.arguments[0])
+        cur = emit(:idx, [recv, k]); rhs = expr(n.value)
+        v = emit(ARITH.fetch(n.binary_operator), [cur, rhs])
+        r = emit(:idx_set, [recv, k, v])
+        case n.receiver
+        when Prism::LocalVariableReadNode then @locals[lname(n.receiver.name)] = r
+        when Prism::InstanceVariableReadNode then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
+        end
+        v
       when Prism::IndexOrWriteNode # h[k] ||= v
         recv = expr(n.receiver); k = expr(n.arguments.arguments[0])
         cur = emit(:idx, [recv, k])
@@ -401,11 +412,34 @@ module Indus
         if a.is_a?(Prism::StringNode) then emit(:puts_s, [a.unescaped])
         else emit(:puts_v, [expr(a)]) end # Types picks puts_i / puts_str
       elsif n.name == :p && n.receiver.nil? && args.size == 1
-        emit(:p_v, [expr(args[0])])       # inspect form: strings quoted, nil as "nil"
+        if kind_of(args[0]) == :array # Array#inspect: "[" + elements.inspect.join(", ") + "]"
+          arr = expr(args[0])
+          outv = :"insp#{@f.blocks.size}:out"
+          @locals[outv] = emit(:sconst, ["["])
+          len = emit(:alen, [arr])
+          counted_loop(const(0), len, :lt, [], []) do |i, _ps, _pfx|
+            # out = out + (i > 0 ? ", " : "") + inspect(arr[i])
+            sep = emit(:sconst, [", "]); none = emit(:sconst, [""])
+            tb, eb, mb = @f.new_block(:ithen), @f.new_block(:ielse), @f.new_block(:imerge)
+            emit(:condbr, [emit(:cmp, [i, const(0)], :gt), tb, eb])
+            @cur = tb; emit(:br, [mb])
+            @cur = eb; emit(:br, [mb])
+            @cur = mb
+            ph = mb.phi; ph.args = [[tb, sep], [eb, none]]
+            el = emit(:aget, [arr, i])
+            @locals[outv] = emit(:scat, [emit(:scat, [@locals[outv], ph]), emit(:inspect_v, [el])])
+          end
+          out = emit(:scat, [@locals.delete(outv), emit(:sconst, ["]"])])
+          emit(:puts_str, [out])
+        else
+          emit(:p_v, [expr(args[0])])       # inspect form: strings quoted, nil as "nil"
+        end
       elsif n.name == :print && n.receiver.nil? && args.size == 1
         emit(:print_v, [expr(args[0])])   # no newline
       elsif n.name == :Integer && n.receiver.nil? && args.size == 1
         emit(:to_i, [expr(args[0])])      # Integer(x): the parse, no exception on junk (yet)
+      elsif n.name == :is_a? && args.size == 1 && n.receiver && args[0].is_a?(Prism::ConstantReadNode)
+        emit(:isa, [expr(n.receiver), args[0].name])
       elsif n.name == :nil? && args.empty? && n.receiver
         v = expr(n.receiver); emit(:cmp, [v, (c = const(0); c.ty = :nil; c)], :eq)
       elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
@@ -469,18 +503,19 @@ module Indus
         emit(:call, [@klass.find_method(n.name), me, *args.map { expr(_1) }])
       else
         f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
+        kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
         vals = args.map { expr(_1) }
-        vals = fill_defaults(f, vals) if vals.size < f.params.size
+        vals = fill_defaults(f, vals, kw) if vals.size < f.params.size || kw
         emit(:call, [f, *vals])
       end
     end
 
     # optional parameters: missing arguments take their default expressions,
     # evaluated at the call site with earlier parameters bound
-    def fill_defaults(f, vals)
+    def fill_defaults(f, vals, kw = nil)
       d = @defs_by_func[f] or raise "#{f.name}: wrong number of arguments"
       ps = d.parameters
-      names = ps.requireds.map(&:name) + ps.optionals.map(&:name)
+      names = ps.requireds.map(&:name) + ps.optionals.map(&:name) + ps.keywords.map(&:name)
       pfx = :"dflt#{@f.blocks.size}:"
       names.each_with_index { |nm, k| @locals[:"#{pfx}#{nm}"] = vals[k] if vals[k] }
       @blk_pfx = (@blk_pfx || []) << pfx
@@ -488,6 +523,13 @@ module Indus
         idx = ps.requireds.size + k
         next if vals[idx]
         vals[idx] = expr(o.value); @locals[:"#{pfx}#{o.name}"] = vals[idx]
+      end
+      given = {}
+      kw&.elements&.each { |el| given[el.key.unescaped.to_sym] = el.value }
+      ps.keywords.each_with_index do |kp, k|
+        idx = ps.requireds.size + ps.optionals.size + k
+        node = given.fetch(kp.name) { kp.respond_to?(:value) && kp.value or raise "missing keyword #{kp.name} for #{f.name}" }
+        vals[idx] = expr(node); @locals[:"#{pfx}#{kp.name}"] = vals[idx]
       end
       @blk_pfx.pop
       @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
@@ -554,8 +596,20 @@ module Indus
       when :each, :map, :each_with_index
         r = recv.is_a?(Prism::ParenthesesNode) ? recv.body.body.last : recv
         if r.is_a?(Prism::RangeNode)
-          raise "map over a range" if n.name == :map
-          return counted_loop(expr(r.left), expr(r.right), r.exclude_end? ? :lt : :le, params, body)
+          lo = expr(r.left); hi = expr(r.right)
+          if n.name == :map # a fresh array, filled by the body's value
+            len = emit(:add, [emit(:sub, [hi, lo]), const(r.exclude_end? ? 0 : 1)])
+            fill = const(0); fill.ty = :nil
+            arr = emit(:anew, [len, fill])
+            outv = :"rmap#{@f.blocks.size}:out"
+            @locals[outv] = arr
+            counted_loop(lo, hi, r.exclude_end? ? :lt : :le, params, body) do |i, ps, pfx|
+              @locals[:"#{pfx}#{ps[0]}"] = i if ps[0]
+              @map_target = [outv, emit(:sub, [i, lo])]
+            end
+            return @locals.delete(outv)
+          end
+          return counted_loop(lo, hi, r.exclude_end? ? :lt : :le, params, body)
         end
         k = recv ? kind_of(recv) : (@klass&.name) # receiverless: self
         y = @yielders[n.name]

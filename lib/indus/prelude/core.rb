@@ -104,3 +104,7 @@ def __float_to_s(f)
   end
   neg ? "-" + out : out
 end
+
+def __quote(s)
+  "\"" + s + "\""
+end

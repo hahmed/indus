@@ -58,6 +58,7 @@ module Indus
             bind(f, i) if i.op == :mcall
             dsend(f, i) if i.op == :dsend
             float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
+            inspect_v(f, i) if i.op == :inspect_v && of(f, i.args[0])
             index(f, i) if i.op == :idx || i.op == :idx_set
             t = infer(f, i)
             set.(i.ty, t) { i.ty = _1 }
@@ -120,6 +121,18 @@ module Indus
 
     # generic ops whose operands turned out to be strings
     def self.strings(f)
+      f.all.each { |i| (i.op = :sconst; i.args = [""]) if i.op == :inspect_v } # unreached: empty array, no element type
+      f.all.each do |i| # is_a?: decided here; a poly receiver needs its tag at run time
+        next unless i.op == :isa
+        v, cname = i.args; t = of(f, v)
+        want = { Integer: :int, Float: :float, String: :str, Array: :arr, Hash: :hash }[cname]
+        if poly?(t) && @classes[cname]
+          i.op = :isa_tag; i.args = [v, @classes[cname].id] # compare the class id in word 0
+        else
+          yes = want ? (want == :arr || want == :hash ? (t.is_a?(Array) && t[0] == want) : t == want || (want == :int && t == :int?)) : (t == cname || (t.is_a?(Symbol) && @classes[t] && ancestor?(@classes[t], cname)))
+          i.op = :const; i.args = [yes ? 1 : 0]; i.ty = :bool
+        end
+      end
       f.blocks.each do |b| # truthiness of a nullable int: not the sentinel
         t = b.term
         next unless t&.op == :condbr && of(f, t.args[0]) == :int?
@@ -164,6 +177,18 @@ module Indus
       i.args = [c]
       i.op = :print_v if i.op == :print_v
       i.op = :puts_v if i.op == :p_v # p of a float is unquoted
+    end
+
+    # inspect of one value, by type: int -> to_s, float -> __float_to_s, str -> __quote
+    def self.inspect_v(f, i)
+      t = of(f, i.args[0])
+      case t
+      when :str then i.op = :call; i.args = [@lower.funcs.fetch(:__quote), i.args[0]]
+      when :float then i.op = :call; i.args = [@lower.funcs.fetch(:__float_to_s), i.args[0]]
+      when :int, :int? then i.op = :itos
+      when :bool then i.op = :bool_to_s
+      else raise "inspect of #{t.inspect} not supported"
+      end
     end
 
     # :mcall name, recv, args -> :call Func / :fld_get / :fld_set
@@ -238,6 +263,15 @@ module Indus
       else raise "[] on #{t.inspect}" end
     end
 
+    def self.ancestor?(klass, cname)
+      k = klass
+      while k
+        return true if k.name == cname
+        k = k.superclass
+      end
+      false
+    end
+
     def self.resolve(klass, name, nargs, allow_missing: false)
       if (iv = klass.find_reader(name)) && nargs == 0 then [:fld_get, klass.ivar(iv)]
       elsif (iv = klass.find_writer(name)) && nargs == 1 then [:fld_set, klass.ivar(iv)]
@@ -270,10 +304,11 @@ module Indus
       case i.op
       when :const then %i[nil sym bool lambda].include?(i.ty) ? i.ty : :int
       when :fconst then :float
-      when :sconst, :scat, :sappend, :itos then :str
+      when :sconst, :scat, :sappend, :itos, :bool_to_s then :str
       when :seq, :sne, :scmp then :bool
       when :puts_i, :puts_str, :puts_bool, :puts_opt, :puts_nil, :print_i, :print_str, :p_str then :int
       when :p_v, :print_v then of(f, a[0]) && :int
+      when :inspect_v then of(f, a[0]) && :str
       when :idx, :idx_set, :dsend, :mcall then nil
       when :lshift_or_append then (t = of(f, a[0])) && (t == :int ? :int : t)
       when :to_s then (t = of(f, a[0])) && (t == :str ? :str : narrow(t) == :int ? :str : nil)
@@ -281,7 +316,7 @@ module Indus
       when :add, :sub, :mul, :div then join(narrow(of(f, a[0])), narrow(of(f, a[1])))
       when :and, :or then (of(f, a[0]) == :bool && of(f, a[1]) == :bool) ? :bool : :int
       when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub then :int
-      when :cmp, :ucmp then :bool
+      when :cmp, :ucmp, :isa then :bool
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
       when :dsend then nil

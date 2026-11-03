@@ -164,6 +164,7 @@ module Indus
         when :rawst then @asm.str_off(reg(i.args[1], 9), reg(i.args[0]), 0)
         when :gbase then @asm.mov(d, Asm::GBASE)
         when :trap then @asm.emit(0xD4200000) # brk #0: heap exhausted
+        when :isa_tag then @asm.ldr_off(16, reg(i.args[0]), 0); @asm.cmpi(16, i.args[1]); @asm.cset(d, :eq)
         when :ucmp then @asm.cmp(reg(i.args[0]), reg(i.args[1], 9)); @asm.cset(d, i.cond)
         when :fbits then @asm.emit(0x9E660000 | (freg(i.args[0]) << 5) | d)                       # fmov d, dn
         when :lsr then @asm.emit(0x9AC02400 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d) # lsrv
@@ -326,6 +327,11 @@ module Indus
           @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_cmp)
           @asm.cmpi(0, 0); @asm.cset(d, i.cond)
         when :itos then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_itos); @asm.mov(d, 0)
+        when :bool_to_s # "true" / "false" as fresh strings
+          @asm.str_data(:__true, "true"); @asm.str_data(:__false, "false")
+          f_ = @asm.uniq; dn = @asm.uniq
+          @asm.cbz(reg(i.args[0]), f_); @asm.adr(0, :__true); @asm.mov_imm(1, 4); @asm.b(dn); @asm.label(f_); @asm.adr(0, :__false); @asm.mov_imm(1, 5); @asm.label(dn)
+          @asm.bl(:rt_str_new); @asm.mov(d, 0)
         when :puts_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_puts_str)
         when :hnew then @asm.mov_imm(0, 8); @asm.bl(:rt_hash_new); @asm.mov(d, 0)
         when :hget, :hkey, :hset
