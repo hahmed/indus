@@ -21,8 +21,12 @@ module Indus
       mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
       defs = body.grep(Prism::DefNode)
       cdefs = body.grep(Prism::ClassNode) + mod_classes
-      top = (body - defs - cdefs - mods) 
-      top = mod_consts + top
+      # constants written inside class bodies run before everything else
+      class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode) }
+      # Name = Struct.new(:a, :b) defines a class with accessors and an initialize
+      structs = body.select { |st| st.is_a?(Prism::ConstantWriteNode) && struct_new?(st.value) }
+      top = (body - defs - cdefs - mods - structs)
+      top = class_consts + mod_consts + top
       # methods that take a block (contain yield) are inlined at call sites with a literal block;
       # they still get compiled as functions for block-less callers
       @yielders = {} # name -> [klass or nil, def]
@@ -35,6 +39,16 @@ module Indus
         @defs_by_func[f] = d
       end
       methods = [] # [klass, def, func]
+      structs.each do |st|
+        k = @classes[st.name] = Klass.new(st.name)
+        k.id = @classes.size
+        fields = st.value.arguments.arguments.map { |a| a.unescaped.to_sym }
+        fields.each { |f| k.ivar(:"@#{f}"); k.readers[f] = :"@#{f}"; k.writers[:"#{f}="] = :"@#{f}" }
+        init = Func.new(:"#{k.name}#initialize", 1 + fields.size)
+        init.cls = k; k.methods[:initialize] = init
+        # body: @a = a; @b = b ...  built as AST-free lowering below
+        methods << [k, nil, init, [:self, *fields], fields.map { |f| [:struct_set, f] }, {}]
+      end
       cdefs.each do |c|
         sup = c.superclass && @classes.fetch(c.superclass.name) { raise "superclass #{c.superclass.name} must be defined first" }
         k = @classes[c.constant_path.name] = Klass.new(c.constant_path.name, sup)
@@ -48,6 +62,7 @@ module Indus
             f.cls = k; k.methods[st.name] = f; methods << [k, st, f]
           when Prism::CallNode
             class_body_call(k, st, {}, methods)
+          when Prism::ConstantWriteNode then nil # hoisted above
           else raise "unsupported in class body: #{st.class}"
           end
         end
@@ -142,8 +157,15 @@ module Indus
       end
     end
 
+    def struct_new?(v) = v.is_a?(Prism::CallNode) && v.name == :new && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Struct
+
     def lower_body(f, names, stmts, klass = nil, ct = {})
       @f, @locals, @cur, @klass, @ct = f, names.zip(f.params).to_h, f.entry, klass, ct
+      if stmts.first.is_a?(Array) && stmts.first[0] == :struct_set # a Struct's initialize
+        stmts.each { |(_, fld)| emit(:fld_set, [@locals[:self], klass.ivar(:"@#{fld}"), @locals.fetch(fld)]) }
+        emit(:ret, [@locals[:self]])
+        return
+      end
       last = nil
       stmts.each { last = expr(_1) }
       emit(:ret, [last || const(0)]) unless @cur.term
@@ -259,6 +281,9 @@ module Indus
         if n.name == :ARGV then (c = const(0); c.ty = :nil; c) # no arguments: every ARGV[k] is nil
         else emit(:gget, [n.name]) end
       when Prism::ConstantWriteNode
+        v = expr(n.value); emit(:gset, [n.name, v]); v
+      when Prism::GlobalVariableReadNode then emit(:gget, [n.name])
+      when Prism::GlobalVariableWriteNode
         v = expr(n.value); emit(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode
         if @ct&.key?(n.name) then (c = const(sym_id(@ct[n.name])); c.ty = :sym; c) # compile-time symbol
