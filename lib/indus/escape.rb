@@ -45,7 +45,7 @@ module Indus
       f.all.each do |i|
         case i.op
         when :fld_set then mark.(i.args[2])
-        when :box then mark.(i.args[0]) # a tagged value is tracked no further
+        when :box, :mkbuf then mark.(i.args[0]) # a tagged value / a cell's content is tracked no further
         when :aset then mark.(i.args[2])
         when :hset then mark.(i.args[1]); mark.(i.args[2])
         when :gset then mark.(i.args[1])
@@ -96,6 +96,7 @@ module Indus
         when :fld_set
           o, _, v = i.args
           into.(o) if heap?(ty(f, v))
+        when :bufappend then into.(i.args[0]) # the grown string is stored into the cell
         when :aset, :hset
           a, k, v = i.args
           into.(a) if heap?(ty(f, v)) || (i.op == :hset && heap?(ty(f, k)))
@@ -144,16 +145,22 @@ module Indus
       body
     end
 
+    OWN_ALLOC = %i[onew anew hnew sconst scat sappend itos ssub chr sdup mkbuf box aset hset bufappend].freeze
     def self.region_safe?(f, h, body)
-      fresh = {} # heap-typed values defined this iteration
+      fresh = {} # heap-typed values defined this iteration (may be fresh: used to detect leaks)
       body.each_key { |b| (b.phis + b.insts).each { |i| fresh[i] = true if heap?(i.ty) && !(b == h && i.op == :phi) } }
+      # surely allocated this iteration: a store into one of these cannot leak. A load (aget,
+      # fld_get, bufderef ...) or a call result may be a pre-existing object, so it is not here.
+      own = {}
+      body.each_key { |b| b.insts.each { |i| own[i] = true if OWN_ALLOC.include?(i.op) && heap?(i.ty) && (!%i[aset hset bufappend].include?(i.op) || own[i.args[0]]) } }
       body.each_key do |b|
         b.insts.each do |i|
           case i.op
+          when :bufappend then return false unless own[i.args[0]] # a grown buffer into a pre-existing cell
           when :fld_set, :aset, :hset
             o, k, v = i.args
-            return false if heap?(ty(f, v)) && !fresh[o]      # heap value into pre-existing memory
-            return false if i.op == :hset && heap?(ty(f, k)) && !fresh[o]
+            return false if heap?(ty(f, v)) && !own[o]      # heap value into pre-existing memory
+            return false if i.op == :hset && heap?(ty(f, k)) && !own[o]
           when :gset then return false if heap?(ty(f, i.args[1]))
           when :ret then return false if heap?(ty(f, i.args[0]))
           when :call

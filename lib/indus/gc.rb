@@ -29,7 +29,7 @@ module Indus
     def self.dyn_classes(classes) = classes.values.select(&:tagged)
 
     # ops that bump the heap themselves (calls are decided by their callee)
-    DIRECT_ALLOC = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos box chr sdup].freeze
+    DIRECT_ALLOC = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos box chr sdup mkbuf bufappend].freeze
 
     # Func#allocates: can running this function (transitively) allocate? A call
     # to a function that cannot needs no safepoint. Patchable methods may be
@@ -77,6 +77,7 @@ module Indus
         @types[id] =
           case
           when t == :str then [0]
+          when t == :strbuf then [3, 8, 1, 0, tid(:str)] # a one-field object: the string handle
           when t == :dyn # a tagged scalar: the concrete type is known only at run time, by tag
             boxed = @classes.values.select(&:boxed)
             [5, tid(:str), tid([:arr, :dyn]), tid([:hash, :dyn, :dyn]), tid(:str), boxed.size, *boxed.flat_map { |k| [k.id, tid(k.name)] }]

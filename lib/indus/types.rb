@@ -17,6 +17,7 @@ module Indus
       return a if b == :nil
       return :float if (a == :int && b == :float) || (a == :float && b == :int)
       return :int? if (a == :int? && b == :nil) || (a == :nil && b == :int?)
+      return :strbuf if (a == :str && b == :strbuf) || (a == :strbuf && b == :str) # a string that grew a stable handle
       return [:arr, join_elem(a[1], b[1])] if arr(a) && arr(b)
       return [:hash, join_elem(a[1], b[1]), join_elem(a[2], b[2])] if hsh(a) && hsh(b)
       # two classes meet: a closed poly set (whole program, so it is finite)
@@ -41,7 +42,7 @@ module Indus
     def self.arr(t) = t.is_a?(Array) && t[0] == :arr
     # does a value of this type hold a heap pointer the collector must follow?
     def self.heap_pointer?(t)
-      return true if t == :str || t == :dyn
+      return true if t == :str || t == :dyn || t == :strbuf
       return true if t.is_a?(Array) && %i[arr hash poly].include?(t[0])
       t.is_a?(Symbol) && !!@classes&.[](t)
     end
@@ -71,8 +72,21 @@ module Indus
           v = v.args[0] while %i[aset hset].include?(v.op)
           v.op == :param ? f.ptypes[f.params.index(v)] = nt : v.ty = nt; changed = true
         }
+        # a plain string flowing into a :strbuf slot is wrapped in a cell at its origin
+        cellflow = ->(f, i, v, dest) {
+          next unless dest == :strbuf && v.is_a?(Inst) && of(f, v) == :str
+          make_cell(f, v, i); changed = true
+        }
         funcs.each do |f|
           f.all.each do |i|
+            case i.op
+            when :aset then cellflow.(f, i, i.args[2], arr(of(f, i.args[0])) && of(f, i.args[0])[1])
+            when :hset then cellflow.(f, i, i.args[2], hsh(of(f, i.args[0])) && of(f, i.args[0])[2])
+            when :fld_set then cellflow.(f, i, i.args[2], ivar_type(of(f, i.args[0]), i.args[1]))
+            when :gset then cellflow.(f, i, i.args[1], @consts[i.args[0]])
+            when :ret then cellflow.(f, i, i.args[0], f.rtype)
+            when :phi then i.args.each { |(_, v)| cellflow.(f, i, v, i.ty) }
+            end
             case i.op
             when :aset then dynflow.(f, i.args[2], arr(of(f, i.args[0])) && of(f, i.args[0])[1])
             when :hset then (dynflow.(f, i.args[1], hsh(of(f, i.args[0])) && of(f, i.args[0])[1]); dynflow.(f, i.args[2], hsh(of(f, i.args[0])) && of(f, i.args[0])[2]))
@@ -83,6 +97,20 @@ module Indus
             when :phi then i.args.each { |(_, v)| dynflow.(f, v, i.ty) }
             end
             bind(f, i) if i.op == :mcall
+            # `s << v` where s is a parameter (or loop-carried from one): the caller must see the
+            # growth, so the value becomes a stable handle (:strbuf, notes/32). The cell is one
+            # word holding the current string; appends write through it, reads load through it.
+            if i.op == :lshift_or_append && of(f, i.args[0]) == :str && (ao = alias_origin(i.args[0]))
+              make_cell(f, ao); changed = true
+            end
+            if i.op == :lshift_or_append && of(f, i.args[0]) == :strbuf then i.op = :bufappend; i.ty = :strbuf; bufferize(f, i); changed = true end
+            if i.op == :call # an argument flowing into a :strbuf parameter is made a stable handle at its origin
+              callee = i.args[0]
+              i.args[1..].each_with_index do |v, k|
+                next unless callee.ptypes[k] == :strbuf && of(f, v) == :str
+                make_cell(f, v, i); changed = true
+              end
+            end
             if i.op == :lshift_or_append && arr(of(f, i.args[0])) # a << v on an array is push: aset at the length
               raise "#{f.name}: `<<` on parameter #{i.args[0]} would not be seen by the caller after growth; not supported yet" if i.args[0].op == :param
               len = Inst.new(:alen, [i.args[0]]); len.ty = :int; len.block = i.block
@@ -93,16 +121,25 @@ module Indus
             float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
             # printing/inspecting by type is irreversible, so it waits for the types to settle (below)
             if i.op == :mul && of(f, i.args[0]) == :str # "ab" * n
-              fn = @lower.funcs.fetch(:__str_times); i.op = :call; i.args = [fn, *i.args]; changed = true
+              fn = @lower.funcs.fetch(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
             end
             if @settled
+              if i.op == :to_s && of(f, i.args[0]) == :dyn # Object#to_s by tag
+                i.op = :call; i.args = [@lower.funcs.fetch(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true
+              end
+              if %i[sappend scat bufappend lshift_or_append].include?(i.op) && of(f, i.args[1]) == :dyn # must be a String at run time
+                c = Inst.new(:call, [@lower.funcs.fetch(:__dyn_str), i.args[1]]); c.ty = :str; c.block = i.block
+                i.block.insts.insert(i.block.insts.index(i), c); i.args[1] = c; changed = true
+              end
               dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
               dyn_print(f, i) if %i[puts_v p_v print_v inspect_v].include?(i.op) && of(f, i.args[0]) == :dyn
               inspect_v(f, i) if i.op == :inspect_v && of(f, i.args[0])
             end
             index(f, i) if i.op == :idx || i.op == :idx_set
             t = infer(f, i)
+            was = i.ty
             set.(i.ty, t) { i.ty = _1 }
+            bufferize(f, i) if i.ty == :strbuf && was != :strbuf # the cell now flows through this value (phi, call result, ...)
             case i.op
             when :call
               callee = i.args[0]
@@ -238,6 +275,71 @@ module Indus
       i.args = [c]
       i.op = :print_v if i.op == :print_v
       i.op = :puts_v if i.op == :p_v # p of a float is unquoted
+    end
+
+    FRESH_ORIGINS = %i[sconst scat itos ssub sdup call param phi aget hget fld_get gget].freeze
+    # a value whose home cannot be rebound by the appending code: a parameter, or a value loaded
+    # from a slot (ivar, element, global) -- possibly loop-carried (phi) or through appends
+    def self.alias_origin(v, seen = {})
+      return nil if seen[v]; seen[v] = true
+      case v.op
+      when :param, :fld_get, :aget, :hget, :gget then v
+      when :phi then v.args.each { |(_, a)| (r = alias_origin(a, seen)) and return r }; nil
+      when :lshift_or_append, :sappend, :bufappend then alias_origin(v.args[0], seen)
+      end
+    end
+
+    # wrap the string v in a cell at its origin; every use of the origin now sees the cell
+    def self.make_cell(f, v, use = nil)
+      if v.op == :bufderef # already a cell: hand the cell itself to this use
+        use.args.map! { |a| a == v ? v.args[0] : a } if use
+        return v.args[0]
+      end
+      o = v; o = o.args[0] while %i[sappend scat lshift_or_append].include?(o.op) && o.args[0].ty == :str && !FRESH_ORIGINS.include?(o.op)
+      return o if o.ty == :strbuf
+      if o.op == :param then f.ptypes[f.params.index(o)] = :strbuf; bufferize(f, o); return o end
+      # a load: the slot it came from becomes the cell (every store into it is wrapped by cellflow)
+      case o.op
+      when :fld_get
+        k = of(f, o.args[0]); @ivars[k][o.args[1]] = :strbuf if k
+        o.ty = :strbuf; bufferize(f, o); return o
+      when :aget, :hget, :apop
+        a = o.args[0]; a = a.args[0] while %i[aset hset].include?(a.op)
+        t = of(f, a); nt = arr(t) ? [:arr, :strbuf] : [:hash, t[1], :strbuf]
+        a.op == :param ? f.ptypes[f.params.index(a)] = nt : a.ty = nt
+        o.ty = :strbuf; bufferize(f, o); return o
+      when :gget
+        @consts[o.args[0]] = :strbuf; o.ty = :strbuf; bufferize(f, o); return o
+      end
+      mk = Inst.new(:mkbuf, [o]); mk.ty = :strbuf; mk.block = o.block
+      at = o.op == :phi ? 0 : o.block.insts.index(o) + 1
+      o.block.insts.insert(at, mk)
+      f.replace_uses(o, mk); mk.args = [o]
+      bufferize(f, mk); mk
+    end
+
+    STRBUF_CONSUMERS = %i[bufappend mkbuf bufderef].freeze
+    # v now holds a :strbuf. Every use that wants the string gets a load through the cell;
+    # appends go through the cell; calls into :strbuf parameters, returns of a :strbuf
+    # function and phis pass the cell itself (phis become :strbuf and are fixed in turn).
+    def self.bufferize(f, v, seen = {})
+      return if seen[v]; seen[v] = true
+      f.all.each do |u|
+        next unless u.args.any? { |a| a == v || (a.is_a?(Array) && a[1] == v) }
+        case u.op
+        when *STRBUF_CONSUMERS then next
+        when :lshift_or_append then u.op = :bufappend; u.ty = :strbuf; bufferize(f, u, seen); next
+        when :phi then u.ty = :strbuf; bufferize(f, u, seen); next
+        when :call then next if u.args[0].ptypes[u.args.index(v) - 1] == :strbuf
+        when :ret then (f.rtype = :strbuf; next) if f.rtype.nil? || f.rtype == :str || f.rtype == :strbuf
+        when :aset, :fld_set then next if u.args[2] == v # stored as the cell: the slot type widens to :strbuf
+        when :hset then next if u.args[2] == v && u.args[1] != v
+        when :gset then next
+        end
+        d = Inst.new(:bufderef, [v]); d.ty = :str; d.block = u.block
+        u.block.insts.insert(u.block.insts.index(u), d)
+        u.args.map! { |a| a == v ? d : a }
+      end
     end
 
     # an operator on a tagged scalar: the prelude dispatches on the tags.
@@ -399,6 +501,8 @@ module Indus
       when :fconst then :float
       when :sconst, :scat, :sappend, :itos, :bool_to_s, :chr, :sdup then :str
       when :rawld8 then :int
+      when :mkbuf, :bufappend then :strbuf
+      when :bufderef then :str
       when :apop then (t = of(f, a[0])) && arr(t) ? t[1] : nil
       when :hcap then :int
       when :hkey_at then (t = of(f, a[0])) && hsh(t) ? t[1] : nil

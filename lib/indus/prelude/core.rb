@@ -410,3 +410,9 @@ def __str_times(s, n)
   end
   out
 end
+
+# a tagged value where Ruby requires a String (`str << v`): unbox or trap (TypeError)
+def __dyn_str(v)
+  __trap if __tag(v) != 2
+  __unbox_str(v)
+end

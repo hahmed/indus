@@ -162,6 +162,17 @@ module Indus
       { Integer: :int, Float: :float, String: :str, Array: [:arr, :dyn], Hash: [:hash, :dyn, :dyn], Symbol: :sym }.fetch(cname) { @classes[cname] ? cname : raise("is_a?(#{cname}): unknown class") }
     end
 
+    # `x << a << b`: the local or ivar at the root of the chain, nil when it is an integer local
+    def append_root(n)
+      r = n.receiver
+      r = r.receiver while r.is_a?(Prism::CallNode) && r.name == :<<
+      case r
+      when Prism::LocalVariableReadNode then @int_locals&.include?(r.name) ? nil : r
+      when Prism::InstanceVariableReadNode then r
+      when Prism::CallNode then r if r.arguments.nil? && r.block.nil? && r.receiver # `obj.attr << v`: the slot becomes a cell (Types)
+      end
+    end
+
     def struct_new?(v) = v.is_a?(Prism::CallNode) && v.name == :new && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Struct
 
     def lower_body(f, names, stmts, klass = nil, ct = {})
@@ -399,14 +410,14 @@ module Indus
     def call(n)
       args = n.arguments&.arguments || []
       return block_call(n, args) if n.block.is_a?(Prism::BlockNode)
-      if n.name == :<< && n.receiver.is_a?(Prism::LocalVariableReadNode) && !@int_locals&.include?(n.receiver.name)
-        # `<<` is append on strings/arrays and shift on integers; Types fixes up a misguess
-        a = expr(n.receiver); v = expr(args[0])
-        return @locals[n.receiver.name] = emit(:lshift_or_append, [a, v])
-      elsif n.name == :<< && n.receiver.is_a?(Prism::InstanceVariableReadNode)
+      if n.name == :<< && (root = append_root(n)) # `<<` is append on strings/arrays and shift on integers; Types fixes up a misguess
         a = expr(n.receiver); v = expr(args[0])
         r = emit(:lshift_or_append, [a, v])
-        emit(:fld_set, [@locals.fetch(:self), @klass.ivar(n.receiver.name), r]); return r
+        case root # the chain's home is rebound to the result (a grown string/array may have moved)
+        when Prism::LocalVariableReadNode then @locals[root.name] = r
+        when Prism::InstanceVariableReadNode then emit(:fld_set, [@locals.fetch(:self), @klass.ivar(root.name), r])
+        end
+        return r
       end
       if n.receiver.nil? && n.name.to_s.start_with?("__") && !@funcs[n.name] && !(@klass && @klass.find_method(n.name))
         return intrinsic(n.name, args) # the GC prelude's raw memory access

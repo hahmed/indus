@@ -173,6 +173,17 @@ module Indus
             (@asm.mov_imm(TMP, k.id); @asm.str_off(TMP, 0, 0)) if k.tagged # class id in word 0
             @asm.mov(d, 0)
           end
+        when :mkbuf # a one-word cell holding the current string handle
+          @asm.emit(0xF81F0FE0 | reg(i.args[0], 9)) # str v, [sp, #-16]!  (survives the allocation call)
+          @asm.mov_imm(0, 8); @asm.bl(:__onew)
+          @asm.emit(0xF84107F0); @asm.str_off(16, 0, 0) # ldr x16, [sp], #16 ; str x16, [x0]
+          @asm.mov(d, 0)
+        when :bufderef then @asm.ldr_off(d, reg(i.args[0]), 0)
+        when :bufappend # *cell = rt_str_append(*cell, v); result is the cell
+          rb = reg(i.args[0], 9); @asm.mov(1, reg(i.args[1], 1)) # operands first: spill slots are sp-relative
+          @asm.emit(0xF81F0FE0 | rb); @asm.ldr_off(0, rb, 0)
+          @asm.bl(:rt_str_append)
+          @asm.emit(0xF84107F0); @asm.str_off(0, 16, 0); @asm.mov(d, 16)
         when :nop then @asm.mov(d, reg(i.args[0]))
         when :rawld then @asm.ldr_off(d, reg(i.args[0]), 0)
         when :rawld8 then @asm.emit(0x38606800 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d)   # ldrb wd, [s, i]
