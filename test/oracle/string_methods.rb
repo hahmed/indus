@@ -29,3 +29,6 @@ puts "".strip + "|"
 puts "abcabc".index("c")
 puts "abcabc".index("c", 3)
 puts "abc".index("z").nil?
+puts "hello world".byteslice(6, 5)
+puts "hello".byteslice(3, 10)
+puts "abc".sum

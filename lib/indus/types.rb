@@ -77,7 +77,7 @@ module Indus
             each_flow(f, i) do |v, dest|
               next unless v.is_a?(Inst)
               if @settled && dest == :int? && v.op == :const && v.ty == :nil then v.args[0] = INT_NIL; v.ty = :int; changed = true end # nil in a nullable int slot is the sentinel (settled: the slot might still widen to a pointer type)
-              changed = true if dest == :dyn && widen_elements_to_dyn(f, v)
+              changed = true if (dest == :dyn || arr(dest) && dest[1] == :dyn || hsh(dest) && dest[2] == :dyn) && widen_elements_to_dyn(f, v, dest)
               changed = true if dest == :strbuf && of(f, v) == :str && make_cell(f, v, i)
             end
             bind(f, i) if i.op == :mcall
@@ -139,6 +139,9 @@ module Indus
               fn = @lower.funcs.fetch(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
             end
             if @settled
+              if i.op == :alen && of(f, i.args[0]) == :dyn # length of a tagged value: by tag
+                i.op = :call; i.args = [@lower.funcs.fetch(:__dyn_length), i.args[0]]; i.ty = :int; changed = true
+              end
               if i.op == :to_s && of(f, i.args[0]) == :dyn # Object#to_s by tag
                 i.op = :call; i.args = [@lower.funcs.fetch(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true
               end
@@ -217,11 +220,17 @@ module Indus
       funcs.each { |f| f.all.each { |i| raise "uninitialized constant #{i.args[0]}" if i.op == :gget && !@consts.key?(i.args[0]) } }
       # classes that appear in any poly type carry a tag word
       tag = ->(t) { classes_of(t)&.each { @classes[_1].tagged = true } if poly?(t) || arr(t) && poly?(t[1]) }
-      # a user object boxed into a :dyn must carry its class id: tag every class that is boxed
-      funcs.each { |f| f.all.each { |i| (c = @classes[i.args[1]]) && (c.tagged = true) if i.op == :box && i.args[1].is_a?(Symbol) } }
       funcs.each { |f| f.all.each { tag.(_1.ty) }; f.ptypes.each { tag.(_1) }; tag.(f.rtype) }
       @ivars.each_value { |h| h.each_value { tag.(_1) } }
       funcs.each { convert(_1) }
+      # a user object boxed into a :dyn carries its class id in word 0 and is listed in the DYN
+      # descriptor: decided after convert, which is where the boxes are inserted
+      funcs.each do |f|
+        f.all.each do |i|
+          next unless i.op == :box
+          (classes_of(i.args[1]) || []).each { |cn| k = @classes[cn]; k.tagged = true; k.boxed = true } # a class or a poly set of classes
+        end
+      end
       funcs.each { strings(_1) }
     end
 
@@ -388,9 +397,10 @@ module Indus
 
     # a container flowing into a :dyn slot must hold :dyn elements itself, or whoever
     # unboxes it later finds raw words. Widened at the container's origin. True if changed.
-    def self.widen_elements_to_dyn(f, v)
+    def self.widen_elements_to_dyn(f, v, dest = :dyn)
       t = of(f, v)
-      nt = arr(t) ? [:arr, :dyn] : hsh(t) ? [:hash, :dyn, :dyn] : nil
+      nt = if dest == :dyn then arr(t) ? [:arr, :dyn] : hsh(t) ? [:hash, :dyn, :dyn] : nil
+           else (arr(t) && arr(dest) || hsh(t) && hsh(dest)) ? join(t, dest) : nil end # the slot's own shape
       return false if nt.nil? || t == nt
       v = v.args[0] while %i[aset hset].include?(v.op)
       v.op == :param ? f.ptypes[f.params.index(v)] = nt : v.ty = nt
@@ -574,6 +584,9 @@ module Indus
         raise "no method #{name} on any of #{t[1].join(', ')}" if arms.all? { |(_, kind, _)| kind == :trap }
         i.op = :pcall; i.args = [arms, recv, *args]
         return
+      end
+      if name == :value && args.empty? && !(t.is_a?(Symbol) && @classes[t]) && !poly?(t) && t
+        i.op = :nop; i.args = [recv]; i.ty = t; return # a finished Thread is its value (threads run at Thread.new)
       end
       if t == :int && (fn = @lower.funcs[:"__fd_#{name}"]) # a file descriptor is an Integer: fd.puts, fd.write, fd.close
         i.op = :call; i.args = [fn, recv, *args]; return

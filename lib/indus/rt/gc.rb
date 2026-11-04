@@ -239,7 +239,19 @@ def __gc_forward(slot, tid, from, from_end, free, wtop, bitmap, types)
     elsif tag == 14
       ctid = __ld32(desc0 + 16)
     else
-      cid = __ld(p - 8)
+      # an object: word 0 is its class id -- unless it was already copied this collection,
+      # in which case word 0 is the forwarding pointer; the bitmap says which
+      base = p - tag
+      if base >= from && base < from_end
+        bit = (base - from) / 16
+        if (__ld(bitmap + bit / 64 * 8) & (1 << (bit % 64))) != 0
+          __st(slot, __ld(base) + tag)
+          __st(g + 72, free)
+          __st(g + 80, wtop)
+          return 0
+        end
+      end
+      cid = __ld(base)
       np = __ld32(desc0 + 20)
       n = 0
       while n < np

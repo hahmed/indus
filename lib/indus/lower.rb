@@ -374,8 +374,9 @@ module Indus
       when Prism::LocalVariableOperatorWriteNode
         l = @locals.fetch(lname(n.name)); r = expr(n.value)
         @locals[lname(n.name)] = emit(ARITH.fetch(n.binary_operator), [l, r])
-      when Prism::MultiWriteNode # a, @b = x, y  (evaluate all, then bind each target)
-        vals = n.value.elements.map { expr(_1) }
+      when Prism::MultiWriteNode # a, @b = x, y  (evaluate all, then bind each target); a, b = arr destructures
+        vals = if n.value.is_a?(Prism::ArrayNode) then n.value.elements.map { expr(_1) }
+               else arr = expr(n.value); n.lefts.each_index.map { |k| emit(:idx, [arr, const(k)]) } end
         n.lefts.zip(vals).each do |t, v|
           case t
           when Prism::LocalVariableTargetNode then @locals[lname(t.name)] = v
@@ -423,6 +424,7 @@ module Indus
           case part
           when Prism::StringNode then emit(:sconst, [part.unescaped])
           when Prism::EmbeddedStatementsNode then to_s(expr(part.statements.body.last))
+          when Prism::InterpolatedStringNode then expr(part) # "a#{x}" \ "b#{y}": adjacent literals
           else raise "unsupported interpolation part #{part.class}"
           end
         end
@@ -598,6 +600,9 @@ module Indus
       elsif (n.name == :even? || n.name == :odd?) && args.empty? && n.receiver
         emit(:cmp, [emit(:and, [expr(n.receiver), const(1)]), const(0)], n.name == :even? ? :eq : :ne)
       elsif n.name == :chr && args.empty? && n.receiver then emit(:chr, [expr(n.receiver)])
+      elsif n.name == :pass && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Thread then const(0) # no preemption: nothing to yield to
+      elsif %i[lock synchronize sleep].include?(n.name) || n.receiver.is_a?(Prism::ConstantReadNode) && %i[Mutex Queue].include?(n.receiver.name)
+        raise "#{n.name}: threads run to completion at Thread.new here; anything that would observe interleaving is not supported"
       elsif n.name == :delete && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :File
         emit(:call, [@funcs.fetch(:__file_delete), expr(args[0])])
       elsif n.name == :clock_gettime && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Process
@@ -754,7 +759,19 @@ module Indus
       body = blk.body&.body || []
       recv = n.receiver
       case n.name
-      when :new # Array.new(n) { |i| v }
+      when :times then counted_loop(const(0), expr(recv), :lt, params, body)
+      when :upto then counted_loop(expr(recv), expr(args[0]), :le, params, body)
+      when :new # Thread.new(args) { |params| body }: the thread runs to completion here (one legal
+                # schedule under the GVL: nothing else is required to run). Its value is the body's.
+        if recv.is_a?(Prism::ConstantReadNode) && recv.name == :Thread
+          pfx = :"blk#{@f.blocks.size}:"
+          params.each_with_index { |pn, k| @locals[:"#{pfx}#{pn}"] = expr(args[k]) if args[k] }
+          @blk_pfx = (@blk_pfx || []) << pfx
+          last = nil; body.each { last = expr(_1) }
+          @blk_pfx.pop
+          @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
+          return last || const(0)
+        end
         raise "block passed to #{recv&.name}.new" unless recv.is_a?(Prism::ConstantReadNode) && recv.name == :Array
         len = expr(args[0])
         fill = const(0); fill.ty = :nil
@@ -766,8 +783,6 @@ module Indus
           @map_target = [outv, i]
         end
         return @locals.delete(outv)
-      when :times then counted_loop(const(0), expr(recv), :lt, params, body)
-      when :upto then counted_loop(expr(recv), expr(args[0]), :le, params, body)
       when :open # File.open(path, mode) { |f| ... }: f is the descriptor, closed after the block
         raise "block passed to #{recv&.name}.open" unless recv.is_a?(Prism::ConstantReadNode) && recv.name == :File
         fd = emit(:call, [@funcs.fetch(:__file_open), expr(args[0]), args[1] ? expr(args[1]) : emit(:sconst, ["r"])])
@@ -836,7 +851,7 @@ module Indus
       hb, bb, lb, xb = @f.new_block(:head), @f.new_block(:body), @f.new_block(:latch), @f.new_block(:exit)
       xb.cold = true
       pre = @cur
-      ivar = :"#{pfx}i"
+      ivar = :"#{pfx}$i" # a name no Ruby local can have: a block local `i` must not alias the counter
       @locals[ivar] = from
       emit(:br, [hb])
       phis = @locals.to_h { |nm, v| ph = hb.phi; ph.args << [pre, v]; [nm, ph] }

@@ -665,3 +665,28 @@ def __fd_lines(fd)
   out.push(s[start, s.length - start]) if start < s.length
   out
 end
+
+def __str_byteslice(s, start, len)
+  return "" if start >= s.length
+  len = s.length - start if start + len > s.length
+  s[start, len]
+end
+
+# String#sum: the byte sum (mod 2**16 in Ruby's default; callers here reduce it further)
+def __str_sum(s)
+  t = 0
+  i = 0
+  while i < s.length
+    t = t + __ld8(s, i)
+    i = i + 1
+  end
+  t % 65536
+end
+
+def __dyn_length(v)
+  t = __tag(v)
+  return __unbox_str(v).length if t == 2
+  return __unbox_arr(v).length if t == 4
+  __trap
+  0
+end
