@@ -17,6 +17,9 @@ module Indus
       body = @ast.statements.body
       # modules are namespaces: hoist their classes and constants to the top level
       mods = body.grep(Prism::ModuleNode)
+      # a module's instance methods: `include M` in a class body compiles them as that class's own
+      # (one copy per including class -- typed for that class, like everything else here)
+      @module_defs = mods.to_h { |m| [m.constant_path.name, (m.body&.body || []).grep(Prism::DefNode).reject { _1.receiver.is_a?(Prism::SelfNode) }] }
       mod_classes = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ClassNode) }
       mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
       mod_ivars = mods.flat_map { |m| (m.body&.body || []).grep(Prism::InstanceVariableWriteNode).map { [m.constant_path.name, _1] } }
@@ -78,7 +81,11 @@ module Indus
         # every @ivar this class body writes, registered now: a subclass declared below copies
         # the parent's layout at declaration, before the parent's methods are lowered
         assigned_ivars(c.body).each { k.ivar(_1) }
-        (c.body&.body || []).each do |st|
+        included = (c.body&.body || []).select { |st| st.is_a?(Prism::CallNode) && st.name == :include && st.receiver.nil? }
+                     .flat_map { |st| st.arguments.arguments.map { |a| a.is_a?(Prism::ConstantReadNode) ? a.name : raise("include needs a module name") } }
+        mixed_in = included.flat_map { |m| @module_defs.fetch(m) { m == :Comparable ? [] : raise("include #{m}: unknown module") } }
+        mixed_in.each { |d| assigned_ivars(d).each { k.ivar(_1) } }
+        (mixed_in + (c.body&.body || [])).each do |st|
           case st
           when Prism::DefNode
             next if st.receiver.is_a?(Prism::SelfNode) # Owner.m, registered above
@@ -88,6 +95,7 @@ module Indus
             f.rest = true if ps&.rest
             f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
           when Prism::CallNode
+            next if st.name == :include # mixed in above
             class_body_call(k, st, {}, methods)
           when Prism::ConstantWriteNode then nil # hoisted above
           else raise "unsupported in class body: #{st.class}"
@@ -688,6 +696,8 @@ module Indus
       elsif (c = CMP[n.name])
         l = expr(n.receiver); r = expr(args[0])
         emit(:cmp, [l, r], c)
+      elsif n.name == :<=> && args.size == 1 && n.receiver
+        emit(:mcall, [:<=>, expr(n.receiver), expr(args[0])]) # Types: ints/strings via the prelude, objects via their method
       elsif n.name == :to_i && args.empty? then emit(:to_i, [expr(n.receiver)])
       elsif n.name == :to_f && args.empty? then emit(:to_f, [expr(n.receiver)])
       elsif n.name == :putc

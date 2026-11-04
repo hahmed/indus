@@ -719,3 +719,25 @@ def __uncaught(e)
   __sys_exit(1)
   0
 end
+
+def __num_spaceship(a, b)
+  return -1 if a < b
+  return 1 if a > b
+  0
+end
+
+def __str_spaceship(a, b)
+  return -1 if a < b
+  return 1 if a > b
+  0
+end
+
+# Comparable: everything from <=>. Compiled into each class that includes it.
+module Comparable
+  def <(other) = (self <=> other) < 0
+  def <=(other) = (self <=> other) <= 0
+  def >(other) = (self <=> other) > 0
+  def >=(other) = (self <=> other) >= 0
+  def ==(other) = (self <=> other) == 0
+  def between?(lo, hi) = self >= lo && self <= hi
+end

@@ -150,6 +150,20 @@ module Indus
               i.op = :eputs_str; i.args = [c]
             end
             # printing/inspecting by type is irreversible, so it waits for the types to settle (below)
+            if i.op == :cmp && (t0 = of(f, i.args[0])) && (t0.is_a?(Symbol) && @classes[t0] || poly?(t0))
+              # comparing objects: an ordering is the class's own operator (Comparable from the prelude,
+              # or user-defined); == / != too when the class defines ==, else identity
+              has_eq = (classes_of(t0) || []).any? { @classes[_1].find_method(:==) }
+              if %i[lt le gt ge].include?(i.cond) || has_eq && %i[eq ne].include?(i.cond)
+                neg = i.cond == :ne
+                i.op = :mcall; i.args = [{ lt: :<, le: :<=, gt: :>, ge: :>=, eq: :==, ne: :== }.fetch(i.cond), *i.args]; i.cond = nil; bind(f, i); changed = true
+                if neg # a != b is !(a == b)
+                  c = Inst.new(i.op, i.args.dup); c.ty = :bool; c.block = i.block; c.cond = i.cond; i.block.insts.insert(i.block.insts.index(i), c)
+                  z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
+                  i.op = :cmp; i.args = [c, z]; i.cond = :eq
+                end
+              end
+            end
             if i.op == :cmp && arr(of(f, i.args[0])) && arr(of(f, i.args[1])) && %i[eq ne].include?(i.cond) # Array#== is elementwise
               l, r = i.args; fn = fn(:__arr_eq)
               c = Inst.new(:call, [fn, l, r]); c.ty = :bool; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
@@ -629,6 +643,9 @@ module Indus
       end
       if t == :int && (fn = fnq(:"__fd_#{name}")) # a file descriptor is an Integer: fd.puts, fd.write, fd.close
         i.op = :call; i.args = [fn, recv, *args]; return
+      end
+      if name == :<=> && (t == :int || t == :str || t == :float)
+        i.op = :call; i.args = [fn(t == :str ? :__str_spaceship : :__num_spaceship), recv, *args]; return
       end
       if t == :int && %i[succ pred].include?(name) && args.empty? # Integer#succ / #pred
         c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
