@@ -105,6 +105,9 @@ module Indus
               # bound to one class while the receiver was that class; it has since widened to a set
               i.op = :mcall; i.args = [c.name.to_s.split("#").last.to_sym, *i.args[1..]]; bind(f, i); changed = true
             end
+            if i.op == :call && i.args[0].name == :__arr_inspect && of(f, i.args[1]) == :dyn # the array became a tagged value: inspect by tag
+              i.args[0] = fn(:__dyn_inspect); changed = true
+            end
             if i.op == :call && generic?(i.args[0]) && clashes?(i.args[0], i.args[1..].map { of(f, _1) })
               # another caller already shaped this prelude generic: this call gets its own copy
               # (before infer, so the call's type never sees the other instance's result)
@@ -173,12 +176,26 @@ module Indus
             if %i[add sub mul div mod cmp].include?(i.op) && (big?(of(f, i.args[0])) || big?(of(f, i.args[1]))) && !@no_big_rewrite
               big_op(f, i); changed = true
             end
+            if %i[add sub and or mul].include?(i.op) && arr(of(f, i.args[0])) # a + b, a - b, a & b, a | b, a * n on arrays
+              fnm = { add: :__arr_plus, sub: :__arr_minus, and: :__arr_and, or: :__arr_or, mul: :__arr_times }.fetch(i.op)
+              fn = fn(fnm); i.op = :call; i.args = [fn, *i.args]; i.ty = nil; changed = true
+            end
+            if i.op == :to_f && of(f, i.args[0]) == :str then i.op = :call; i.args = [fn(:__str_to_f), i.args[0]]; i.ty = :float; changed = true end # "3.5".to_f
             if i.op == :mul && of(f, i.args[0]) == :str # "ab" * n
               fn = fn(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
             end
             if @settled
               if i.op == :alen && of(f, i.args[0]) == :dyn # length of a tagged value: by tag
                 i.op = :call; i.args = [fn(:__dyn_length), i.args[0]]; i.ty = :int; changed = true
+              end
+              if %i[puts_v p_v print_v].include?(i.op) && (t = of(f, i.args[0])) && (arr(t) || hsh(t)) # p arr -> inspect; puts arr -> one element per line
+                name = i.op == :puts_v && arr(t) ? :__arr_lines : (arr(t) ? :__arr_inspect : :__hash_inspect)
+                c = Inst.new(:call, [fn(name), i.args[0]]); c.ty = :str; c.block = i.block
+                i.block.insts.insert(i.block.insts.index(i), c); i.args = [c]; i.op = i.op == :print_v ? :print_str : :puts_str; changed = true
+              end
+              if i.op == :p_v && of(f, i.args[0]) == :str # p "s": String#inspect, escapes included
+                c = Inst.new(:call, [fn(:__quote), i.args[0]]); c.ty = :str; c.block = i.block
+                i.block.insts.insert(i.block.insts.index(i), c); i.args = [c]; i.op = :puts_str; changed = true
               end
               if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :sym # puts :a -> "a"; p :a -> ":a"
                 c = Inst.new(:call, [fn(i.op == :p_v ? :__sym_inspect : :__sym_name), i.args[0]]); c.ty = :str; c.block = i.block
@@ -421,9 +438,11 @@ module Indus
 
     # prelude generics: top-level functions named __arr_* / __merge_*; one instance per
     # distinct container type they are called with
-    def self.generic?(f) = f.name.to_s.start_with?("__arr_", "__merge_") && !f.cls
+    def self.generic?(f) = f.name.to_s.start_with?("__arr_", "__merge_", "__hash_", "__fd_lines_of") && !f.cls
     def self.clashes?(f, ts)
-      f.ptypes.zip(ts).any? { |cur, t| cur && t && cur != t && (arr(cur) || arr(t)) && join(cur, t) != cur && join(cur, t) != t || (cur && t && cur != t && join(cur, t) == :dyn) }
+      # containers: one instance per exact element type (a narrower array passed where a wider one
+      # was seen would need its elements re-represented, not just a wider parameter)
+      f.ptypes.zip(ts).any? { |cur, t| cur && t && cur != t && ((arr(cur) || arr(t) || hsh(cur) || hsh(t)) && !(arr(cur) && arr(t) && cur[1].nil?) && !(arr(cur) && arr(t) && t[1].nil?) || join(cur, t) == :dyn) }
     end
     def self.instance_for(f, ts, funcs)
       base = f.name.to_s.sub(/\$\d+$/, "")
@@ -461,7 +480,11 @@ module Indus
            else (arr(t) && arr(dest) || hsh(t) && hsh(dest)) ? join(t, dest) : nil end # the slot's own shape
       return false if nt.nil? || t == nt
       v = v.args[0] while %i[aset hset].include?(v.op)
-      v.op == :param ? f.ptypes[f.params.index(v)] = nt : v.ty = nt
+      case v.op
+      when :param then f.ptypes[f.params.index(v)] = nt
+      when :call then v.args[0].rtype = nt # the callee's returned container: its stores box, through its own ret flow
+      else v.ty = nt
+      end
       true
     end
 
@@ -630,6 +653,7 @@ module Indus
       when :sym then i.op = :call; i.args = [fn(:__sym_inspect), i.args[0]]
       else
         if arr(t) then i.op = :call; i.args = [fn(:__arr_inspect), i.args[0]]
+        elsif hsh(t) then i.op = :call; i.args = [fn(:__hash_inspect), i.args[0]]
         else raise "inspect of #{t.inspect} not supported" end
       end
     end
@@ -655,10 +679,10 @@ module Indus
       end
       t = :int if t == :int? # a nullable int used as a receiver: nil would have raised
       if t == :int && name == :to_s && args.empty? then i.op = :itos; i.args = [recv]; return end
-      if hsh(t) && (fn = fnq(:"__hash_#{name.to_s.sub('?', '_p')}")) # Hash methods in the prelude
-        i.op = :call; i.args = [fn, recv, *args]; return
-      end
-      if (t == :int || t == :float) && (fn = fnq(:"__num_#{name.to_s.sub('?', '_p')}")) # Integer / Float methods in the prelude
+      # prelude methods by family and name (__hash_x, __num_x, __str_x, __arr_x); an arity-suffixed
+      # sibling (__arr_last1) serves a call with that many arguments, since defaults cannot be typed here
+      fam = hsh(t) ? "hash" : (t == :int || t == :float) ? "num" : t == :str ? "str" : arr(t) ? "arr" : nil
+      if fam && (fn = prelude_method(fam, name, args.size))
         i.op = :call; i.args = [fn, recv, *args]; return
       end
       if t == :int && %i[succ pred].include?(name) && args.empty? # Integer#succ / #pred
@@ -666,13 +690,7 @@ module Indus
         i.op = name == :succ ? :add : :sub; i.args = [recv, c]; return
       end
       # prelude methods take no optional parameters: an arity-suffixed name (__str_rjust1) serves the shorter call
-      if t == :str && (fn = fnq(:"__str_#{name.to_s.sub('?', '_p')}#{args.size}") || fnq(:"__str_#{name.to_s.sub('?', '_p')}")) # String methods written in the prelude
-        i.op = :call; i.args = [fn, recv, *args]; return
-      end
       if arr(t) && name == :to_a && args.empty? then i.op = :nop; i.args = [recv]; i.ty = t; return end
-      if arr(t) && (fn = fnq(:"__arr_#{name.to_s.sub('?', '_p')}") || fnq(:"__arr_#{name}"))
-        i.op = :call; i.args = [fn, recv, *args]; return
-      end
       return unless t.is_a?(Symbol) && (klass = @classes[t])
       kind, payload = resolve(klass, name, args.size, allow_missing: true)
       case kind
@@ -682,6 +700,11 @@ module Indus
       when :missing # method_missing(name, *args): the name is a compile-time symbol, args packed
         i.op = :call; i.args = [payload, recv, sym_const(i, name), pack_args(i, args)]
       end
+    end
+
+    def self.prelude_method(fam, name, argc)
+      base = name.to_s.sub("?", "_p").sub("!", "_bang")
+      fnq(:"__#{fam}_#{base}#{argc}") || fnq(:"__#{fam}_#{base}")
     end
 
     def self.sym_const(at, name)
@@ -730,7 +753,8 @@ module Indus
       t = of(f, r)
       t ||= { hnew: [:hash, nil, nil], anew: [:arr, nil] }[r.op] if r.is_a?(Inst) # empty literal, nothing stored yet
       return unless t
-      if arr(t) then i.op = i.op == :idx ? :aget : :aset
+      if arr(t) && i.op == :idx && i.args.size == 3 then i.op = :call; i.args = [fn(:__arr_slice), *i.args]; i.ty = nil # a[start, len]
+      elsif arr(t) then i.op = i.op == :idx ? :aget : :aset
       elsif hsh(t) then i.op = i.op == :idx ? :hget : :hset
       elsif t == :str && i.op == :idx then i.op = :ssub; i.args << (c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); c) if i.args.size == 2
       else raise "[] on #{t.inspect}" end
@@ -789,6 +813,7 @@ module Indus
       when :mkbuf, :bufappend then :strbuf
       when :bufderef then :str
       when :apop then (t = of(f, a[0])) && arr(t) ? t[1] : nil
+      when :nop then of(f, a[0]) # the same value under another name
       when :hcap, :gcepoch, :hsave, :sys then :int
       when :cell_new then (t = of(f, a[0])) && [:cell, t]
       when :cell_get then (t = of(f, a[0])) && t.is_a?(Array) && t[0] == :cell ? t[1] : nil

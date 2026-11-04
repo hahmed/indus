@@ -779,6 +779,8 @@ module Indus
       elsif %i[sin cos].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
         emit(:libm, [n.name, expr(args[0])])
       elsif n.name == :** then emit(:pow, [expr(n.receiver), expr(args[0])]) # ipow or libm pow, by type
+      elsif n.name == :pow && args.size == 1 && n.receiver && !const_recv?(n) then emit(:pow, [expr(n.receiver), expr(args[0])])
+      elsif n.name == :pow && args.size == 2 && n.receiver && !const_recv?(n) then emit(:call, [demand(:__num_pow_mod), expr(n.receiver), expr(args[0]), expr(args[1])])
       elsif %i[length size bytesize].include?(n.name) && args.empty? && n.receiver then emit(:alen, [expr(n.receiver)])
       elsif (n.name == :even? || n.name == :odd?) && args.empty? && n.receiver
         emit(:cmp, [emit(:and, [expr(n.receiver), const(1)]), const(0)], n.name == :even? ? :eq : :ne)
@@ -1400,6 +1402,8 @@ module Indus
     def free_locals(node, bound, out = []) = free_locals_plain(node, bound, out)
 
     def recv_val(recv) = @recv_value || expr(recv)
+    # Mod.m / Klass.m: a constant naming a class or module, not a value
+    def const_recv?(n) = n.receiver.is_a?(Prism::ConstantReadNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name) || @funcs.key?(:"#{n.receiver.name}.#{n.name}"))
 
     # the values as an array whose elements are tagged (a heterogeneous argument list)
     def dyn_array(nodes)

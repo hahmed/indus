@@ -105,8 +105,20 @@ def __float_to_s(f)
   neg ? "-" + out : out
 end
 
+# String#inspect: quotes, with \n \t \" \\ escaped
 def __quote(s)
-  "\"" + s + "\""
+  out = "\""
+  i = 0
+  while i < s.length
+    c = __ld8(s, i)
+    if c == 10 then out = out + "\\n"
+    elsif c == 9 then out = out + "\\t"
+    elsif c == 34 then out = out + "\\\""
+    elsif c == 92 then out = out + "\\\\"
+    else out = out + s[i, 1] end
+    i = i + 1
+  end
+  out + "\""
 end
 
 # Tagged scalars (:dyn): to_s / inspect by tag. Tags: 0 nil, odd fixnum,
@@ -456,7 +468,7 @@ def __arr_shift(a)
   first
 end
 
-def __arr_reverse!(a)
+def __arr_reverse_bang(a)
   i = 0
   j = a.length - 1
   while i < j
