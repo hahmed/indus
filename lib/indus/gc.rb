@@ -81,7 +81,7 @@ module Indus
           when t == :dyn # a tagged scalar: the concrete type is known only at run time, by tag
             boxed = @classes.values.select(&:boxed)
             [5, tid(:str), tid([:arr, :dyn]), tid([:hash, :dyn, :dyn]), tid(:str), boxed.size, *boxed.flat_map { |k| [k.id, tid(k.name)] }]
-          when t.is_a?(Array) && t[0] == :arr then [1, tid(t[1])]
+          when t.is_a?(Array) && t[0] == :arr then [1, tid(t[1])] # (a Bignum is an int array too)
           when t.is_a?(Array) && t[0] == :hash then [2, tid(t[1]), tid(t[2])]
           when t.is_a?(Array) && t[0] == :poly then [4, t[1].size, *t[1].flat_map { |c| [@classes[c].id, tid(c)] }]
           when t.is_a?(Symbol) && (k = @classes[t])

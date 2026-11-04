@@ -287,7 +287,7 @@ module Indus
 
     def expr(n)
       case n
-      when Prism::IntegerNode then const(n.value)
+      when Prism::IntegerNode then (n.value.bit_length <= 64 or raise "integer literal #{n.value} does not fit 64 bits (Bignum literals not supported yet)"); const(n.value)
       when Prism::FloatNode then fconst(n.value)
       when Prism::NilNode then (c = const(0); c.ty = :nil; c)
       when Prism::TrueNode then (c = const(1); c.ty = :bool; c)

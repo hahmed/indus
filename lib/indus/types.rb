@@ -16,6 +16,8 @@ module Indus
       return b if a == :nil
       return a if b == :nil
       return :float if (a == :int && b == :float) || (a == :float && b == :int)
+      intish = ->(t) { t == :int || t == :int? || t.nil? }
+      return BIG if (big?(a) && (intish.(b) || arr(b) && intish.(b[1]))) || (big?(b) && (intish.(a) || arr(a) && intish.(a[1])))
       return :int? if (a == :int? && b == :nil) || (a == :nil && b == :int?)
       return :strbuf if (a == :str && b == :strbuf) || (a == :strbuf && b == :str) # a string that grew a stable handle
       return [:arr, join_elem(a[1], b[1])] if arr(a) && arr(b)
@@ -40,6 +42,10 @@ module Indus
     def self.poly?(t) = t.is_a?(Array) && t[0] == :poly
     def self.of(f, v) = v.op == :param ? f.ptypes[f.params.index(v)] : v.ty
     def self.arr(t) = t.is_a?(Array) && t[0] == :arr
+    # Bignum: an int array ([sign, limbs...], lib/indus/rt/big.rb) marked so that operators
+    # and printing go to __big_*. Array-shaped for everything the prelude does to it.
+    BIG = [:arr, :int, :big].freeze
+    def self.big?(t) = t == BIG
     # does a value of this type hold a heap pointer the collector must follow?
     def self.heap_pointer?(t)
       return true if t == :str || t == :dyn || t == :strbuf
@@ -70,7 +76,7 @@ module Indus
             # changes happen at the value's *origin*, so a slot never mixes representations
             each_flow(f, i) do |v, dest|
               next unless v.is_a?(Inst)
-              if dest == :int? && v.op == :const && v.ty == :nil then v.args[0] = INT_NIL; v.ty = :int; changed = true end # nil in a nullable int slot is the sentinel
+              if @settled && dest == :int? && v.op == :const && v.ty == :nil then v.args[0] = INT_NIL; v.ty = :int; changed = true end # nil in a nullable int slot is the sentinel (settled: the slot might still widen to a pointer type)
               changed = true if dest == :dyn && widen_elements_to_dyn(f, v)
               changed = true if dest == :strbuf && of(f, v) == :str && make_cell(f, v, i)
             end
@@ -102,6 +108,12 @@ module Indus
             end
             dsend(f, i) if i.op == :dsend
             float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
+            if %i[puts_v p_v print_v to_s].include?(i.op) && big?(of(f, i.args[0])) # Bignum prints through the prelude
+              c = Inst.new(:call, [@lower.funcs.fetch(:__big_to_s), i.args[0]]); c.ty = :str; c.block = i.block
+              i.block.insts.insert(i.block.insts.index(i), c)
+              if i.op == :to_s then i.op = :nop; i.args = [c]; i.ty = :str else i.args = [c] end
+              changed = true
+            end
             if i.op == :eputs_v && (t = of(f, i.args[0])) # $stderr.puts: make it a string, then write to fd 2
               c = case t
                   when :str then i.args[0]
@@ -119,6 +131,9 @@ module Indus
               c = Inst.new(:call, [fn, l, r]); c.ty = :bool; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
               z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
               i.args = [c, z]; i.cond = i.cond == :eq ? :ne : :eq; changed = true # (a == b) is (eq_result != 0)
+            end
+            if %i[add sub mul div mod cmp].include?(i.op) && (big?(of(f, i.args[0])) || big?(of(f, i.args[1]))) && !@no_big_rewrite
+              big_op(f, i); changed = true
             end
             if i.op == :mul && of(f, i.args[0]) == :str # "ab" * n
               fn = @lower.funcs.fetch(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
@@ -193,11 +208,12 @@ module Indus
           end
         end
         unless changed
+          if !@settled && !@promoted && promote_geometric(funcs) then @promoted = true; changed = true; next end
           break if @settled # second convergence: prints resolved and types stable
           @settled = true; changed = true # one more round with the by-type rewrites enabled
         end
       end
-      @settled = false
+      @settled = false; @promoted = false
       funcs.each { |f| f.all.each { |i| raise "uninitialized constant #{i.args[0]}" if i.op == :gget && !@consts.key?(i.args[0]) } }
       # classes that appear in any poly type carry a tag word
       tag = ->(t) { classes_of(t)&.each { @classes[_1].tagged = true } if poly?(t) || arr(t) && poly?(t[1]) }
@@ -440,6 +456,75 @@ module Indus
       end
     end
 
+    # an operator with a Bignum operand: the other operand is lifted (coerce, int -> big) and
+    # the op becomes a prelude call. Compares go through __big_cmp and test its sign.
+    BIG_OPS = { add: :__big_add, sub: :__big_sub, mul: :__big_mul, div: :__big_div, mod: :__big_mod }.freeze
+    def self.big_op(f, i)
+      l, r = i.args.map { |v| big?(of(f, v)) ? v : coerce(f, i.block, i, v, BIG) } # lift the int operand now, so the callee is typed BIG from the start
+      if i.op == :cmp
+        c = Inst.new(:call, [@lower.funcs.fetch(:__big_cmp), l, r]); c.ty = :int; c.block = i.block
+        i.block.insts.insert(i.block.insts.index(i), c)
+        z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
+        i.args = [c, z] # cond unchanged: (a < b) is (cmp(a, b) < 0)
+      else
+        fn = @lower.funcs.fetch(BIG_OPS.fetch(i.op))
+        i.op = :call; i.args = [fn, l, r]; i.ty = BIG
+      end
+    end
+
+    # Loop-carried integers that grow geometrically cannot be 64-bit honestly: a phi whose
+    # back-edge value adds two things that both depend on it (fib), or multiplies something
+    # that depends on it by anything but a constant 0/1 (q = q * k), becomes a Bignum. Counters
+    # (i + 1) and sums of independent data (sum + a[i]) stay ints and keep their overflow trap.
+    def self.promote_geometric(funcs)
+      promoted = false
+      funcs.each do |f|
+        next if f.name.to_s.start_with?("__") # the preludes are written to fit
+        f.blocks.each do |h|
+          next unless h.name.to_s.start_with?("head")
+          phis = h.phis.select { _1.ty == :int }
+          next if phis.empty?
+          back = ->(p) { p.args.reject { |(pred, _)| f.blocks.index(pred) < f.blocks.index(h) }.map(&:last) }
+          # reach[p]: the header phis p's value depends on, through the loop body and other phis' back edges
+          reach = phis.to_h { [_1, {}] }
+          deps = ->(v, seen = {}) {
+            next {} if !v.is_a?(Inst) || v.op == :const || v.op == :param || seen[v]
+            seen[v] = true
+            next({ v => true }.merge(reach[v])) if reach.key?(v)
+            next {} if v.op == :phi
+            v.args.map { |a| deps.(a.is_a?(Array) ? a[1] : a, seen) }.reduce({}) { _1.merge(_2) }
+          }
+          loop do
+            grew = false
+            phis.each do |p|
+              d = back.(p).map { deps.(_1) }.reduce({}) { _1.merge(_2) }
+              (grew = true; reach[p] = reach[p].merge(d)) if (d.keys - reach[p].keys).any?
+            end
+            break unless grew
+          end
+          # a phi the loop condition bounds (`while width < n`, n independent of it) stays an int
+          bounded = ->(p) {
+            c = h.term; cmp = c && c.op == :condbr && c.args[0].is_a?(Inst) && c.args[0].op == :cmp ? c.args[0] : nil
+            next false unless cmp && %i[lt le gt ge].include?(cmp.cond)
+            l, r = cmp.args
+            (deps.(l)[p] && !deps.(r)[p]) || (deps.(r)[p] && !deps.(l)[p])
+          }
+          phis.each do |p|
+            next if bounded.(p)
+            back.(p).each do |v|
+              next unless v.is_a?(Inst) && %i[add mul].include?(v.op)
+              x, y = v.args
+              hits = ->(o) { deps.(o)[p] }
+              trivial = ->(o) { o.is_a?(Inst) && o.op == :const && [0, 1].include?(o.args[0]) }
+              geometric = v.op == :add ? (hits.(x) && hits.(y)) : ((hits.(x) || hits.(y)) && !trivial.(x) && !trivial.(y))
+              (p.ty = BIG; promoted = true) if geometric
+            end
+          end
+        end
+      end
+      promoted
+    end
+
     # an operator on a tagged scalar: the prelude dispatches on the tags.
     # cmp.eq/ne give a bool; the ordering compares and arithmetic give a :dyn
     # (Integer + Integer may be Float + ..., String + String is a String).
@@ -663,77 +748,61 @@ module Indus
 
     # insert itof where an int flows into a float position, and box where a
     # typed value flows into a :dyn position
+    # Representation changes where a value meets a slot of a wider type: int -> float
+    # (itof), typed -> :dyn (box), int -> Bignum (__big_from_int). One walk over every
+    # slot position; each coercion is a rule from (value type, slot type) to an instruction.
     def self.convert(f)
-      cvt = ->(blk, before, v) {
-        c = Inst.new(:itof, [v]); c.ty = :float; c.block = blk
-        blk.insts.insert(blk.insts.index(before), c); c
-      }
-      box = ->(blk, before, v) {
-        t = of(f, v)
-        next v if t == :dyn || t.nil?
-        c = Inst.new(:box, [v, t]); c.ty = :dyn; c.block = blk
-        blk.insts.insert(blk.insts.index(before), c); c
-      }
       f.blocks.each do |b|
         b.insts.dup.each do |i|
-          case i.op
-          when :aset
-            a, _, v = i.args
-            i.args[2] = box.(b, i, v) if arr(of(f, a)) && of(f, a)[1] == :dyn && of(f, v) != :dyn
-          when :hset
-            h, k, v = i.args
-            t = of(f, h)
-            if hsh(t)
-              i.args[1] = box.(b, i, k) if t[1] == :dyn && of(f, k) != :dyn
-              i.args[2] = box.(b, i, v) if t[2] == :dyn && of(f, v) != :dyn
-            end
-          when :fld_set
-            o, ix, v = i.args
-            i.args[2] = box.(b, i, v) if ivar_type(of(f, o), ix) == :dyn && of(f, v) != :dyn
-          when :gset then i.args[1] = box.(b, i, i.args[1]) if @consts[i.args[0]] == :dyn && of(f, i.args[1]) != :dyn
-          when :call
-            callee = i.args[0]
-            i.args[1..].each_with_index { |v, k| i.args[k + 1] = box.(b, i, v) if callee.ptypes[k] == :dyn && of(f, v) != :dyn }
-          when :ret then i.args[0] = box.(b, i, i.args[0]) if f.rtype == :dyn && of(f, i.args[0]) != :dyn
-          end
-        end
-        b.phis.each do |p|
-          next unless p.ty == :dyn
-          p.args.map! { |(pred, v)| of(f, v) != :dyn ? [pred, box.(pred, pred.term, v)] : [pred, v] }
-        end
-      end
-      f.blocks.each do |b|
-        b.insts.dup.each do |i|
+          # operators: a float or Bignum operand lifts the other
           case i.op
           when :add, :sub, :mul, :div, :cmp
-            next unless i.args.any? { of(f, _1) == :float }
-            i.args.map! { |v| of(f, v) == :int ? cvt.(b, i, v) : v }
-            i.cond = :"f#{i.cond}" if i.op == :cmp
-          when :fsqrt then i.args[0] = cvt.(b, i, i.args[0]) if of(f, i.args[0]) == :int
-          when :libm then i.args[1] = cvt.(b, i, i.args[1]) if of(f, i.args[1]) == :int
+            if i.args.any? { of(f, _1) == :float }
+              i.args.map! { |v| of(f, v) == :int ? coerce(f, b, i, v, :float) : v }
+              i.cond = :"f#{i.cond}" if i.op == :cmp
+            end
+          when :fsqrt then i.args[0] = coerce(f, b, i, i.args[0], :float)
+          when :libm then i.args[1] = coerce(f, b, i, i.args[1], :float)
           when :pow
-            if i.ty == :float
-              i.args.map! { |v| of(f, v) == :int ? cvt.(b, i, v) : v }; i.op = :fpow
+            if i.ty == :float then i.args.map! { |v| coerce(f, b, i, v, :float) }; i.op = :fpow
             else i.op = :ipow end
-          when :aset
-            a, _, v = i.args
-            i.args[2] = cvt.(b, i, v) if arr(of(f, a)) && of(f, a)[1] == :float && of(f, v) == :int
-          when :fld_set
-            o, ix, v = i.args
-            i.args[2] = cvt.(b, i, v) if ivar_type(of(f, o), ix) == :float && of(f, v) == :int
-          when :gset then i.args[1] = cvt.(b, i, i.args[1]) if @consts[i.args[0]] == :float && of(f, i.args[1]) == :int
-          when :call
-            callee = i.args[0]
-            i.args[1..].each_with_index { |v, k| i.args[k + 1] = cvt.(b, i, v) if callee.ptypes[k] == :float && of(f, v) == :int }
-          when :ret
-            i.args[0] = cvt.(b, i, i.args[0]) if f.rtype == :float && of(f, i.args[0]) == :int
           end
+          each_slot(f, i) { |v, dest, set| set.(coerce(f, b, i, v, dest)) }
         end
         b.phis.each do |p|
-          next unless p.ty == :float
-          p.args.map! { |(pred, v)| of(f, v) == :int ? [pred, cvt.(pred, pred.term, v)] : [pred, v] }
+          p.args.map! { |(pred, v)| [pred, coerce(f, pred, pred.term, v, p.ty)] }
         end
       end
+    end
+
+    # like each_flow, with a setter for the operand position
+    def self.each_slot(f, i)
+      case i.op
+      when :aset
+        t = of(f, i.args[0]); yield i.args[2], t[1], ->(w) { i.args[2] = w } if arr(t)
+      when :hset
+        t = of(f, i.args[0])
+        if hsh(t) then yield i.args[1], t[1], ->(w) { i.args[1] = w }; yield i.args[2], t[2], ->(w) { i.args[2] = w } end
+      when :fld_set then yield i.args[2], ivar_type(of(f, i.args[0]), i.args[1]), ->(w) { i.args[2] = w }
+      when :gset then yield i.args[1], @consts[i.args[0]], ->(w) { i.args[1] = w }
+      when :call then i.args[1..].each_with_index { |v, k| yield v, i.args[0].ptypes[k], ->(w) { i.args[k + 1] = w } }
+      when :ret then yield i.args[0], f.rtype, ->(w) { i.args[0] = w }
+      end
+    end
+
+    # the value v as the slot type dest, or v itself when no change of representation is needed
+    def self.coerce(f, blk, before, v, dest)
+      t = of(f, v)
+      return v if t.nil? || dest.nil? || t == dest
+      c = case
+          when dest == :float && t == :int then Inst.new(:itof, [v]).tap { _1.ty = :float }
+          when dest == :dyn && t != :dyn then Inst.new(:box, [v, t]).tap { _1.ty = :dyn }
+          when big?(dest) && %i[int int?].include?(t) then Inst.new(:call, [@lower.funcs.fetch(:__big_from_int), v]).tap { _1.ty = BIG }
+          else return v
+          end
+      c.block = blk
+      blk.insts.insert(blk.insts.index(before), c)
+      c
     end
   end
 end
