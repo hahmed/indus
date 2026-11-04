@@ -16,3 +16,5 @@ puts s
 puts s.length
 puts c == "hello world"
 puts c == "nope"
+puts "ends with newline\n"
+puts "two\n\n"

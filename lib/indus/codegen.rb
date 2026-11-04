@@ -435,7 +435,7 @@ module Indus
           @asm.cbz(reg(i.args[0]), f_); @asm.adr(0, :__true); @asm.b(dn); @asm.label(f_); @asm.adr(0, :__false); @asm.label(dn)
           @asm.bl(:rt_puts_str)
         when :puts_s
-          s = i.args[0] + "\n"; name = :"str#{i.id}"
+          s = i.args[0].end_with?("\n") ? i.args[0] : i.args[0] + "\n"; name = :"str#{i.id}" # puts adds no newline to one that has it
           @asm.data(name, s)
           @asm.adr(1, name); @asm.mov_imm(2, s.bytesize); @asm.mov_imm(0, 1)
           @asm.call_write

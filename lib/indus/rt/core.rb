@@ -311,10 +311,30 @@ def __str_end_with_p(s, pat)
   __str_match_at(s, pat, s.length - pat.length)
 end
 
-def __str_index(s, pat)
-  r = __str_index_from(s, pat, 0)
+def __str_index(s, pat, from = 0)
+  r = __str_index_from(s, pat, from)
   return nil if r < 0
   r
+end
+
+def __str_strip(s)
+  a = 0
+  b = s.length
+  a = a + 1 while a < b && __str_space(__ld8(s, a))
+  b = b - 1 while b > a && __str_space(__ld8(s, b - 1))
+  s[a, b - a]
+end
+
+def __str_lstrip(s)
+  a = 0
+  a = a + 1 while a < s.length && __str_space(__ld8(s, a))
+  s[a, s.length - a]
+end
+
+def __str_rstrip(s)
+  b = s.length
+  b = b - 1 while b > 0 && __str_space(__ld8(s, b - 1))
+  s[0, b]
 end
 
 # split(","): fields between separators; trailing empty fields dropped like Ruby.

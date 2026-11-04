@@ -21,3 +21,10 @@ puts h["a"] + 1
 names = ["x", "y"]
 puts names[5] == nil
 puts names[1] == nil
+def maybe(x)
+  return nil if x < 0
+  x
+end
+puts maybe(-1).nil?
+puts maybe(3).nil?
+puts maybe(-1) == nil

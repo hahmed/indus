@@ -45,7 +45,7 @@ module Indus
   end
 
   class Func
-    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :rest, :allocates
+    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :rest, :allocates, :result_unused
     def initialize(name, nparams)
       @name, @params, @blocks = name, Array.new(nparams) { Inst.new(:param) }, [Block.new(:entry)]
     end

@@ -59,8 +59,10 @@ module Indus
       @ivars ||= Hash.new { |h, k| h[k] = {} } # class name -> ivar index -> type
       @consts ||= {}
       funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = f.cls.name if f.cls }
+      @seams = funcs.any? { |f| f.all.any? { _1.op == :seam } }
       loop do
         changed = false
+        mark_unused_results(funcs) if funcs.any? { _1.name == :main } # a whole-program fact; the resident compiler sees one function
         set = ->(cur, nt, &w) { (w.call(join(cur, nt)); changed = true) if nt && join(cur, nt) != cur }
         funcs.each do |f|
           f.all.each do |i|
@@ -68,6 +70,7 @@ module Indus
             # changes happen at the value's *origin*, so a slot never mixes representations
             each_flow(f, i) do |v, dest|
               next unless v.is_a?(Inst)
+              if dest == :int? && v.op == :const && v.ty == :nil then v.args[0] = INT_NIL; v.ty = :int; changed = true end # nil in a nullable int slot is the sentinel
               changed = true if dest == :dyn && widen_elements_to_dyn(f, v)
               changed = true if dest == :strbuf && of(f, v) == :str && make_cell(f, v, i)
             end
@@ -138,7 +141,7 @@ module Indus
                 when :fld_set then k = of(f, recv); set.(@ivars[k][payload], of(f, args[0])) { @ivars[k][payload] = _1 } if k
                 end
               end
-            when :ret then set.(f.rtype, of(f, i.args[0])) { f.rtype = _1 }
+            when :ret then set.(f.rtype, of(f, i.args[0])) { f.rtype = _1 } unless f.result_unused
             when :aset
               a, _, v = i.args
               nt = [:arr, of(f, v)]
@@ -264,6 +267,44 @@ module Indus
       end
     end
 
+    # A method whose result no caller reads (`parse(text)` as a statement) has a return
+    # value in Ruby -- its last expression -- but nothing observes it, so its type must not
+    # flow anywhere: a trailing `if` without else would otherwise join (array, nil) into :dyn
+    # and widen the array at its origin. Direct calls only; a method reachable through a
+    # dispatch (pcall/sendsw/dsend/seam) is assumed read.
+    def self.mark_unused_results(funcs)
+      read = {}; read_name = {}
+      funcs.each do |f|
+        f.all.each do |i|
+          case i.op
+          when :pcall, :sendsw then i.args[0].each { |(_, kind, payload)| read[payload] = true if kind == :call }
+          when :dsend then i.args.each { read[_1] = true if _1.is_a?(Func) }
+          end
+          (i.op == :phi ? i.args.map(&:last) : i.args).each do |a|
+            next unless a.is_a?(Inst)
+            read[a.args[0]] = true if a.op == :call
+            read_name[a.args[0]] = true if a.op == :mcall # target not bound yet: every method of that name
+          end
+        end
+      end
+      funcs.each do |f|
+        base = f.name.to_s.split("#").last.to_sym
+        unused = !read[f] && !read_name[base] && f.name != :main && !f.patchable && !f.name.to_s.start_with?("__")
+        f.result_unused = unused
+        # Once the types have settled (mcalls bound), a dead result is made to return a
+        # constant, so the value -- and any phi only it kept alive -- stops existing instead of
+        # shaping the types of what it was built from. Irreversible, so not before @settled,
+        # and never in a seam program: code compiled later may read what nobody reads now.
+        next unless unused && @settled && !@seams
+        f.all.each do |i|
+          next unless i.op == :ret && i.args[0].is_a?(Inst) && i.args[0].op != :const
+          c = Inst.new(:const, [0]); c.ty = :nil; c.block = i.block
+          i.block.insts.insert(i.block.insts.index(i), c); i.args = [c]
+        end
+        Passes.trivial_phis(f)
+      end
+    end
+
     # every (value, slot type) pair where i stores a value into a typed slot:
     # container elements, ivars, globals, call parameters, the return slot, phis
     def self.each_flow(f, i)
@@ -275,8 +316,8 @@ module Indus
       when :fld_set then yield i.args[2], ivar_type(of(f, i.args[0]), i.args[1])
       when :gset then yield i.args[1], @consts[i.args[0]]
       when :call then i.args[1..].each_with_index { |v, k| yield v, i.args[0].ptypes[k] }
-      when :ret then yield i.args[0], f.rtype
-      when :phi then i.args.each { |(_, v)| yield v, i.ty }
+      when :ret then yield i.args[0], f.rtype unless f.result_unused
+      when :phi then i.args.each { |(_, v)| yield v, i.ty } unless f.result_unused && f.all.all? { |u| !(u.op == :phi ? u.args.map(&:last) : u.args).include?(i) || u.op == :ret }
       end
     end
 

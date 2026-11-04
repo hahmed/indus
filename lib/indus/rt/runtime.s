@@ -172,6 +172,7 @@ rt_itos:
         ret
 
 // rt_puts_str(x0 s): write(1, s, len); write(1, "\n", 1)
+// rt_puts_str(x0 s): write s, then a newline unless s already ends in one (Ruby's puts)
 rt_puts_str:
         stp     x29, x30, [sp, #-48]!
         str     x19, [sp, #16]
@@ -181,14 +182,20 @@ rt_puts_str:
         mov     x0, #1
         ldr     x16, [x27]
         blr     x16
-        mov     w3, #10
+        ldur    x2, [x19, #-8]
+        cbz     x2, 1f
+        sub     x2, x2, #1
+        ldrb    w3, [x19, x2]
+        cmp     w3, #10
+        b.eq    2f
+1:      mov     w3, #10
         add     x1, sp, #32             // scratch byte, above the saved registers
         strb    w3, [x1]
         mov     x2, #1
         mov     x0, #1
         ldr     x16, [x27]
         blr     x16
-        ldr     x19, [sp, #16]
+2:      ldr     x19, [sp, #16]
         ldp     x29, x30, [sp], #48
         ret
 

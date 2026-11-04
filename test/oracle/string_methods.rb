@@ -22,3 +22,10 @@ puts "az".succ
 puts "a".b.length
 puts "a-b-c".gsub("-", "+")
 puts "hello".gsub("l", "L")
+puts "  padded  ".strip + "|"
+puts "\t x\n".lstrip + "|"
+puts "x  \n".rstrip + "|"
+puts "".strip + "|"
+puts "abcabc".index("c")
+puts "abcabc".index("c", 3)
+puts "abc".index("z").nil?
