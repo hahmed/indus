@@ -62,46 +62,21 @@ module Indus
       loop do
         changed = false
         set = ->(cur, nt, &w) { (w.call(join(cur, nt)); changed = true) if nt && join(cur, nt) != cur }
-        # a container that flows into a :dyn slot must itself hold :dyn elements, so that
-        # whoever unboxes it later finds tagged values: widen it at its origin
-        dynflow = ->(f, v, dest) {
-          next unless dest == :dyn && v.is_a?(Inst)
-          t = of(f, v)
-          nt = arr(t) ? [:arr, :dyn] : hsh(t) ? [:hash, :dyn, :dyn] : nil
-          next if nt.nil? || t == nt
-          v = v.args[0] while %i[aset hset].include?(v.op)
-          v.op == :param ? f.ptypes[f.params.index(v)] = nt : v.ty = nt; changed = true
-        }
-        # a plain string flowing into a :strbuf slot is wrapped in a cell at its origin
-        cellflow = ->(f, i, v, dest) {
-          next unless dest == :strbuf && v.is_a?(Inst) && of(f, v) == :str
-          make_cell(f, v, i); changed = true
-        }
         funcs.each do |f|
           f.all.each do |i|
-            case i.op
-            when :aset then cellflow.(f, i, i.args[2], arr(of(f, i.args[0])) && of(f, i.args[0])[1])
-            when :hset then cellflow.(f, i, i.args[2], hsh(of(f, i.args[0])) && of(f, i.args[0])[2])
-            when :fld_set then cellflow.(f, i, i.args[2], ivar_type(of(f, i.args[0]), i.args[1]))
-            when :gset then cellflow.(f, i, i.args[1], @consts[i.args[0]])
-            when :ret then cellflow.(f, i, i.args[0], f.rtype)
-            when :phi then i.args.each { |(_, v)| cellflow.(f, i, v, i.ty) }
-            end
-            case i.op
-            when :aset then dynflow.(f, i.args[2], arr(of(f, i.args[0])) && of(f, i.args[0])[1])
-            when :hset then (dynflow.(f, i.args[1], hsh(of(f, i.args[0])) && of(f, i.args[0])[1]); dynflow.(f, i.args[2], hsh(of(f, i.args[0])) && of(f, i.args[0])[2]))
-            when :fld_set then dynflow.(f, i.args[2], ivar_type(of(f, i.args[0]), i.args[1]))
-            when :gset then dynflow.(f, i.args[1], @consts[i.args[0]])
-            when :call then i.args[1..].each_with_index { |v, k| dynflow.(f, v, i.args[0].ptypes[k]) }
-            when :ret then dynflow.(f, i.args[0], f.rtype)
-            when :phi then i.args.each { |(_, v)| dynflow.(f, v, i.ty) }
+            # a value entering a slot whose type is wider than its own: two representation
+            # changes happen at the value's *origin*, so a slot never mixes representations
+            each_flow(f, i) do |v, dest|
+              next unless v.is_a?(Inst)
+              changed = true if dest == :dyn && widen_elements_to_dyn(f, v)
+              changed = true if dest == :strbuf && of(f, v) == :str && make_cell(f, v, i)
             end
             bind(f, i) if i.op == :mcall
             # `s << v` where s is a parameter (or loop-carried from one): the caller must see the
             # growth, so the value becomes a stable handle (:strbuf, notes/32). The cell is one
             # word holding the current string; appends write through it, reads load through it.
             if i.op == :lshift_or_append && of(f, i.args[0]) == :str && (ao = alias_origin(i.args[0]))
-              make_cell(f, ao); changed = true
+              make_cell(f, ao, i); changed = true
             end
             if i.op == :lshift_or_append && of(f, i.args[0]) == :strbuf then i.op = :bufappend; i.ty = :strbuf; bufferize(f, i); changed = true end
             if i.op == :call # an argument flowing into a :strbuf parameter is made a stable handle at its origin
@@ -289,10 +264,43 @@ module Indus
       end
     end
 
-    # wrap the string v in a cell at its origin; every use of the origin now sees the cell
-    def self.make_cell(f, v, use = nil)
+    # every (value, slot type) pair where i stores a value into a typed slot:
+    # container elements, ivars, globals, call parameters, the return slot, phis
+    def self.each_flow(f, i)
+      case i.op
+      when :aset
+        t = of(f, i.args[0]); yield i.args[2], t[1] if arr(t)
+      when :hset
+        t = of(f, i.args[0]); (yield i.args[1], t[1]; yield i.args[2], t[2]) if hsh(t)
+      when :fld_set then yield i.args[2], ivar_type(of(f, i.args[0]), i.args[1])
+      when :gset then yield i.args[1], @consts[i.args[0]]
+      when :call then i.args[1..].each_with_index { |v, k| yield v, i.args[0].ptypes[k] }
+      when :ret then yield i.args[0], f.rtype
+      when :phi then i.args.each { |(_, v)| yield v, i.ty }
+      end
+    end
+
+    # a container flowing into a :dyn slot must hold :dyn elements itself, or whoever
+    # unboxes it later finds raw words. Widened at the container's origin. True if changed.
+    def self.widen_elements_to_dyn(f, v)
+      t = of(f, v)
+      nt = arr(t) ? [:arr, :dyn] : hsh(t) ? [:hash, :dyn, :dyn] : nil
+      return false if nt.nil? || t == nt
+      v = v.args[0] while %i[aset hset].include?(v.op)
+      v.op == :param ? f.ptypes[f.params.index(v)] = nt : v.ty = nt
+      true
+    end
+
+    # replace v by w in one instruction's operands (phi operands are [pred, value] pairs)
+    def self.swap_operand(i, v, w)
+      i.op == :phi ? i.args.map! { |(bb, x)| [bb, x == v ? w : x] } : i.args.map! { |a| a == v ? w : a }
+    end
+
+    # wrap the string v in a cell at its origin; every use of the origin now sees the cell.
+    # `use` is the instruction that wanted the cell. Returns the cell.
+    def self.make_cell(f, v, use)
       if v.op == :bufderef # already a cell: hand the cell itself to this use
-        use.args.map! { |a| a == v ? v.args[0] : a } if use
+        swap_operand(use, v, v.args[0])
         return v.args[0]
       end
       o = v; o = o.args[0] while %i[sappend scat lshift_or_append].include?(o.op) && o.args[0].ty == :str && !FRESH_ORIGINS.include?(o.op)
@@ -338,7 +346,7 @@ module Indus
         end
         d = Inst.new(:bufderef, [v]); d.ty = :str; d.block = u.block
         u.block.insts.insert(u.block.insts.index(u), d)
-        u.args.map! { |a| a == v ? d : a }
+        swap_operand(u, v, d)
       end
     end
 
