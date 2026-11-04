@@ -12,7 +12,7 @@ pass=0; fail=0
 run() { timeout -k 2 60 env "$@" 2>/dev/null; }
 for f in "${files[@]}"; do
   exp="${f%.rb}.expected"
-  if [ -f "$exp" ]; then want=$(cat "$exp"); else want=$(ruby --disable-gems "$f" 2>&1); fi
+  if [ -f "$exp" ]; then want=$(cat "$exp"); else want=$(ruby --disable-gems "$f" 2>/dev/null); fi   # stdout is the truth, for both
   for mode in "" "INDUS_HEAP_MB=2"; do
     got=$(run $mode bin/indus "$f")
     if [ "$want" == "$got" ]; then pass=$((pass+1)); else
