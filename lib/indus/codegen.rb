@@ -188,6 +188,7 @@ module Indus
         when :rawld then @asm.ldr_off(d, reg(i.args[0]), 0)
         when :rawld8 then @asm.emit(0x38606800 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d)   # ldrb wd, [s, i]
         when :rawst8 then @asm.emit(0x38206800 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | reg(i.args[2], 10)) # strb
+        when :salloc then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_str_alloc); @asm.mov(d, 0)
         when :sdup then @asm.mov(0, reg(i.args[0], 0)); @asm.ldur(1, 0, -8); @asm.bl(:rt_str_new); @asm.mov(d, 0)
         when :rawld32 then @asm.emit(0xB9400000 | (reg(i.args[0]) << 5) | d)      # ldr wd, [xn]
         when :rawst then @asm.str_off(reg(i.args[1], 9), reg(i.args[0]), 0)

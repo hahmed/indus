@@ -422,10 +422,16 @@ def __str_succ(s)
 end
 
 def __str_times(s, n)
-  out = ""
+  __trap if n < 0
+  len = s.length
+  out = __salloc(len * n)
   i = 0
   while i < n
-    out = out + s
+    j = 0
+    while j < len
+      __st8(out, i * len + j, __ld8(s, j))
+      j = j + 1
+    end
     i = i + 1
   end
   out

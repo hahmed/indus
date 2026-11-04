@@ -626,6 +626,7 @@ module Indus
       when :__ld8 then emit(:rawld8, [expr(args[0]), expr(args[1])])          # byte i of string s
       when :__st8 then (a = expr(args[0]); ix = expr(args[1]); v = expr(args[2]); emit(:rawst8, [a, ix, v]); v)
       when :__sdup then emit(:sdup, [expr(args[0])])
+      when :__salloc then emit(:salloc, [expr(args[0])])                    # a fresh string of n bytes, contents undefined
       when :__st then (a = expr(args[0]); v = expr(args[1]); emit(:rawst, [a, v]); v)
       when :__gbase then emit(:gbase, [])
       when :__adr_tables then emit(:adrlbl, [:__gc_tables])

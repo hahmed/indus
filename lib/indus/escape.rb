@@ -145,7 +145,7 @@ module Indus
       body
     end
 
-    OWN_ALLOC = %i[onew anew hnew sconst scat sappend itos ssub chr sdup mkbuf box aset hset bufappend].freeze
+    OWN_ALLOC = %i[onew anew hnew sconst scat sappend itos ssub chr sdup salloc mkbuf box aset hset bufappend].freeze
     def self.region_safe?(f, h, body)
       fresh = {} # heap-typed values defined this iteration (may be fresh: used to detect leaks)
       body.each_key { |b| (b.phis + b.insts).each { |i| fresh[i] = true if heap?(i.ty) && !(b == h && i.op == :phi) } }

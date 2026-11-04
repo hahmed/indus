@@ -550,7 +550,7 @@ module Indus
       case i.op
       when :const then %i[nil sym bool lambda].include?(i.ty) ? i.ty : :int
       when :fconst then :float
-      when :sconst, :scat, :sappend, :itos, :bool_to_s, :chr, :sdup then :str
+      when :sconst, :scat, :sappend, :itos, :bool_to_s, :chr, :sdup, :salloc then :str
       when :rawld8 then :int
       when :mkbuf, :bufappend then :strbuf
       when :bufderef then :str

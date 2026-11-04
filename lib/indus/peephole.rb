@@ -9,7 +9,7 @@
 #    becomes an in-place append: O(n) instead of O(n^2) per build.
 module Indus
   module Peephole
-    FRESH = %i[sconst scat sappend ssub itos].freeze
+    FRESH = %i[sconst scat sappend ssub itos sdup salloc chr].freeze
     READERS = %i[scat sappend seq seq_char alen ssub puts_str phi].freeze # uses that do not alias the string
 
     def self.run(f)

@@ -56,6 +56,18 @@ rt_str_new:
         ldp     x29, x30, [sp], #32
         ret
 
+// rt_str_alloc(x0 len) -> handle of an uninitialised string of len bytes
+rt_str_alloc:
+        stp     x29, x30, [sp, #-32]!
+        str     x19, [sp, #16]
+        mov     x19, x0
+        bl      rt_alloc
+        stur    x19, [x0, #-16]
+        stur    x19, [x0, #-8]
+        ldr     x19, [sp, #16]
+        ldp     x29, x30, [sp], #32
+        ret
+
 // rt_str_cat(x0 a, x1 b) -> new handle a+b
 rt_str_cat:
         stp     x29, x30, [sp, #-48]!
