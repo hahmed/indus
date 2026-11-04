@@ -419,6 +419,11 @@ module Indus
           @asm.cbz(reg(i.args[0]), f_); @asm.adr(0, :__true); @asm.mov_imm(1, 4); @asm.b(dn); @asm.label(f_); @asm.adr(0, :__false); @asm.mov_imm(1, 5); @asm.label(dn)
           @asm.bl(:rt_str_new); @asm.mov(d, 0)
         when :puts_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_puts_str)
+        when :sys # libc call by name, integer args/result (in-process)
+          name, *a = i.args
+          addr = @asm.libm&.[](name) or raise "File I/O needs libc; not available in a standalone binary yet"
+          a.each_with_index { |v, k| @asm.mov(k, reg(v, k)) }
+          @asm.mov_imm(16, addr); @asm.blr(16); @asm.mov(d, 0)
         when :eputs_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_eputs_str)
         when :clock # clock_gettime(CLOCK_MONOTONIC, &ts) in-process; seconds + nanos * 1e-9
           addr = @asm.libm&.[](:clock_gettime) or raise "Process.clock_gettime needs libc; not available in a standalone binary yet"

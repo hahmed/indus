@@ -21,6 +21,9 @@ module Indus
       mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
       mod_ivars = mods.flat_map { |m| (m.body&.body || []).grep(Prism::InstanceVariableWriteNode).map { [m.constant_path.name, _1] } }
       defs = body.grep(Prism::DefNode)
+      # top-level define_method(:name) { |params| body } with a literal symbol and block: a def
+      dm = body.select { |st| st.is_a?(Prism::CallNode) && st.name == :define_method && st.receiver.nil? && st.block.is_a?(Prism::BlockNode) && st.arguments&.arguments&.first.is_a?(Prism::SymbolNode) }
+      body = body - dm
       cdefs = body.grep(Prism::ClassNode) + mod_classes
       # `def self.m` in a class or module body: a function named Owner.m, no self
       @modules = mods.map { _1.constant_path.name }
@@ -37,6 +40,13 @@ module Indus
       @yielders = {} # name -> [klass or nil, def]
       defs.each { |d| @yielders[d.name] = [nil, d] if yields?(d) }
       @defs_by_func = {}
+      @dm_bodies = {}
+      dm.each do |st|
+        name = st.arguments.arguments.first.unescaped.to_sym
+        params = st.block.parameters&.parameters&.requireds&.map(&:name) || []
+        f = @funcs[name] = Func.new(name, params.size)
+        @dm_bodies[f] = [params, st.block.body&.body || []]
+      end
       sdefs.each do |owner, d|
         ps = d.parameters
         f = @funcs[:"#{owner}.#{d.name}"] = Func.new(:"#{owner}.#{d.name}", (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0))
@@ -82,6 +92,7 @@ module Indus
       main = Func.new(:main, 0)
       lower_body(main, [], top)
       defs.each { |d| lower_body(@funcs[d.name], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || []) if @funcs[d.name] }
+      @dm_bodies.each { |f, (params, stmts)| lower_body(f, params, stmts) }
       sdefs.each do |owner, d|
         @owner = owner
         lower_body(@funcs[:"#{owner}.#{d.name}"], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || [])
@@ -539,7 +550,7 @@ module Indus
         else emit(:putc, [expr(a)]) end
       elsif n.name == :puts && n.receiver.is_a?(Prism::GlobalVariableReadNode) && n.receiver.name == :$stderr && args.size == 1
         emit(:eputs_v, [expr(args[0])])  # $stderr.puts x
-      elsif n.name == :puts
+      elsif n.name == :puts && (n.receiver.nil? || n.receiver.is_a?(Prism::GlobalVariableReadNode) && n.receiver.name == :$stdout || n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :STDOUT)
         a = args[0]
         if a.is_a?(Prism::StringNode) then emit(:puts_s, [a.unescaped])
         else emit(:puts_v, [expr(a)]) end # Types picks puts_i / puts_str
@@ -587,6 +598,8 @@ module Indus
       elsif (n.name == :even? || n.name == :odd?) && args.empty? && n.receiver
         emit(:cmp, [emit(:and, [expr(n.receiver), const(1)]), const(0)], n.name == :even? ? :eq : :ne)
       elsif n.name == :chr && args.empty? && n.receiver then emit(:chr, [expr(n.receiver)])
+      elsif n.name == :delete && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :File
+        emit(:call, [@funcs.fetch(:__file_delete), expr(args[0])])
       elsif n.name == :clock_gettime && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Process
         emit(:clock, [])                 # Process.clock_gettime(any clock): monotonic seconds as a Float
       elsif n.name == :round && args.size == 1 && n.receiver
@@ -685,6 +698,13 @@ module Indus
       when :__ld8 then emit(:rawld8, [expr(args[0]), expr(args[1])])          # byte i of string s
       when :__st8 then (a = expr(args[0]); ix = expr(args[1]); v = expr(args[2]); emit(:rawst8, [a, ix, v]); v)
       when :__sdup then emit(:sdup, [expr(args[0])])
+      # the five file primitives, libc in-process (a standalone binary needs the syscalls; refused until then)
+      when :__sys_open then emit(:sys, [:open, expr(args[0]), expr(args[1])])   # open(path, O_RDONLY): no mode (libc open is variadic; Apple arm64 passes variadic args on the stack)
+      when :__sys_creat then emit(:sys, [:creat, expr(args[0]), expr(args[1])]) # creat(path, mode) = open(path, O_WRONLY|O_CREAT|O_TRUNC, mode), not variadic
+      when :__sys_read then emit(:sys, [:read, expr(args[0]), expr(args[1]), expr(args[2])])
+      when :__sys_write then emit(:sys, [:write, expr(args[0]), expr(args[1]), expr(args[2])])
+      when :__sys_close then emit(:sys, [:close, expr(args[0])])
+      when :__sys_unlink then emit(:sys, [:unlink, expr(args[0])])
       when :__salloc then emit(:salloc, [expr(args[0])])                    # a fresh string of n bytes, contents undefined
       when :__st then (a = expr(args[0]); v = expr(args[1]); emit(:rawst, [a, v]); v)
       when :__gbase then emit(:gbase, [])
@@ -748,6 +768,19 @@ module Indus
         return @locals.delete(outv)
       when :times then counted_loop(const(0), expr(recv), :lt, params, body)
       when :upto then counted_loop(expr(recv), expr(args[0]), :le, params, body)
+      when :open # File.open(path, mode) { |f| ... }: f is the descriptor, closed after the block
+        raise "block passed to #{recv&.name}.open" unless recv.is_a?(Prism::ConstantReadNode) && recv.name == :File
+        fd = emit(:call, [@funcs.fetch(:__file_open), expr(args[0]), args[1] ? expr(args[1]) : emit(:sconst, ["r"])])
+        pfx = :"blk#{@f.blocks.size}:"
+        @locals[:"#{pfx}#{params[0]}"] = fd if params[0]
+        @blk_pfx = (@blk_pfx || []) << pfx
+        body.each { expr(_1) }
+        @blk_pfx.pop
+        @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
+        return emit(:call, [@funcs.fetch(:__file_close), fd])
+      when :each_line # fd.each_line { |line| }: the whole file, split keeping each newline
+        lines = emit(:call, [@funcs.fetch(:__fd_lines), expr(recv)])
+        return array_loop(lines, :each, params, body)
       when :sort_by, :min_by, :max_by # Schwartzian: keys once by `map`, then the prelude sorts/selects by key
         arr = expr(recv)
         keys = array_loop(arr, :map, params, body)

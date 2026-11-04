@@ -602,3 +602,66 @@ end
 def __float_round0(f)
   f >= 0.0 ? (f + 0.5).to_i : 0 - (0.0 - f + 0.5).to_i
 end
+
+# Files. A file is a descriptor (an Integer); File.open yields it and closes it after
+# the block. Paths go to libc NUL-terminated.
+def __cstr(s)
+  s + "\0"
+end
+
+def __file_open(path, mode)
+  fd = mode == "w" ? __sys_creat(__cstr(path), 420) : __sys_open(__cstr(path), 0)
+  __trap if fd < 0
+  fd
+end
+
+def __file_close(fd)
+  __sys_close(fd)
+  0
+end
+
+def __file_delete(path)
+  __sys_unlink(__cstr(path))
+end
+
+def __fd_write(fd, s)
+  __sys_write(fd, s, s.length)
+end
+
+def __fd_puts(fd, s)
+  __sys_write(fd, s, s.length)
+  __sys_write(fd, "\n", 1) unless s.length > 0 && __ld8(s, s.length - 1) == 10
+  0
+end
+
+def __fd_close(fd)
+  __sys_close(fd)
+end
+
+def __fd_read_all(fd)
+  out = ""
+  buf = __salloc(65536)
+  n = __sys_read(fd, buf, 65536)
+  while n > 0
+    out = out + buf[0, n]
+    n = __sys_read(fd, buf, 65536)
+  end
+  out
+end
+
+# each_line: lines keep their newline, like Ruby
+def __fd_lines(fd)
+  s = __fd_read_all(fd)
+  out = []
+  start = 0
+  i = 0
+  while i < s.length
+    if __ld8(s, i) == 10
+      out.push(s[start, i + 1 - start])
+      start = i + 1
+    end
+    i = i + 1
+  end
+  out.push(s[start, s.length - start]) if start < s.length
+  out
+end

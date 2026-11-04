@@ -575,6 +575,9 @@ module Indus
         i.op = :pcall; i.args = [arms, recv, *args]
         return
       end
+      if t == :int && (fn = @lower.funcs[:"__fd_#{name}"]) # a file descriptor is an Integer: fd.puts, fd.write, fd.close
+        i.op = :call; i.args = [fn, recv, *args]; return
+      end
       if t == :int && %i[succ pred].include?(name) && args.empty? # Integer#succ / #pred
         c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
         i.op = name == :succ ? :add : :sub; i.args = [recv, c]; return
@@ -695,7 +698,7 @@ module Indus
       when :mkbuf, :bufappend then :strbuf
       when :bufderef then :str
       when :apop then (t = of(f, a[0])) && arr(t) ? t[1] : nil
-      when :hcap, :gcepoch, :hsave then :int
+      when :hcap, :gcepoch, :hsave, :sys then :int
       when :hkey_at then (t = of(f, a[0])) && hsh(t) ? t[1] : nil
       when :hval_at then (t = of(f, a[0])) && hsh(t) ? t[2] : nil
       when :seq, :sne, :scmp then :bool
