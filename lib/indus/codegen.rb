@@ -391,8 +391,11 @@ module Indus
         when :aget # out of range (incl. negative, via unsigned compare) -> nil (0)
           a, ix = i.args
           @asm.fmov_imm(d, 0.0) if i.float?             # the nil default first: its mov_imm uses x8
-          ra = reg(a); ri = reg(ix, 9)
-          @asm.ldur(16, ra, -8); @asm.cmp(ri, 16)      # x16: len (x8/x9 may hold ra/ri)
+          ra = reg(a); ri = reg(ix, 9)                  # ra may be x8 (a spill load), ri x9: work in x16/x17
+          @asm.ldur(17, ra, -8)                         # x17: len (d is written last, so d == x17 is fine)
+          @asm.mov(16, ri); ri = 16                     # a negative index counts from the end (Ruby)
+          @asm.emit(0xB6F80050); @asm.emit(0x8B110210)   # tbz x16, #63, +8 ; add x16, x16, x17
+          @asm.cmp(ri, 17)
           skip = @asm.uniq
           if i.float? then @asm.bhs(skip); @asm.fldr_idx(d, ra, ri)
           else

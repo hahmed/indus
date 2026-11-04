@@ -741,3 +741,225 @@ module Comparable
   def ==(other) = (self <=> other) == 0
   def between?(lo, hi) = self >= lo && self <= hi
 end
+
+def __num_even_p(n) = n % 2 == 0
+def __num_odd_p(n) = n % 2 != 0
+def __num_abs(n) = n < 0 ? 0 - n : n
+def __num_zero_p(n) = n == 0
+
+def __arr_sum(a)
+  t = 0
+  i = 0
+  while i < a.length
+    t = t + a[i]
+    i = i + 1
+  end
+  t
+end
+
+def __arr_uniq(a)
+  out = []
+  i = 0
+  while i < a.length
+    j = 0
+    seen = false
+    while j < out.length
+      seen = true if out[j] == a[i]
+      j = j + 1
+    end
+    out.push(a[i]) unless seen
+    i = i + 1
+  end
+  out
+end
+
+def __arr_include_p(a, x)
+  i = 0
+  while i < a.length
+    return true if a[i] == x
+    i = i + 1
+  end
+  false
+end
+
+def __arr_index(a, x)
+  i = 0
+  while i < a.length
+    return i if a[i] == x
+    i = i + 1
+  end
+  nil
+end
+
+def __arr_reverse(a)
+  out = []
+  i = a.length - 1
+  while i >= 0
+    out.push(a[i])
+    i = i - 1
+  end
+  out
+end
+
+def __arr_first(a) = a[0]
+def __arr_last(a) = a[a.length - 1]
+
+def __arr_take(a, n)
+  out = []
+  i = 0
+  while i < n && i < a.length
+    out.push(a[i])
+    i = i + 1
+  end
+  out
+end
+
+def __arr_join(a, sep)
+  out = ""
+  i = 0
+  while i < a.length
+    out = out + sep if i > 0
+    out = out + a[i].to_s
+    i = i + 1
+  end
+  out
+end
+
+def __str_reverse(s)
+  out = __salloc(s.length)
+  i = 0
+  while i < s.length
+    __st8(out, i, __ld8(s, s.length - 1 - i))
+    i = i + 1
+  end
+  out
+end
+
+def __str_upcase(s)
+  out = __sdup(s)
+  i = 0
+  while i < out.length
+    c = __ld8(out, i)
+    __st8(out, i, c - 32) if c >= 97 && c <= 122
+    i = i + 1
+  end
+  out
+end
+
+def __str_downcase(s)
+  out = __sdup(s)
+  i = 0
+  while i < out.length
+    c = __ld8(out, i)
+    __st8(out, i, c + 32) if c >= 65 && c <= 90
+    i = i + 1
+  end
+  out
+end
+
+def __str_capitalize(s)
+  out = __str_downcase(s)
+  if out.length > 0
+    c = __ld8(out, 0)
+    __st8(out, 0, c - 32) if c >= 97 && c <= 122
+  end
+  out
+end
+
+# tr with single characters or simple sets (no ranges yet)
+def __str_tr(s, from, to)
+  out = __sdup(s)
+  i = 0
+  while i < out.length
+    j = 0
+    while j < from.length
+      if __ld8(out, i) == __ld8(from, j)
+        __st8(out, i, __ld8(to, j < to.length ? j : to.length - 1))
+        j = from.length
+      end
+      j = j + 1
+    end
+    i = i + 1
+  end
+  out
+end
+
+def __str_chars(s)
+  out = []
+  i = 0
+  while i < s.length
+    out.push(s[i, 1])
+    i = i + 1
+  end
+  out
+end
+
+def __str_sub(s, pat, rep)
+  at = __str_index_from(s, pat, 0)
+  return __sdup(s) if at < 0
+  s[0, at] + rep + s[at + pat.length, s.length - at - pat.length]
+end
+
+def __str_count(s, set)
+  n = 0
+  i = 0
+  while i < s.length
+    j = 0
+    while j < set.length
+      n = n + 1 if __ld8(s, i) == __ld8(set, j)
+      j = j + 1
+    end
+    i = i + 1
+  end
+  n
+end
+
+def __str_ljust1(s, w) = __str_ljust(s, w, " ")
+def __str_rjust1(s, w) = __str_rjust(s, w, " ")
+def __str_center1(s, w) = __str_center(s, w, " ")
+
+def __str_ljust(s, w, pad)
+  out = __sdup(s)
+  out = out + pad while out.length < w
+  out
+end
+
+def __str_rjust(s, w, pad)
+  out = __sdup(s)
+  out = pad + out while out.length < w
+  out
+end
+
+def __str_center(s, w, pad)
+  out = __sdup(s)
+  left = true
+  while out.length < w
+    out = left ? out + pad : pad + out
+    left = !left
+  end
+  out
+end
+
+# Symbols are small integers at run time; SYMBOL_NAMES (built at the top of main) has their names
+def __sym_name(id) = SYMBOL_NAMES[id]
+def __sym_inspect(id) = ":" + SYMBOL_NAMES[id]
+
+def __hash_values(h)
+  out = []
+  i = 0
+  while i < __hcount(h)
+    out.push(__hval_at(h, i))
+    i = i + 1
+  end
+  out
+end
+
+def __hash_fetch(h, k)
+  __trap unless __hkey_p(h, k) # KeyError
+  h[k]
+end
+
+def __hash_key_p(h, k) = __hkey_p(h, k)
+def __hash_has_key_p(h, k) = __hkey_p(h, k)
+def __hash_include_p(h, k) = __hkey_p(h, k)
+def __hash_empty_p(h) = __hcount(h) == 0

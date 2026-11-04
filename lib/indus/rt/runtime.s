@@ -540,7 +540,9 @@ rt_hash_keys:
 // rt_str_sub(x0 s, x1 start, x2 len) -> new string, or 0 if start is out of range
 rt_str_sub:
         ldur    x3, [x0, #-8]
-        cmp     x1, x3
+        tbz     x1, #63, 0f
+        add     x1, x1, x3              // a negative start counts from the end
+0:      cmp     x1, x3
         b.hi    9f                      // start > len (unsigned: negatives too)
         sub     x3, x3, x1
         cmp     x2, x3

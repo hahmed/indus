@@ -180,8 +180,13 @@ module Indus
               if i.op == :alen && of(f, i.args[0]) == :dyn # length of a tagged value: by tag
                 i.op = :call; i.args = [fn(:__dyn_length), i.args[0]]; i.ty = :int; changed = true
               end
+              if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :sym # puts :a -> "a"; p :a -> ":a"
+                c = Inst.new(:call, [fn(i.op == :p_v ? :__sym_inspect : :__sym_name), i.args[0]]); c.ty = :str; c.block = i.block
+                i.block.insts.insert(i.block.insts.index(i), c); i.args = [c]; i.op = i.op == :print_v ? :print_str : :puts_str; changed = true
+              end
               if i.op == :to_s && (t = of(f, i.args[0])) # to_s by type; a prelude call must be made here, so it gets typed
                 case t
+                when :sym then i.op = :call; i.args = [fn(:__sym_name), i.args[0]]; i.ty = :str; changed = true
                 when :str then i.op = :nop; changed = true
                 when :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]; i.ty = :str; changed = true
                 when :bool then i.op = :bool_to_s; changed = true
@@ -622,6 +627,7 @@ module Indus
       when :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]
       when :int, :int? then i.op = :itos
       when :bool then i.op = :bool_to_s
+      when :sym then i.op = :call; i.args = [fn(:__sym_inspect), i.args[0]]
       else
         if arr(t) then i.op = :call; i.args = [fn(:__arr_inspect), i.args[0]]
         else raise "inspect of #{t.inspect} not supported" end
@@ -647,13 +653,23 @@ module Indus
       if name == :<=> && (t == :int || t == :str || t == :float)
         i.op = :call; i.args = [fn(t == :str ? :__str_spaceship : :__num_spaceship), recv, *args]; return
       end
+      t = :int if t == :int? # a nullable int used as a receiver: nil would have raised
+      if t == :int && name == :to_s && args.empty? then i.op = :itos; i.args = [recv]; return end
+      if hsh(t) && (fn = fnq(:"__hash_#{name.to_s.sub('?', '_p')}")) # Hash methods in the prelude
+        i.op = :call; i.args = [fn, recv, *args]; return
+      end
+      if (t == :int || t == :float) && (fn = fnq(:"__num_#{name.to_s.sub('?', '_p')}")) # Integer / Float methods in the prelude
+        i.op = :call; i.args = [fn, recv, *args]; return
+      end
       if t == :int && %i[succ pred].include?(name) && args.empty? # Integer#succ / #pred
         c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
         i.op = name == :succ ? :add : :sub; i.args = [recv, c]; return
       end
-      if t == :str && (fn = fnq(:"__str_#{name.to_s.sub('?', '_p')}")) # String methods written in the prelude
+      # prelude methods take no optional parameters: an arity-suffixed name (__str_rjust1) serves the shorter call
+      if t == :str && (fn = fnq(:"__str_#{name.to_s.sub('?', '_p')}#{args.size}") || fnq(:"__str_#{name.to_s.sub('?', '_p')}")) # String methods written in the prelude
         i.op = :call; i.args = [fn, recv, *args]; return
       end
+      if arr(t) && name == :to_a && args.empty? then i.op = :nop; i.args = [recv]; i.ty = t; return end
       if arr(t) && (fn = fnq(:"__arr_#{name.to_s.sub('?', '_p')}") || fnq(:"__arr_#{name}"))
         i.op = :call; i.args = [fn, recv, *args]; return
       end
