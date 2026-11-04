@@ -419,6 +419,17 @@ module Indus
           @asm.cbz(reg(i.args[0]), f_); @asm.adr(0, :__true); @asm.mov_imm(1, 4); @asm.b(dn); @asm.label(f_); @asm.adr(0, :__false); @asm.mov_imm(1, 5); @asm.label(dn)
           @asm.bl(:rt_str_new); @asm.mov(d, 0)
         when :puts_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_puts_str)
+        when :eputs_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_eputs_str)
+        when :clock # clock_gettime(CLOCK_MONOTONIC, &ts) in-process; seconds + nanos * 1e-9
+          addr = @asm.libm&.[](:clock_gettime) or raise "Process.clock_gettime needs libc; not available in a standalone binary yet"
+          @asm.emit(0xD10043FF)                                  # sub sp, sp, #16
+          @asm.mov_imm(0, RUBY_PLATFORM.include?("darwin") ? 6 : 1); @asm.addi(1, 31, 0)
+          @asm.mov_imm(16, addr); @asm.blr(16)
+          @asm.emit(0xF94003E0); @asm.emit(0xF94007E1)          # ldr x0, [sp] ; ldr x1, [sp, #8]
+          @asm.emit(0x910043FF)                                  # add sp, sp, #16
+          @asm.scvtf(0, 0); @asm.scvtf(1, 1); @asm.fmov_imm(2, 1e-9)
+          @asm.emit(0x1E620821)                                  # fmul d1, d1, d2
+          @asm.emit(0x1E612800 | d)                              # fadd d, d0, d1
         when :hnew then @asm.mov_imm(0, 8); @asm.bl(:rt_hash_new); @asm.mov(d, 0)
         when :hget, :hkey, :hset
           kt = i.args[0].ty&.[](1) or raise "hash #{i.args[0]} has no key type in #{@f.name}"

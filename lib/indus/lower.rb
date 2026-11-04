@@ -200,6 +200,23 @@ module Indus
 
     def struct_new?(v) = v.is_a?(Prism::CallNode) && v.name == :new && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Struct
 
+    public
+    # A prelude generic (`__arr_sort_by(a, keys)`) is Ruby over whatever element type its
+    # caller has; two callers with different types get two copies. Re-lower the def into
+    # a fresh Func; Types infers the copy against the new call's types.
+    def instantiate(f)
+      d = @defs_by_func.fetch(f)
+      @instances ||= Hash.new(0); n = @instances[f.name] += 1
+      g = Func.new(:"#{f.name}$#{n}", f.params.size)
+      @defs_by_func[g] = d
+      saved = [@f, @locals, @cur, @klass, @ct, @owner]
+      lower_body(g, (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || [])
+      @f, @locals, @cur, @klass, @ct, @owner = saved
+      prune(g)
+      g
+    end
+    private
+
     def lower_body(f, names, stmts, klass = nil, ct = {})
       @f, @locals, @cur, @klass, @ct = f, names.zip(f.params).to_h, f.entry, klass, ct
       if f.name == :main && @mod_ivars # `module M; @x = 1; end` runs before the program
@@ -346,9 +363,17 @@ module Indus
       when Prism::LocalVariableOperatorWriteNode
         l = @locals.fetch(lname(n.name)); r = expr(n.value)
         @locals[lname(n.name)] = emit(ARITH.fetch(n.binary_operator), [l, r])
-      when Prism::MultiWriteNode # a, b = x, y  (evaluate all, then bind)
+      when Prism::MultiWriteNode # a, @b = x, y  (evaluate all, then bind each target)
         vals = n.value.elements.map { expr(_1) }
-        n.lefts.zip(vals).each { |t, v| @locals[t.name] = v }
+        n.lefts.zip(vals).each do |t, v|
+          case t
+          when Prism::LocalVariableTargetNode then @locals[lname(t.name)] = v
+          when Prism::InstanceVariableTargetNode
+            if @owner then emit(:gset, [:"#{@owner}#{t.name}", v])
+            else emit(:fld_set, [me_val, @klass.ivar(t.name), v]) end
+          else raise "unsupported assignment target #{t.class}"
+          end
+        end
         vals.last
       when Prism::BreakNode
         raise "break outside loop" unless @loop
@@ -560,6 +585,16 @@ module Indus
       elsif (n.name == :even? || n.name == :odd?) && args.empty? && n.receiver
         emit(:cmp, [emit(:and, [expr(n.receiver), const(1)]), const(0)], n.name == :even? ? :eq : :ne)
       elsif n.name == :chr && args.empty? && n.receiver then emit(:chr, [expr(n.receiver)])
+      elsif n.name == :clock_gettime && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Process
+        emit(:clock, [])                 # Process.clock_gettime(any clock): monotonic seconds as a Float
+      elsif n.name == :puts && n.receiver.is_a?(Prism::GlobalVariableReadNode) && n.receiver.name == :$stderr && args.size == 1
+        emit(:eputs_v, [expr(args[0])])  # $stderr.puts x
+      elsif n.name == :round && args.size == 1 && n.receiver
+        if args[0].is_a?(Prism::IntegerNode) && args[0].value <= 0 # x.round(0) is an Integer in Ruby
+          emit(:call, [@funcs.fetch(:__float_round0), expr(n.receiver)])
+        else
+          emit(:call, [@funcs.fetch(:__float_round), expr(n.receiver), expr(args[0])])
+        end
       elsif n.name == :raise && n.receiver.nil?
         emit(:trap, []); return const(0)  # no exceptions yet: die where Ruby would raise
       elsif n.name == :printf && n.receiver.nil? && args[0].is_a?(Prism::StringNode)
@@ -713,6 +748,10 @@ module Indus
         return @locals.delete(outv)
       when :times then counted_loop(const(0), expr(recv), :lt, params, body)
       when :upto then counted_loop(expr(recv), expr(args[0]), :le, params, body)
+      when :sort_by, :min_by, :max_by # Schwartzian: keys once by `map`, then the prelude sorts/selects by key
+        arr = expr(recv)
+        keys = array_loop(arr, :map, params, body)
+        return emit(:call, [@funcs.fetch(:"__arr_#{n.name}"), arr, keys])
       when :sum, :count # accumulate the block's value / truthiness
         accv = :"acc#{@f.blocks.size}:v"
         @locals[accv] = const(0)

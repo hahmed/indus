@@ -48,7 +48,7 @@ module Indus
     end
     def self.hsh(t) = t.is_a?(Array) && t[0] == :hash
 
-    def self.reset! = (@ivars = nil; @consts = nil)
+    def self.reset! = (@ivars = nil; @consts = nil; @instances = nil)
     # a snapshot of the program-wide tables, to detect a seam widening a type
     # that compiled code already relies on
     def self.snapshot = Marshal.load(Marshal.dump([@ivars.to_h { |k, v| [k, v.dup] }, @consts.dup]))
@@ -75,6 +75,11 @@ module Indus
               changed = true if dest == :strbuf && of(f, v) == :str && make_cell(f, v, i)
             end
             bind(f, i) if i.op == :mcall
+            if i.op == :call && generic?(i.args[0]) && clashes?(i.args[0], i.args[1..].map { of(f, _1) })
+              # another caller already shaped this prelude generic: this call gets its own copy
+              # (before infer, so the call's type never sees the other instance's result)
+              i.args[0] = instance_for(i.args[0], i.args[1..].map { of(f, _1) }, funcs); changed = true
+            end
             # `s << v` where s is a parameter (or loop-carried from one): the caller must see the
             # growth, so the value becomes a stable handle (:strbuf, notes/32). The cell is one
             # word holding the current string; appends write through it, reads load through it.
@@ -97,6 +102,17 @@ module Indus
             end
             dsend(f, i) if i.op == :dsend
             float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
+            if i.op == :eputs_v && (t = of(f, i.args[0])) # $stderr.puts: make it a string, then write to fd 2
+              c = case t
+                  when :str then i.args[0]
+                  when :float then Inst.new(:call, [@lower.funcs.fetch(:__float_to_s), i.args[0]])
+                  when :int, :int? then Inst.new(:itos, [i.args[0]])
+                  when :dyn then Inst.new(:call, [@lower.funcs.fetch(:__dyn_to_s), i.args[0]])
+                  else raise "$stderr.puts of #{t.inspect}"
+                  end
+              unless c.equal?(i.args[0]) then c.ty = :str; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c) end
+              i.op = :eputs_str; i.args = [c]
+            end
             # printing/inspecting by type is irreversible, so it waits for the types to settle (below)
             if i.op == :cmp && arr(of(f, i.args[0])) && arr(of(f, i.args[1])) && %i[eq ne].include?(i.cond) # Array#== is elementwise
               l, r = i.args; fn = @lower.funcs.fetch(:__arr_eq)
@@ -127,6 +143,9 @@ module Indus
             case i.op
             when :call
               callee = i.args[0]
+              if generic?(callee) && clashes?(callee, i.args[1..].map { of(f, _1) }) # a call rewritten into a generic this very visit
+                callee = i.args[0] = instance_for(callee, i.args[1..].map { of(f, _1) }, funcs); changed = true
+              end
               i.args[1..].each_with_index { |a, k| set.(callee.ptypes[k], of(f, a)) { callee.ptypes[k] = _1 } }
             when :pcall
               arms, recv, *args = i.args
@@ -227,7 +246,13 @@ module Indus
           end
           if of(f, l) == :int? && of(f, r) == :nil then r.args[0] = INT_NIL; r.ty = :int
           elsif of(f, r) == :int? && of(f, l) == :nil then l.args[0] = INT_NIL; l.ty = :int end
-        when :to_s then i.op = of(f, i.args[0]) == :str ? :nop : :itos
+        when :to_s
+          case of(f, i.args[0])
+          when :str then i.op = :nop
+          when :float then i.op = :call; i.args = [@lower.funcs.fetch(:__float_to_s), i.args[0]]; i.ty = :str
+          when :bool then i.op = :bool_to_s
+          else i.op = :itos
+          end
         when :to_i then i.op = :stoi if of(f, i.args[0]) == :str
         when :puts_v, :p_v, :print_v
           t = of(f, i.args[0])
@@ -309,6 +334,23 @@ module Indus
           i.block.insts.insert(i.block.insts.index(i), c); i.args = [c]
         end
         Passes.trivial_phis(f)
+      end
+    end
+
+    # prelude generics: top-level functions named __arr_* / __merge_*; one instance per
+    # distinct container type they are called with
+    def self.generic?(f) = f.name.to_s.start_with?("__arr_", "__merge_") && !f.cls
+    def self.clashes?(f, ts)
+      f.ptypes.zip(ts).any? { |cur, t| cur && t && cur != t && (arr(cur) || arr(t)) && join(cur, t) != cur && join(cur, t) != t || (cur && t && cur != t && join(cur, t) == :dyn) }
+    end
+    def self.instance_for(f, ts, funcs)
+      base = f.name.to_s.sub(/\$\d+$/, "")
+      @instances ||= {}
+      key = [base, ts.map { arr(_1) || hsh(_1) ? _1 : :_ }]
+      @instances[key] ||= begin
+        g = @lower.instantiate(f)
+        g.ptypes = Array.new(g.params.size); g.rtype = nil
+        Passes.trivial_phis(g); funcs << g; g
       end
     end
 
@@ -589,7 +631,8 @@ module Indus
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
       when :dsend then nil
-      when :to_f, :fsqrt, :libm then :float
+      when :to_f, :fsqrt, :libm, :clock then :float
+      when :eputs_v, :eputs_str then :int
       when :pow then join(narrow(of(f, a[0])), narrow(of(f, a[1]))) == :float ? :float : :int
       when :seq_char then :bool
       when :anew then (t = of(f, a[1])) && t != :nil ? [:arr, t] : [:arr, nil] # partial until a store

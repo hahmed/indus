@@ -57,7 +57,7 @@ module Indus
     asm.gc_table = GC::Table.new(lower.classes)
     asm.write_addr = Metal::LIBC["write"].to_i unless standalone
     asm.mmap_addr = Metal::LIBC["mmap"].to_i unless standalone
-    asm.libm = %i[sin cos pow].to_h { [_1, Metal::LIBC[_1.to_s].to_i] } unless standalone
+    asm.libm = %i[sin cos pow clock_gettime].to_h { [_1, Metal::LIBC[_1.to_s].to_i] } unless standalone
     asm.emit_start_linux if standalone == :linux
     funcs.each { Codegen.new(asm, lower.classes).func(_1) }
     asm.emit_runtime_blob

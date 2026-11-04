@@ -31,3 +31,17 @@ puts pt.x
 Rec = Struct.new(:v0, :v1, :v2, :levar)
 r = Rec.new(1, 2, 3, 1)
 puts r.v2 + r.levar
+class Swapper
+  attr_reader :a, :b, :c
+  def initialize
+    @a = 1
+    @b = 2
+    @c = 3
+  end
+  def rotate
+    @a, @b, @c = @b, @c, @a
+  end
+end
+s = Swapper.new
+s.rotate
+puts s.a + s.b * 10 + s.c * 100

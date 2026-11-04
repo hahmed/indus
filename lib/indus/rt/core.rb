@@ -503,3 +503,102 @@ def __arr_inspect(a)
   end
   out + "]"
 end
+
+# sort_by: a stable merge sort of the indices by key (keys computed once by the caller)
+def __arr_sort_by(a, keys)
+  n = a.length
+  idx = Array.new(n, 0)
+  tmp = Array.new(n, 0)
+  i = 0
+  while i < n
+    idx[i] = i
+    i = i + 1
+  end
+  width = 1
+  while width < n
+    lo = 0
+    while lo < n
+      mid = lo + width
+      hi = lo + width * 2
+      mid = n if mid > n
+      hi = n if hi > n
+      __merge_by(idx, tmp, keys, lo, mid, hi)
+      lo = hi
+    end
+    t = idx
+    idx = tmp
+    tmp = t
+    width = width * 2
+  end
+  out = Array.new(n, a[0])
+  i = 0
+  while i < n
+    out[i] = a[idx[i]]
+    i = i + 1
+  end
+  out
+end
+
+def __merge_by(idx, tmp, keys, lo, mid, hi)
+  i = lo
+  j = mid
+  k = lo
+  while k < hi
+    if i < mid && (j >= hi || keys[idx[i]] <= keys[idx[j]])
+      tmp[k] = idx[i]
+      i = i + 1
+    else
+      tmp[k] = idx[j]
+      j = j + 1
+    end
+    k = k + 1
+  end
+end
+
+def __arr_min_by(a, keys)
+  best = 0
+  i = 1
+  while i < a.length
+    best = i if keys[i] < keys[best]
+    i = i + 1
+  end
+  a[best]
+end
+
+def __arr_max_by(a, keys)
+  best = 0
+  i = 1
+  while i < a.length
+    best = i if keys[i] > keys[best]
+    i = i + 1
+  end
+  a[best]
+end
+
+def __arr_sort(a)
+  __arr_sort_by(a, a)
+end
+
+def __arr_min(a)
+  __arr_min_by(a, a)
+end
+
+def __arr_max(a)
+  __arr_max_by(a, a)
+end
+
+def __float_round(f, digits)
+  m = 1.0
+  i = 0
+  while i < digits
+    m = m * 10.0
+    i = i + 1
+  end
+  x = f * m
+  r = x >= 0.0 ? (x + 0.5).to_i : 0 - (0.0 - x + 0.5).to_i
+  r.to_f / m
+end
+
+def __float_round0(f)
+  f >= 0.0 ? (f + 0.5).to_i : 0 - (0.0 - f + 0.5).to_i
+end

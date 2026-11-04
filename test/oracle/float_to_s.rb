@@ -20,3 +20,10 @@ x = 0.1 + 0.2
 puts x
 puts 5e-324
 puts 1.7976931348623157e308
+x = 1.5
+puts "v=#{x}"
+puts "n=#{x.round(1)}"
+puts 3.14159.round(2)
+puts 2.5.round(0)
+puts (-1.2345).round(2)
+puts "b=#{1 < 2}"
