@@ -8,7 +8,7 @@ module Indus
       @gc_frames, @gc_globals = [], []
       global(:__write_fn) # offset 0: the runtime blob calls write through [x27]
       # fixed global slots the collector uses (offsets 8..)
-      %i[__gc_limit __gc_from __gc_from_end __gc_to __gc_to_end __gc_bitmap __gc_work __gc_count __gc_free __gc_wtop __mmap_fn __gc_extra].each { global(_1) }
+      %i[__gc_limit __gc_from __gc_from_end __gc_to __gc_to_end __gc_bitmap __gc_work __gc_count __gc_free __gc_wtop __mmap_fn __gc_extra __try_top].each { global(_1) }
       label(:__text_base)
     end
 

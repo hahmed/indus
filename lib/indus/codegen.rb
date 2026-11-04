@@ -39,6 +39,9 @@ module Indus
       # tier-0 objects live in the frame after the spill slots
       @stack_objs = {}; obj_base = @spill_base + ((nslots + 1) / 2) * 16
       f.all.each { |i| next unless i.op == :onew && i.stack; @stack_objs[i] = obj_base; obj_base += (([i.args[0].size, 8].max + 15) / 16) * 16 }
+      # handler records (begin/rescue): [link, sp, fp, x19..x26, resume] = 12 words, 16-aligned
+      @try_recs = {}
+      f.all.each { |i| next unless i.op == :try_push; @try_recs[i] = obj_base; obj_base += 96 }
       frame = obj_base
       raise "frame too large (#{frame})" if frame > 4080
       @asm.label(f.name)
@@ -114,6 +117,11 @@ module Indus
 
     def block(b)
       @asm.label(lbl(b))
+      if GC.enabled? && (push = @f.all.find { _1.op == :try_push && _1.args[0] == b })
+        # a handler: the exception is in x0 (first instruction is exc_value); live pointers reload from homes
+        d0 = dst(b.insts[0]); @asm.mov(d0, 0) if b.insts[0]&.op == :exc_value
+        handler_entry(push)
+      end
       b.insts.each do |i|
         d = dst(i)
         calls_before = @asm.ncalls || 0
@@ -195,6 +203,22 @@ module Indus
         when :gbase then @asm.mov(d, Asm::GBASE)
         when :trap then @asm.emit(0xD4200000) # brk #0: heap exhausted
         when :isa_tag then @asm.ldr_off(16, reg(i.args[0]), 0); @asm.cmpi(16, i.args[1]); @asm.cset(d, :eq)
+        when :isa_tags # class id in word 0 is one of several (a rescue matching a class and its descendants)
+          @asm.ldr_off(16, reg(i.args[0]), 0); @asm.mov_imm(d, 0); yes = @asm.uniq
+          i.args[1].each { |id| @asm.cmpi(16, id); @asm.bcond(:eq, yes) }
+          @asm.b(dn = @asm.uniq); @asm.label(yes); @asm.mov_imm(d, 1); @asm.label(dn)
+        when :try_push # install a handler record in this frame; the handler block reloads live pointers from their homes
+          off = @try_recs.fetch(i); hb = i.args[0]
+          @asm.ldr_off(16, Asm::GBASE, @asm.global(:__try_top)); @asm.str(16, off)       # link
+          @asm.emit(0x910003F0); @asm.str(16, off + 8); @asm.str(29, off + 16)             # mov x16, sp ; sp, fp
+          (19..26).each_with_index { |r, k| @asm.str(r, off + 24 + 8 * k) }
+          @asm.adr(16, lbl(hb)); @asm.str(16, off + 88)                                    # resume address
+          @asm.addi(16, 31, off); @asm.str_off(16, Asm::GBASE, @asm.global(:__try_top))  # top = this record
+        when :try_pop
+          off = @try_recs.fetch(i.args[0])
+          @asm.ldr(16, off); @asm.str_off(16, Asm::GBASE, @asm.global(:__try_top))
+        when :raise then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_raise)
+        when :exc_value then @asm.mov(d, 0) unless GC.enabled? # rt_raise lands here with the exception in x0 (GC mode: block entry did it, before the reloads)
         when :box # tag a typed value: see notes/29_tagged_scalars_design.md
           v, t = i.args; r = v.float? ? nil : reg(v)
           case t
@@ -324,7 +348,8 @@ module Indus
         when :ipow
           @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:__ipow); @asm.mov(d, 0)
         when :fld_get
-          o, ix = i.args; off = @classes.fetch(o.ty) { raise "fld_get on #{o} (#{o.op}) typed #{o.ty.inspect} in #{@f.name}" }.base + ix * 8
+          o, ix = i.args; kt = o.ty.is_a?(Array) && o.ty[0] == :poly ? o.ty[1][0] : o.ty # a poly set shares the field layout
+          off = @classes.fetch(kt) { raise "fld_get on #{o} (#{o.op}) typed #{o.ty.inspect} in #{@f.name}" }.base + ix * 8
           i.float? ? @asm.fldr_off(d, reg(o), off) : @asm.ldr_off(d, reg(o), off)
         when :fld_set
           o, ix, v = i.args; ro = reg(o); off = @classes[o.ty].base + ix * 8
@@ -500,6 +525,12 @@ module Indus
     end
 
     # live pointers go to their typed home slots around the collection check
+    # entry to a handler block: a collection inside the try may have moved what the record's
+    # registers point to; the frame homes are current, reload live pointers from them
+    def handler_entry(push)
+      (@safepoint_live[push] || []).each { |v| @asm.ldr(v.reg, @spill_base + 8 * v.home) if v.reg && v.home && GC.pointer?(v.ty) }
+    end
+
     def safepoint(i)
       live = (@safepoint_live[i] || []).select { |v| v.reg && v.home } # spilled ones are already in slots
       live.each { |v| @asm.str(v.reg, @spill_base + 8 * v.home) }

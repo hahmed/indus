@@ -55,7 +55,7 @@ module Indus
     end
 
     def self.needs_safepoint?(i)
-      return true if DIRECT_ALLOC.include?(i.op)
+      return true if DIRECT_ALLOC.include?(i.op) || i.op == :try_push # live pointers must have homes for the handler to reload
       case i.op
       when :call then i.args[0].allocates
       when :pcall, :sendsw then i.args[0].any? { |(_, kind, payload)| kind == :call && payload.allocates }

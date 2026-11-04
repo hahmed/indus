@@ -897,3 +897,22 @@ rt_chr:
         bl      rt_str_new
         ldp     x29, x30, [sp], #32
         ret
+
+// rt_raise(x0 exception): unwind to the top handler record. With no handler it
+// returns, and the compiled code after it calls __uncaught (prints, exits).
+// record: [link, sp, fp, x19..x26, resume]; top at [x27 + 104]
+rt_raise:
+        ldr     x16, [x27, #104]
+        cbz     x16, 1f
+        ldr     x17, [x16]
+        str     x17, [x27, #104]         // pop
+        ldr     x17, [x16, #8]
+        mov     sp, x17
+        ldr     x29, [x16, #16]
+        ldp     x19, x20, [x16, #24]
+        ldp     x21, x22, [x16, #40]
+        ldp     x23, x24, [x16, #56]
+        ldp     x25, x26, [x16, #72]
+        ldr     x17, [x16, #88]          // x27 (globals) and x28 (heap bump) are process state: not restored
+        br      x17
+1:      ret

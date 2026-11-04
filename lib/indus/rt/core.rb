@@ -690,3 +690,32 @@ def __dyn_length(v)
   __trap
   0
 end
+
+# Exceptions. raise "m" is RuntimeError.new("m"); rescue matches by class.
+class StandardError
+  attr_reader :message
+  def initialize(message = "unhandled exception")
+    @message = message
+  end
+end
+class RuntimeError < StandardError
+end
+class ArgumentError < StandardError
+end
+class TypeError < StandardError
+end
+class ZeroDivisionError < StandardError
+end
+class IndexError < StandardError
+end
+class KeyError < IndexError
+end
+class NoMethodError < StandardError
+end
+
+# nothing rescued it: Ruby prints the message to stderr and exits 1
+def __uncaught(e)
+  $stderr.puts e.message
+  __sys_exit(1)
+  0
+end

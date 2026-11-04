@@ -45,7 +45,7 @@ module Indus
       f.all.each do |i|
         case i.op
         when :fld_set then mark.(i.args[2])
-        when :box, :mkbuf then mark.(i.args[0]) # a tagged value / a cell's content is tracked no further
+        when :box, :mkbuf, :raise then mark.(i.args[0]) # a tagged value / a cell's content / an exception is tracked no further
         when :aset then mark.(i.args[2])
         when :hset then mark.(i.args[1]); mark.(i.args[2])
         when :gset then mark.(i.args[1])

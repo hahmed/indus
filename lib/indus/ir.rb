@@ -6,7 +6,7 @@ module Indus
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
     def term? = %i[br condbr ret].include?(op)
-    def call? = %i[call mcall pcall dsend sendsw puts_i puts_s puts_str eputs_str clock sys puts_bool puts_opt puts_nil puts_nil_word p_str print_i print_str putc anew aset onew ipow seam sconst scat sappend seq sne scmp itos stoi bool_to_s chr box sdup salloc mkbuf bufappend libm fpow hnew hget hset hkey hkeys ssub rawmmap].include?(op)
+    def call? = %i[call mcall pcall dsend sendsw puts_i puts_s puts_str eputs_str clock sys try_push raise puts_bool puts_opt puts_nil puts_nil_word p_str print_i print_str putc anew aset onew ipow seam sconst scat sappend seq sne scmp itos stoi bool_to_s chr box sdup salloc mkbuf bufappend libm fpow hnew hget hset hkey hkeys ssub rawmmap].include?(op)
     def float? = ty == :float
     def to_s = "v#{id}"
   end
@@ -18,11 +18,14 @@ module Indus
     def <<(i) = (i.block = self; insts << i; i)
     def phi = (p = Inst.new(:phi, []); p.block = self; phis << p; p)
     def succs
-      case term&.op
-      when :br then [term.args[0]]
-      when :condbr then term.args[1..2]
-      else []
-      end
+      edges = case term&.op
+              when :br then [term.args[0]]
+              when :condbr then term.args[1..2]
+              else []
+              end
+      # a handler block is entered by rt_raise, not by a branch: an edge for reachability
+      # and layout; the handler's locals come from the try's entry state (lowering), not phis
+      edges + insts.select { _1.op == :try_push }.map { _1.args[0] }
     end
   end
 

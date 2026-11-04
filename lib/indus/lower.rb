@@ -75,14 +75,18 @@ module Indus
         sup = c.superclass && @classes.fetch(c.superclass.name) { raise "superclass #{c.superclass.name} must be defined first" }
         k = @classes[c.constant_path.name] = Klass.new(c.constant_path.name, sup)
         k.id = @classes.size
+        # every @ivar this class body writes, registered now: a subclass declared below copies
+        # the parent's layout at declaration, before the parent's methods are lowered
+        assigned_ivars(c.body).each { k.ivar(_1) }
         (c.body&.body || []).each do |st|
           case st
           when Prism::DefNode
             next if st.receiver.is_a?(Prism::SelfNode) # Owner.m, registered above
             if yields?(st) then @yielders[st.name] = [k, st]; next end # inlined only
-            f = Func.new(:"#{k.name}##{st.name}", 1 + (st.parameters&.requireds&.size || 0) + (st.parameters&.rest ? 1 : 0))
-            f.rest = true if st.parameters&.rest
-            f.cls = k; k.methods[st.name] = f; methods << [k, st, f]
+            ps = st.parameters
+            f = Func.new(:"#{k.name}##{st.name}", 1 + (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0) + (ps&.rest ? 1 : 0))
+            f.rest = true if ps&.rest
+            f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
           when Prism::CallNode
             class_body_call(k, st, {}, methods)
           when Prism::ConstantWriteNode then nil # hoisted above
@@ -104,7 +108,7 @@ module Indus
       end
       methods.each do |k, d, f, names, body, ct|
         if d
-          names = [:self, *(d.parameters&.requireds&.map(&:name) || [])]
+          names = [:self, *def_param_names(d)]
           names << d.parameters.rest.name if d.parameters&.rest # *args arrives as an array
           lower_body(f, names, d.body&.body || [], k)
         else
@@ -219,6 +223,21 @@ module Indus
       end
     end
 
+    # arguments after self for a method call, defaults filled
+    def method_args(f, args)
+      vals = call_args_raw(f, args, 1)
+      vals
+    end
+
+    def call_args_raw(f, args, skip)
+      args = args.dup
+      kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
+      vals = args.map { expr(_1) }
+      return vals if f.rest
+      vals = fill_defaults(f, vals, kw) if (vals.size + skip < f.params.size || kw) && @defs_by_func[f]
+      vals
+    end
+
     # positional and keyword arguments for a call to f, defaults filled
     def call_args(f, args)
       args = args.dup
@@ -242,6 +261,65 @@ module Indus
       when Prism::InstanceVariableReadNode then r
       when Prism::CallNode then r if r.arguments.nil? && r.block.nil? && r.receiver # `obj.attr << v`: the slot becomes a cell (Types)
       end
+    end
+
+    def new_exception(cname, arg_nodes)
+      k = @classes.fetch(cname) { raise "unknown exception class #{cname}" }
+      o = emit(:onew, [k])
+      init = k.find_method(:initialize)
+      emit(:call, [init, o, *method_args(init, arg_nodes)]) if init
+      o
+    end
+
+    # begin body rescue K => e; handler end [ensure fin end]
+    # try_push installs the handler record; a raise inside the body (or any callee) lands at
+    # the handler block with the exception value; try_pop on the normal path.
+    def begin_expr(n)
+      stmts = n.statements&.body || []
+      rescues = []
+      r = n.rescue_clause
+      while r
+        rescues << r; r = r.subsequent
+      end
+      ensure_body = n.ensure_clause&.statements&.body || []
+      return (stmts + ensure_body).map { expr(_1) }.last || const(0) if rescues.empty? && ensure_body.empty?
+      hb, mb = @f.new_block(:handler), @f.new_block(:merge)
+      before = @locals.dup
+      tp = emit(:try_push, [hb])
+      bv = stmts.map { expr(_1) }.last || const(0)
+      emit(:try_pop, [tp])
+      ensure_body.each { expr(_1) }
+      bend, blocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
+      # the handler: the exception value, then rescue clauses by class
+      @cur = hb; @locals = before.dup
+      exc = emit(:exc_value, [])
+      arms = rescues.map do |rc|
+        classes = rc.exceptions.map { |c| c.is_a?(Prism::ConstantReadNode) ? c.name : raise("rescue needs a class name") }
+        classes = [:StandardError] if classes.empty?
+        test = classes.map { |cn| emit(:isa, [exc, cn]) }.reduce { |a, b| emit(:or, [a, b]) }
+        [test, rc]
+      end
+      ends = []
+      arms.each do |test, rc|
+        tb, nb = @f.new_block(:rescue), @f.new_block(:norescue)
+        emit(:condbr, [test, tb, nb])
+        @cur = tb; @locals = before.dup
+        @locals[lname(rc.reference.name)] = exc if rc.reference.is_a?(Prism::LocalVariableTargetNode)
+        rv = (rc.statements&.body || []).map { expr(_1) }.last || const(0)
+        ensure_body.each { expr(_1) }
+        ends << [@cur, @locals, rv] unless @cur.term
+        emit(:br, [mb]) unless @cur.term
+        @cur = nb; @locals = before.dup
+      end
+      # nothing matched: run ensure, re-raise (never returns here)
+      ensure_body.each { expr(_1) }
+      emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc])
+      ends << [@cur, before.dup, const(0)]; emit(:br, [mb])
+      @cur = mb
+      arms_all = [[bend, blocals, bv], *ends]
+      @locals = merge_locals(mb, arms_all.map { |(b, l, _)| [b, l] })
+      ph = mb.phi; ph.args = arms_all.map { |(b, _, v)| [b, v] }
+      ph
     end
 
     def struct_new?(v) = v.is_a?(Prism::CallNode) && v.name == :new && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Struct
@@ -341,6 +419,14 @@ module Indus
       when Prism::UnlessNode then if_expr(n, negate: true)
       when Prism::UntilNode then while_stmt(n, negate: true)
       when Prism::CaseNode then case_expr(n)
+      when Prism::BeginNode then begin_expr(n)
+      when Prism::SuperNode, Prism::ForwardingSuperNode # super(args) / super: the superclass's version of this method
+        raise "super outside a method" unless @klass && @f.cls
+        mname = @f.name.to_s.split("#").last.to_sym
+        sup = @klass.superclass&.find_method(mname) or raise "super: no #{mname} above #{@klass.name}"
+        args = n.is_a?(Prism::SuperNode) ? (n.arguments&.arguments || []) : @f.params[1..].map { nil }
+        vals = n.is_a?(Prism::SuperNode) ? method_args(sup, args) : @f.params[1..]
+        emit(:call, [sup, me_val, *vals])
       when Prism::LambdaNode then lambda_value(n)
       when Prism::ConstantPathNode then expr_const_path(n)
       when Prism::ModuleNode then raise "module in expression position"
@@ -612,7 +698,7 @@ module Indus
         k = @classes[n.receiver.name]
         obj = emit(:onew, [k])
         if (init = k.find_method(:initialize))
-          emit(:call, [init, obj, *args.map { expr(_1) }])
+          emit(:call, [init, obj, *method_args(init, args)])
         end
         obj
       elsif n.name == :class_eval && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
@@ -649,7 +735,13 @@ module Indus
           emit(:call, [demand(:__float_round), expr(n.receiver), expr(args[0])])
         end
       elsif n.name == :raise && n.receiver.nil?
-        emit(:trap, []); return const(0)  # no exceptions yet: die where Ruby would raise
+        # raise "m" -> RuntimeError.new("m"); raise K, "m" -> K.new("m"); raise obj -> obj
+        exc = if args.empty? then new_exception(:RuntimeError, [])
+              elsif args[0].is_a?(Prism::ConstantReadNode) && @classes[args[0].name] then new_exception(args[0].name, args[1..])
+              elsif (k = kind_of(args[0])).is_a?(Symbol) && @classes[k] then expr(args[0]) # raise exc_object
+              else new_exception(:RuntimeError, [args[0]]) end # raise "message" (any String expression)
+        emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc]) # rt_raise returns only when nothing catches (then exit)
+        return const(0)
       elsif n.name == :printf && n.receiver.nil? && args[0].is_a?(Prism::StringNode)
         return printf_lower(args[0].unescaped, args[1..].map { expr(_1) })
       elsif n.name == :pop && args.empty? && n.receiver then emit(:apop, [expr(n.receiver)])
@@ -746,6 +838,7 @@ module Indus
       when :__sys_write then emit(:sys, [:write, expr(args[0]), expr(args[1]), expr(args[2])])
       when :__sys_close then emit(:sys, [:close, expr(args[0])])
       when :__sys_unlink then emit(:sys, [:unlink, expr(args[0])])
+      when :__sys_exit then emit(:sys, [:exit, expr(args[0])])
       when :__salloc then emit(:salloc, [expr(args[0])])                    # a fresh string of n bytes, contents undefined
       when :__st then (a = expr(args[0]); v = expr(args[1]); emit(:rawst, [a, v]); v)
       when :__gbase then emit(:gbase, [])
@@ -1184,6 +1277,20 @@ module Indus
       else
         emit(:inspect_v, [expr(a)])
       end
+    end
+
+    def assigned_ivars(node, out = [])
+      return out unless node.is_a?(Prism::Node)
+      case node
+      when Prism::InstanceVariableWriteNode, Prism::InstanceVariableOperatorWriteNode, Prism::InstanceVariableOrWriteNode, Prism::InstanceVariableTargetNode
+        out << node.name unless out.include?(node.name)
+      when Prism::CallNode
+        if node.receiver.nil? && %i[attr_accessor attr_reader attr_writer].include?(node.name)
+          node.arguments&.arguments&.each { |a| out << :"@#{a.unescaped}" if a.is_a?(Prism::SymbolNode) && !out.include?(:"@#{a.unescaped}") }
+        end
+      end
+      node.compact_child_nodes.each { assigned_ivars(_1, out) }
+      out
     end
 
     # locals a loop body assigns exist (as nil) before the loop in Ruby: `while ..; result = f; end; result`

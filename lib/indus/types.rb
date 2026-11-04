@@ -73,6 +73,7 @@ module Indus
       @consts ||= {}
       @funcs_live = funcs
       funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = f.cls.name if f.cls }
+      @exc_type = nil # the type of a rescued value: whatever any raise in the program raises
       @seams = funcs.any? { |f| f.all.any? { _1.op == :seam } }
       loop do
         changed = false
@@ -96,7 +97,12 @@ module Indus
               changed = true if (dest == :dyn || arr(dest) && dest[1] == :dyn || hsh(dest) && dest[2] == :dyn) && widen_elements_to_dyn(f, v, dest)
               changed = true if dest == :strbuf && of(f, v) == :str && make_cell(f, v, i)
             end
+            if i.op == :raise && (t = of(f, i.args[0])) && join(@exc_type, t) != @exc_type then @exc_type = join(@exc_type, t); changed = true end
             bind(f, i) if i.op == :mcall
+            if i.op == :call && (c = i.args[0]).cls && poly?(of(f, i.args[1])) && !c.name.to_s.end_with?("#initialize")
+              # bound to one class while the receiver was that class; it has since widened to a set
+              i.op = :mcall; i.args = [c.name.to_s.split("#").last.to_sym, *i.args[1..]]; bind(f, i); changed = true
+            end
             if i.op == :call && generic?(i.args[0]) && clashes?(i.args[0], i.args[1..].map { of(f, _1) })
               # another caller already shaped this prelude generic: this call gets its own copy
               # (before infer, so the call's type never sees the other instance's result)
@@ -185,7 +191,7 @@ module Indus
               if generic?(callee) && clashes?(callee, i.args[1..].map { of(f, _1) }) # a call rewritten into a generic this very visit
                 callee = i.args[0] = instance_for(callee, i.args[1..].map { of(f, _1) }, funcs); changed = true
               end
-              i.args[1..].each_with_index { |a, k| set.(callee.ptypes[k], of(f, a)) { callee.ptypes[k] = _1 } }
+              i.args[1..].each_with_index { |a, k| set.(callee.ptypes[k], of(f, a)) { callee.ptypes[k] = _1 } unless k == 0 && callee.cls } # self is the defining class, whatever subclass arrives
             when :pcall
               arms, recv, *args = i.args
               arms.each do |klass, kind, payload|
@@ -240,7 +246,10 @@ module Indus
       @settled = false; @promoted = false
       funcs.each { |f| f.all.each { |i| raise "uninitialized constant #{i.args[0]}" if i.op == :gget && !@consts.key?(i.args[0]) } }
       # classes that appear in any poly type carry a tag word
-      tag = ->(t) { classes_of(t)&.each { @classes[_1].tagged = true } if poly?(t) || arr(t) && poly?(t[1]) }
+      # the layout (class id word, field base) is a property of the whole hierarchy: a
+      # superclass's methods write fields through `self` typed as the superclass
+      tag_class = ->(c) { related(c).each { _1.tagged = true } }
+      tag = ->(t) { classes_of(t)&.each { tag_class.(@classes[_1]) } if poly?(t) || arr(t) && poly?(t[1]) }
       funcs.each { |f| f.all.each { tag.(_1.ty) }; f.ptypes.each { tag.(_1) }; tag.(f.rtype) }
       @ivars.each_value { |h| h.each_value { tag.(_1) } }
       funcs.each { convert(_1) }
@@ -249,7 +258,7 @@ module Indus
       funcs.each do |f|
         f.all.each do |i|
           next unless i.op == :box
-          (classes_of(i.args[1]) || []).each { |cn| k = @classes[cn]; k.tagged = true; k.boxed = true } # a class or a poly set of classes
+          (classes_of(i.args[1]) || []).each { |cn| related(@classes[cn]).each { |k| k.tagged = true; k.boxed = true } } # a class or a poly set of classes, with its hierarchy
         end
       end
       funcs.each { strings(_1) }
@@ -265,7 +274,12 @@ module Indus
         if t == :dyn
           i.op = :isa_dyn; i.args = [v, cname] # tag test, or class id for user classes
         elsif poly?(t) && @classes[cname]
-          i.op = :isa_tag; i.args = [v, @classes[cname].id] # compare the class id in word 0
+          # which members of the set descend from cname? none -> false; all -> true; some -> compare ids
+          hits = t[1].select { |c| ancestor?(@classes[c], cname) }
+          if hits.empty? then i.op = :const; i.args = [0]; i.ty = :bool
+          elsif hits.size == t[1].size then i.op = :const; i.args = [1]; i.ty = :bool
+          elsif hits.size == 1 then i.op = :isa_tag; i.args = [v, @classes[hits[0]].id] # compare the class id in word 0
+          else i.op = :isa_tags; i.args = [v, hits.map { @classes[_1].id }] end
         else
           yes = want ? (want == :arr || want == :hash ? (t.is_a?(Array) && t[0] == want) : t == want || (want == :int && t == :int?)) : (t == cname || (t.is_a?(Symbol) && @classes[t] && ancestor?(@classes[t], cname)))
           i.op = :const; i.args = [yes ? 1 : 0]; i.ty = :bool
@@ -680,6 +694,12 @@ module Indus
       else raise "[] on #{t.inspect}" end
     end
 
+    # a class with its ancestors and descendants: one layout
+    def self.related(klass)
+      ups = []; c = klass.superclass; (ups << c; c = c.superclass) while c
+      [klass, *ups, *@classes.values.select { |c| ancestor?(c, klass.name) && c != klass }]
+    end
+
     def self.ancestor?(klass, cname)
       k = klass
       while k
@@ -711,7 +731,7 @@ module Indus
     def self.arm_type(f, i, arm)
       klass, kind, payload = arm
       case kind
-      when :fld_get then @ivars[klass.name][payload]
+      when :fld_get then ivar_type(klass.name, payload) # the field may be set by a superclass's initialize
       when :fld_set then of(f, i.args[2])
       when :call then payload.rtype
       end
@@ -728,6 +748,8 @@ module Indus
       when :bufderef then :str
       when :apop then (t = of(f, a[0])) && arr(t) ? t[1] : nil
       when :hcap, :gcepoch, :hsave, :sys then :int
+      when :try_push, :try_pop, :raise then :int
+      when :exc_value then @exc_type
       when :hkey_at then (t = of(f, a[0])) && hsh(t) ? t[1] : nil
       when :hval_at then (t = of(f, a[0])) && hsh(t) ? t[2] : nil
       when :seq, :sne, :scmp then :bool
@@ -776,8 +798,15 @@ module Indus
 
     # an ivar's type: joined over the class and its subclasses (same offset)
     def self.ivar_type(k, ix)
+      # a poly receiver (an inherited field read on a set of related classes): the field has
+      # the same index in every member, so join their types
+      return k[1].map { ivar_type(_1, ix) }.reduce(nil) { join(_1, _2) } if poly?(k)
       klass = @classes[k] or raise "ivar_type: receiver typed #{k.inspect}"
-      [klass, *@classes.values.select { |c| c.superclass == klass }].map { @ivars[_1.name][ix] }.reduce(nil) { join(_1, _2) }
+      # the slot's type is whatever any class sharing the slot stores there: this class, the
+      # ancestors whose initialize may set it, and the descendants that inherit it
+      ups = []; c = klass.superclass; (ups << c; c = c.superclass) while c
+      downs = @classes.values.select { |c| ancestor?(c, klass.name) && c != klass }
+      [klass, *ups, *downs].map { @ivars[_1.name][ix] }.reduce(nil) { join(_1, _2) }
     end
 
     # insert itof where an int flows into a float position, and box where a
