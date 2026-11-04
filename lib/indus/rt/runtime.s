@@ -1,5 +1,5 @@
-// Indus runtime routines, assembled once at dev time (tools/build_runtime.sh)
-// into lib/indus/runtime_blob.rb. Position independent; only internal branches.
+// Indus runtime routines, assembled once at dev time (tools/build-rt)
+// into lib/indus/rt/blob.rb. Position independent; only internal branches.
 //
 // Conventions: x27 = globals base ([x27] holds the write(2) function address),
 // x28 = heap bump pointer. Strings/arrays: [cap][len][data...], handle -> data.
@@ -674,7 +674,7 @@ __ipow:
 1:      ret
 
 // ---------------------------------------------------------------- the collector
-// The collector itself is Ruby (lib/indus/prelude/gc.rb), compiled by Indus
+// The collector itself is Ruby (lib/indus/rt/gc.rb), compiled by Indus
 // into GC-mode programs as __gc_run(fp) -> new bump pointer. This stub is the
 // safepoint entry: it preserves every caller-saved register (the compiled
 // code may hold non-pointer temporaries in them) and hands over the frame

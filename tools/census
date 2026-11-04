@@ -1,3 +1,4 @@
+#!/usr/bin/env ruby
 # Which Prism node types and which method names does a Ruby program use,
 # and which of them does Indus lower? tools/census.rb file.rb ...
 gem "prism", "= 1.8.2" rescue nil

@@ -6,7 +6,7 @@ Gem::Specification.new do |s|
   s.authors     = ["Haroon Ahmed"]
   s.homepage    = "https://github.com/hahmed/indus"
   s.license     = "MIT"
-  s.files       = Dir["lib/**/*.rb", "lib/indus/runtime.s", "bin/*", "README.md"]
+  s.files       = Dir["lib/**/*.rb", "lib/indus/rt/runtime.s", "bin/*", "README.md"]
   s.executables = ["indus"]
   s.required_ruby_version = ">= 3.3"
   s.add_dependency "prism", "~> 1.8"

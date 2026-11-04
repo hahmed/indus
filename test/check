@@ -1,0 +1,23 @@
+#!/bin/bash
+# test/check [program.rb ...]   -- every program must print exactly what Ruby prints.
+#
+# The truth for a program is <name>.expected beside it when that exists (benches:
+# CRuby output frozen because some take seconds), otherwise CRuby run right now.
+# Each program runs twice: plain, and with 2 MB semispaces so the collector works.
+# Prints failures only, then one summary line. Exit 1 on any failure.
+cd "$(dirname "$0")/.."
+trap 'pkill -9 -P $$ 2>/dev/null' EXIT INT TERM   # compiled programs ignore SIGTERM
+[ $# -gt 0 ] && files=("$@") || files=(test/oracle/*.rb)
+pass=0; fail=0
+run() { timeout -k 2 60 env "$@" 2>/dev/null; }
+for f in "${files[@]}"; do
+  exp="${f%.rb}.expected"
+  if [ -f "$exp" ]; then want=$(cat "$exp"); else want=$(ruby --disable-gems "$f" 2>&1); fi
+  for mode in "" "INDUS_HEAP_MB=2"; do
+    got=$(run $mode bin/indus "$f")
+    if [ "$want" == "$got" ]; then pass=$((pass+1)); else
+      fail=$((fail+1)); echo "FAIL $f ${mode:+($mode)}"; diff <(echo "$want") <(echo "$got") | head -6; fi
+  done
+done
+echo "$pass passed, $fail failed"
+[ $fail -eq 0 ]

@@ -37,7 +37,7 @@ GRISU_E = [
 # integer arithmetic and the cached powers above. Written in the Indus subset.
 # Unsigned 64-bit values live in Integers as bit patterns; the __u* intrinsics
 # do the unsigned/wrapping operations (umulh, lsr, clz, wrapping add/sub/mul,
-# unsigned compare). Plain-Ruby stand-ins for testing are in grisu_host.rb.
+# unsigned compare). Plain-Ruby stand-ins for testing are in test/host/grisu_host.rb.
 #
 # Returns the digits as an Integer (1..17 digits) and sets the decimal
 # exponent K via __grisu_k (the subset has no multiple return values):

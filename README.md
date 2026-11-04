@@ -23,8 +23,8 @@ Named after the Indus Valley: source, flow, execution.
 ```sh
 bin/indus bench/fib.rb                   # compile and run in-process
 bin/indus bench/fib.rb -o fib --linux    # a standalone ELF executable
-bench/run.sh                             # against CRuby, YJIT and Spinel
-test/run.sh                              # differential tests vs CRuby
+bench/run                                # against CRuby, YJIT and Spinel
+test/check                               # differential tests vs CRuby
 ```
 
 Early days. Expect the subset of Ruby it accepts to grow experiment by

@@ -1,5 +1,5 @@
 # Core routines written in the Indus subset and compiled into every program.
-# Testable with plain Ruby: `ruby -r ./lib/indus/prelude/core.rb`.
+# Testable with plain Ruby: `ruby -r ./lib/indus/rt/core.rb`.
 
 
 # Float#to_s: the shortest decimal that parses back to the same double.

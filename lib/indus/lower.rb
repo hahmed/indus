@@ -590,7 +590,7 @@ module Indus
       vals
     end
 
-    # raw memory / addresses for the collector (lib/indus/prelude/gc.rb)
+    # raw memory / addresses for the collector (lib/indus/rt/gc.rb)
     def intrinsic(name, args)
       case name
       when :__ld then emit(:rawld, [expr(args[0])])

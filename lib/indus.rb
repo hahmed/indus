@@ -7,7 +7,10 @@
 #   lib/indus/passes.rb   SSA passes (trivial phis, return sinking, accumulator loops)
 #   lib/indus/peephole.rb string peepholes (byte compare, in-place append)
 #   lib/indus/escape.rb   escape analysis -> stack objects, loop regions
-#   lib/indus/runtime.s   runtime routines in assembly -> runtime_blob.rb (tools/build_runtime.sh)
+#   lib/indus/gc.rb       the collector's compile-time half: type descriptors, frame maps
+#   lib/indus/rt/         what rides into every binary: runtime.s (primitives, assembled
+#                         once by tools/build-rt into blob.rb) and the Ruby preludes
+#                         gc.rb (the collector), core.rb (String/dyn helpers), grisu.rb
 #   lib/indus/asm.rb      arm64 encoder
 #   lib/indus/regalloc.rb linear-scan register allocation over dataflow liveness
 #   lib/indus/codegen.rb  layout, frames, instruction selection
@@ -15,11 +18,13 @@
 #   lib/indus/macho.rb    standalone Mach-O writer
 #   lib/indus/elf.rb      standalone Linux ELF writer
 #
+# test/check    every test/oracle/*.rb and bench/*.rb prints what CRuby prints
+# tools/sieve   pour programs through; see what compiles and what blocks the rest
 # See experiments/ for how it got here.
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir pretype lower types passes peephole escape gc magic runtime_blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir pretype lower types passes peephole escape gc magic rt/blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # everything a compiled program knows about itself: enough for the
@@ -31,8 +36,8 @@ module Indus
   end
 
   # standalone: nil (run in-process via libc write), :darwin or :linux
-  PRELUDE_GC = File.read(File.join(__dir__, "indus/prelude/gc.rb"))
-  PRELUDE_CORE = File.read(File.join(__dir__, "indus/prelude/grisu.rb")) + "\n" + File.read(File.join(__dir__, "indus/prelude/core.rb"))
+  PRELUDE_GC = File.read(File.join(__dir__, "indus/rt/gc.rb"))
+  PRELUDE_CORE = File.read(File.join(__dir__, "indus/rt/grisu.rb")) + "\n" + File.read(File.join(__dir__, "indus/rt/core.rb"))
 
   def self.compile(src, standalone: nil)
     src = PRELUDE_CORE + "\n" + src          # Float#to_s and friends, in Ruby
