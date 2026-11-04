@@ -394,10 +394,38 @@ module Indus
     end
 
     # branch on a condition without materializing it; && and || short-circuit
+    # Guards narrow (notes/33). facts(cond, truth): the [[local, Class]] that hold on the
+    # edge where cond came out `truth`. Applying one rebinds the local to unbox(v, Class):
+    # the locals map is the SSA renamer, so a narrowing is one assignment.
+    def facts(n, truth)
+      case n
+      when Prism::ParenthesesNode then facts(n.body.body.last, truth)
+      when Prism::AndNode then truth ? facts(n.left, true) + facts(n.right, true) : []
+      when Prism::OrNode then truth ? [] : facts(n.left, false) + facts(n.right, false)
+      when Prism::CallNode
+        if n.name == :! && n.receiver then facts(n.receiver, !truth)
+        elsif truth && n.name == :is_a? && n.receiver.is_a?(Prism::LocalVariableReadNode) && n.arguments&.arguments&.first.is_a?(Prism::ConstantReadNode)
+          [[lname(n.receiver.name), n.arguments.arguments.first.name]]
+        else [] end
+      else []
+      end
+    end
+
+    def narrow(facts)
+      facts.each { |nm, cname| @locals[nm] = emit(:unbox, [@locals.fetch(nm), kind_for(cname)]) if @locals[nm] }
+    end
+
+    # a narrowed name was only a view: unless the region assigned it, the original flows on
+    def unnarrow(facts, before)
+      facts.each { |nm, _| @locals[nm] = before[nm] if @locals[nm]&.op == :unbox && before[nm] }
+    end
+
     def cond_branch(n, tb, eb)
       case n
       when Prism::AndNode
-        mid = @f.new_block(:and); cond_branch(n.left, mid, eb); @cur = mid; cond_branch(n.right, tb, eb)
+        mid = @f.new_block(:and); cond_branch(n.left, mid, eb); @cur = mid
+        saved = @locals.dup; narrow(facts(n.left, true))   # the right side runs only when the left held
+        cond_branch(n.right, tb, eb); unnarrow(facts(n.left, true), saved)
       when Prism::OrNode
         mid = @f.new_block(:or); cond_branch(n.left, tb, mid); @cur = mid; cond_branch(n.right, tb, eb)
       when Prism::ParenthesesNode then cond_branch(n.body.body.last, tb, eb)
@@ -862,28 +890,20 @@ module Indus
       tb, eb, mb = @f.new_block(:then), @f.new_block(:else), @f.new_block(:merge)
       negate ? cond_branch(n.predicate, eb, tb) : cond_branch(n.predicate, tb, eb)
       before = @locals.dup
-      # `if v.is_a?(K)`: inside the branch, v is a K (unbox: Types makes it a nop for an already-typed v)
-      pr = n.predicate
-      if pr.is_a?(Prism::CallNode) && pr.name == :is_a? && pr.receiver.is_a?(Prism::LocalVariableReadNode) && pr.arguments&.arguments&.first.is_a?(Prism::ConstantReadNode)
-        refine = [lname(pr.receiver.name), pr.arguments.arguments.first.name]
-      end
+      tfacts, efacts = facts(n.predicate, !negate), facts(n.predicate, negate)
 
-      @cur = tb
-      if refine && (negate == false)
-        nm, cname = refine
-        @locals[nm] = emit(:unbox, [@locals.fetch(nm), kind_for(cname)]) # a new SSA name for v inside the branch
-      end
+      @cur = tb; narrow(tfacts)
       tv = (n.statements&.body || []).map { expr(_1) }.last || const(0)
-      # the refined name was only a view: if the branch did not assign it, hand the original back to the merge
-      @locals[refine[0]] = before[refine[0]] if refine && negate == false && @locals[refine[0]]&.op == :unbox
+      unnarrow(tfacts, before)
       tend, tlocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
 
-      @cur = eb; @locals = before.dup
+      @cur = eb; @locals = before.dup; narrow(efacts)
       sub = n.is_a?(Prism::UnlessNode) ? n.else_clause : n.subsequent
       ev = case sub
            when Prism::IfNode then if_expr(sub)
            when Prism::ElseNode then sub.statements&.body&.map { expr(_1) }&.last
            end || const(0)
+      unnarrow(efacts, before)
       eend, elocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
 
       @cur = mb
@@ -896,13 +916,20 @@ module Indus
     def case_expr(n)
       subj = n.predicate ? expr(n.predicate) : nil
       tests = n.conditions.map do |w|
-        [w.conditions.map { |c| when_test(subj, c) }, w.statements&.body || []]
+        arm_facts = [] # `when Klass` with a local subject: the arm sees the local as a Klass
+        if w.conditions.size == 1 && n.predicate.is_a?(Prism::LocalVariableReadNode) && class_const?(w.conditions[0])
+          arm_facts = [[lname(n.predicate.name), w.conditions[0].name]]
+        end
+        [w.conditions.map { |c| when_test(subj, c) }, w.statements&.body || [], arm_facts]
       end
       lower_chain(tests, n.else_clause&.statements&.body || [])
     end
 
+    def class_const?(c) = c.is_a?(Prism::ConstantReadNode) && (@classes[c.name] || %i[Integer Float String Array Hash Symbol].include?(c.name))
+
     def when_test(subj, c)
       return ->() { expr(c) } unless subj
+      return ->() { emit(:isa, [subj, c.name]) } if class_const?(c) # `when Klass` is Klass === subj
       if c.is_a?(Prism::RangeNode)
         ->() { lo = expr(c.left); hi = expr(c.right)
                a = emit(:cmp, [subj, lo], :ge); b = emit(:cmp, [subj, hi], c.exclude_end? ? :lt : :le)
@@ -914,7 +941,8 @@ module Indus
 
     def lower_chain(tests, else_body)
       return (else_body.map { expr(_1) }.last || const(0)) if tests.empty?
-      (conds, body), *rest = tests
+      (conds, body, arm_facts), *rest = tests
+      arm_facts ||= []
       tb, eb, mb = @f.new_block(:then), @f.new_block(:else), @f.new_block(:merge)
       # any of the conditions
       conds.each_with_index do |t, k|
@@ -923,7 +951,8 @@ module Indus
         emit(:condbr, [v, tb, nxt]); @cur = nxt
       end
       before = @locals.dup
-      @cur = tb; tv = body.map { expr(_1) }.last || const(0); tend, tl = @cur, @locals; emit(:br, [mb]) unless @cur.term
+      @cur = tb; narrow(arm_facts); tv = body.map { expr(_1) }.last || const(0); unnarrow(arm_facts, before)
+      tend, tl = @cur, @locals; emit(:br, [mb]) unless @cur.term
       @cur = eb; @locals = before.dup; ev = lower_chain(rest, else_body); eend, el = @cur, @locals; emit(:br, [mb]) unless @cur.term
       @cur = mb; @locals = merge_locals(mb, [[tend, tl], [eend, el]])
       p = mb.phi; p.args = [[tend, tv], [eend, ev]]; p
@@ -984,7 +1013,9 @@ module Indus
       negate ? cond_branch(n.predicate, xb, bb) : cond_branch(n.predicate, bb, xb)
       outer, @loop = @loop, { exit: xb, breaks: [], head: hb, nexts: [] }
       @cur = bb
+      bfacts = facts(n.predicate, !negate); head_locals = @locals.dup; narrow(bfacts) # the body runs only when the condition held
       (n.statements&.body || []).each { expr(_1) }
+      unnarrow(bfacts, head_locals)
       bend = @cur
       emit(:br, [hb]) unless @cur.term
       phis.each { |nm, ph| ph.args << [bend, @locals[nm]] unless @cur.name.to_s.start_with?("dead") && bend.succs.empty? }

@@ -392,8 +392,9 @@ module Indus
     def self.bind(f, i)
       name, recv, *args = i.args
       t = of(f, recv)
-      if poly?(t) # one arm per class: [klass, kind, payload]
-        arms = t[1].map { |c| [@classes[c], *resolve(@classes[c], name, args.size)] }
+      if poly?(t) # one arm per class: [klass, kind, payload]; a class without the method traps if reached
+        arms = t[1].map { |c| [@classes[c], *resolve(@classes[c], name, args.size, trap_missing: true)] }
+        raise "no method #{name} on any of #{t[1].join(', ')}" if arms.all? { |(_, kind, _)| kind == :trap }
         i.op = :pcall; i.args = [arms, recv, *args]
         return
       end
@@ -475,11 +476,12 @@ module Indus
       false
     end
 
-    def self.resolve(klass, name, nargs, allow_missing: false)
+    def self.resolve(klass, name, nargs, allow_missing: false, trap_missing: false)
       if (iv = klass.find_reader(name)) && nargs == 0 then [:fld_get, klass.ivar(iv)]
       elsif (iv = klass.find_writer(name)) && nargs == 1 then [:fld_set, klass.ivar(iv)]
       elsif (m = klass.find_method(name)) then [:call, m]
       elsif allow_missing && (mm = klass.find_method(:method_missing)) then [:missing, mm]
+      elsif trap_missing then [:trap, nil] # Ruby's NoMethodError, if this arm ever runs
       else raise "no method #{name} on #{klass.name}"
       end
     end

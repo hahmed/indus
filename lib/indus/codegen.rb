@@ -303,6 +303,7 @@ module Indus
             when :fld_set
               off = klass.base + payload * 8; v = args[0]
               v.float? ? @asm.fstr_off(freg(v), reg(recv), off) : @asm.str_off(reg(v, 9), reg(recv), off)
+            when :trap then @asm.emit(0xD4200000) # NoMethodError: this class has no such method
             end
             @asm.b(done); @asm.label(nxt)
           end
