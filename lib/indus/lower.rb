@@ -537,6 +537,8 @@ module Indus
         a = args[0]
         if a.is_a?(Prism::StringNode) then emit(:putc, [const(a.unescaped.ord)])
         else emit(:putc, [expr(a)]) end
+      elsif n.name == :puts && n.receiver.is_a?(Prism::GlobalVariableReadNode) && n.receiver.name == :$stderr && args.size == 1
+        emit(:eputs_v, [expr(args[0])])  # $stderr.puts x
       elsif n.name == :puts
         a = args[0]
         if a.is_a?(Prism::StringNode) then emit(:puts_s, [a.unescaped])
@@ -587,8 +589,6 @@ module Indus
       elsif n.name == :chr && args.empty? && n.receiver then emit(:chr, [expr(n.receiver)])
       elsif n.name == :clock_gettime && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Process
         emit(:clock, [])                 # Process.clock_gettime(any clock): monotonic seconds as a Float
-      elsif n.name == :puts && n.receiver.is_a?(Prism::GlobalVariableReadNode) && n.receiver.name == :$stderr && args.size == 1
-        emit(:eputs_v, [expr(args[0])])  # $stderr.puts x
       elsif n.name == :round && args.size == 1 && n.receiver
         if args[0].is_a?(Prism::IntegerNode) && args[0].value <= 0 # x.round(0) is an Integer in Ruby
           emit(:call, [@funcs.fetch(:__float_round0), expr(n.receiver)])
