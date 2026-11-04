@@ -442,3 +442,64 @@ def __dyn_str(v)
   __trap if __tag(v) != 2
   __unbox_str(v)
 end
+
+# Array methods in Ruby, routed by Types.bind for a receiver typed [:arr, T]
+def __arr_shift(a)
+  __trap if a.length == 0
+  first = a[0]
+  i = 1
+  while i < a.length
+    a[i - 1] = a[i]
+    i = i + 1
+  end
+  a.pop
+  first
+end
+
+def __arr_reverse!(a)
+  i = 0
+  j = a.length - 1
+  while i < j
+    t = a[i]
+    a[i] = a[j]
+    a[j] = t
+    i = i + 1
+    j = j - 1
+  end
+  a
+end
+
+def __arr_empty_p(a)
+  a.length == 0
+end
+
+def __arr_dup(a)
+  out = []
+  i = 0
+  while i < a.length
+    out.push(a[i])
+    i = i + 1
+  end
+  out
+end
+
+def __arr_eq(a, b)
+  return false if a.length != b.length
+  i = 0
+  while i < a.length
+    return false if a[i] != b[i]
+    i = i + 1
+  end
+  true
+end
+
+def __arr_inspect(a)
+  out = "["
+  i = 0
+  while i < a.length
+    out = out + ", " if i > 0
+    out = out + a[i].inspect
+    i = i + 1
+  end
+  out + "]"
+end

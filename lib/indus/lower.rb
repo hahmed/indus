@@ -19,6 +19,7 @@ module Indus
       mods = body.grep(Prism::ModuleNode)
       mod_classes = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ClassNode) }
       mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
+      mod_ivars = mods.flat_map { |m| (m.body&.body || []).grep(Prism::InstanceVariableWriteNode).map { [m.constant_path.name, _1] } }
       defs = body.grep(Prism::DefNode)
       cdefs = body.grep(Prism::ClassNode) + mod_classes
       # `def self.m` in a class or module body: a function named Owner.m, no self
@@ -30,6 +31,7 @@ module Indus
       structs = body.select { |st| st.is_a?(Prism::ConstantWriteNode) && struct_new?(st.value) }
       top = (body - defs - cdefs - mods - structs)
       top = class_consts + mod_consts + top
+      @mod_ivars = mod_ivars
       # methods that take a block (contain yield) are inlined at call sites with a literal block;
       # they still get compiled as functions for block-less callers
       @yielders = {} # name -> [klass or nil, def]
@@ -200,6 +202,9 @@ module Indus
 
     def lower_body(f, names, stmts, klass = nil, ct = {})
       @f, @locals, @cur, @klass, @ct = f, names.zip(f.params).to_h, f.entry, klass, ct
+      if f.name == :main && @mod_ivars # `module M; @x = 1; end` runs before the program
+        @mod_ivars.each { |owner, w| @owner = owner; expr(w); @owner = nil }
+      end
       if stmts.first.is_a?(Array) && stmts.first[0] == :struct_set # a Struct's initialize
         stmts.each { |(_, fld)| emit(:fld_set, [@locals[:self], klass.ivar(:"@#{fld}"), @locals.fetch(fld)]) }
         emit(:ret, [@locals[:self]])
@@ -311,8 +316,11 @@ module Indus
           h = emit(:hset, [h, expr(el.key), expr(el.value)])
         end
         h
-      when Prism::InstanceVariableReadNode then emit(:fld_get, [me_val, @klass.ivar(n.name)])
+      when Prism::InstanceVariableReadNode
+        return emit(:gget, [:"#{@owner}#{n.name}"]) if @owner # a module's / class object's own ivar
+        emit(:fld_get, [me_val, @klass.ivar(n.name)])
       when Prism::InstanceVariableWriteNode
+        if @owner then v = expr(n.value); emit(:gset, [:"#{@owner}#{n.name}", v]); return v end
         v = expr(n.value)
         ((@ivar_kinds ||= {})[[@klass&.name, n.name]] ||= kind_of(n.value)) if @klass
         emit(:fld_set, [me_val, @klass.ivar(n.name), v]); v
@@ -370,7 +378,7 @@ module Indus
       when Prism::YieldNode
         raise "yield outside an inlined block method" unless @block
         yield_block(n.arguments&.arguments || [])
-      when Prism::RangeNode then raise "a Range is only supported as the receiver of each/map"
+      when Prism::RangeNode then raise "a Range is only supported as the receiver of each/map/to_a"
       when Prism::SymbolNode then (c = const(sym_id(n.unescaped)); c.ty = :sym; c)
       when Prism::ParenthesesNode then n.body.body.map { expr(_1) }.last
       when Prism::StringNode then emit(:sconst, [n.unescaped])
@@ -511,6 +519,7 @@ module Indus
       elsif n.name == :p && n.receiver.nil? && args.size > 1
         args.each { |a| p_one(a) }; return const(0)   # p a, b: one line each
       elsif n.name == :p && n.receiver.nil? && args.size == 1 then p_one(args[0])
+      elsif n.name == :inspect && args.empty? && n.receiver then inspect_str(n.receiver)
       elsif n.name == :print && n.receiver.nil? && args.size == 1
         emit(:print_v, [expr(args[0])])   # no newline
       elsif n.name == :Integer && n.receiver.nil? && args.size == 1
@@ -522,7 +531,7 @@ module Indus
       elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
       elsif n.name == :+@ && args.empty? then expr(n.receiver) # +"" : literals are already fresh copies
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array
-        len = expr(args[0]); fill = args[1] ? expr(args[1]) : const(0)
+        len = args[0] ? expr(args[0]) : const(0); fill = args[1] ? expr(args[1]) : (c = const(0); c.ty = :nil; c)
         emit(:anew, [len, fill])
       elsif n.name == :new && (n.receiver.is_a?(Prism::ConstantReadNode) || n.receiver.is_a?(Prism::ConstantPathNode)) && @classes[n.receiver.name]
         k = @classes[n.receiver.name]
@@ -551,9 +560,17 @@ module Indus
       elsif (n.name == :even? || n.name == :odd?) && args.empty? && n.receiver
         emit(:cmp, [emit(:and, [expr(n.receiver), const(1)]), const(0)], n.name == :even? ? :eq : :ne)
       elsif n.name == :chr && args.empty? && n.receiver then emit(:chr, [expr(n.receiver)])
+      elsif n.name == :raise && n.receiver.nil?
+        emit(:trap, []); return const(0)  # no exceptions yet: die where Ruby would raise
       elsif n.name == :printf && n.receiver.nil? && args[0].is_a?(Prism::StringNode)
         return printf_lower(args[0].unescaped, args[1..].map { expr(_1) })
       elsif n.name == :pop && args.empty? && n.receiver then emit(:apop, [expr(n.receiver)])
+      elsif n.name == :to_a && args.empty? && (r = n.receiver.is_a?(Prism::ParenthesesNode) ? n.receiver.body.body.last : n.receiver).is_a?(Prism::RangeNode)
+        lo = expr(r.left); hi = expr(r.right); hi = emit(:add, [hi, const(1)]) unless r.exclude_end?
+        len = emit(:sub, [hi, lo]); arr = emit(:anew, [len, const(0)])
+        outv = :"toa#{@f.blocks.size}:out"; @locals[outv] = arr
+        counted_loop(const(0), len, :lt, [], []) { |i, _ps, _pfx| @locals[outv] = emit(:aset, [@locals[outv], i, emit(:add, [lo, i])]) }
+        @locals.delete(outv)
       elsif n.name == :push && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode))
         a = expr(n.receiver); v = expr(args[0]); len = emit(:alen, [a])
         r = emit(:aset, [a, len, v]) # may grow: rebind the home
@@ -571,6 +588,7 @@ module Indus
         case n.receiver
         when Prism::LocalVariableReadNode then @locals[lname(n.receiver.name)] = r
         when Prism::InstanceVariableReadNode then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
+        when Prism::CallNode then nil # a[i][j] = v, obj.attr[i] = v: the element store is in place; growth would need the cell design
         else raise "[]= on #{n.receiver.class}"
         end
         v
@@ -758,6 +776,9 @@ module Indus
       each ? each.call(@locals[ivar], params, pfx) : (@locals[:"#{pfx}#{params[0]}"] = @locals[ivar] if params[0])
       @blk_pfx = (@blk_pfx || []) << pfx
       last = nil
+      # the loop's own targets, taken before the body runs: a nested loop sets and clears its own
+      map_target, sum_target = @map_target, @sum_target
+      @map_target = @sum_target = nil
       if (guard = @body_guard) # hash iteration: run the body only for used slots
         @body_guard = nil
         tb, eb, mb = @f.new_block(:gthen), @f.new_block(:gelse), @f.new_block(:gmerge)
@@ -770,12 +791,12 @@ module Indus
         body.each { last = expr(_1) }
       end
       @blk_pfx.pop
-      if @map_target && @map_target[0] && @locals[@map_target[0]]
-        outv, idx = @map_target; @map_target = nil
+      if map_target && @locals[map_target[0]]
+        outv, idx = map_target
         @locals[outv] = emit(:aset, [@locals[outv], idx, last || const(0)])
       end
-      if @sum_target # sum { } adds the body's value; count { } adds 1 when it is truthy
-        accv, kind = @sum_target; @sum_target = nil
+      if sum_target # sum { } adds the body's value; count { } adds 1 when it is truthy
+        accv, kind = sum_target
         v = last || const(0)
         v = emit(:and, [emit(:cmp, [v, const(0)], :ne), const(1)]) if kind == :count
         @locals[accv] = emit(:add, [@locals[accv], v])
@@ -1013,7 +1034,13 @@ module Indus
 
     # p of one value: arrays are inspected element by element, everything else by type
     def p_one(a)
-      if kind_of(a) == :array # Array#inspect: "[" + elements.inspect.join(", ") + "]"
+      if kind_of(a) == :array then emit(:puts_str, [inspect_str(a)])
+      else emit(:p_v, [expr(a)]) end       # inspect form: strings quoted, nil as "nil"
+    end
+
+    # the string Array#inspect builds: "[" + elements.inspect.join(", ") + "]"
+    def inspect_str(a)
+      if kind_of(a) == :array
           arr = expr(a)
         outv = :"insp#{@f.blocks.size}:out"
         @locals[outv] = emit(:sconst, ["["])
@@ -1030,10 +1057,9 @@ module Indus
           el = emit(:aget, [arr, i])
           @locals[outv] = emit(:scat, [emit(:scat, [@locals[outv], ph]), emit(:inspect_v, [el])])
       end
-        out = emit(:scat, [@locals.delete(outv), emit(:sconst, ["]"])])
-        emit(:puts_str, [out])
+        emit(:scat, [@locals.delete(outv), emit(:sconst, ["]"])])
       else
-        emit(:p_v, [expr(a)])       # inspect form: strings quoted, nil as "nil"
+        emit(:inspect_v, [expr(a)])
       end
     end
 

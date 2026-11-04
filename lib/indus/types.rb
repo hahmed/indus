@@ -98,6 +98,12 @@ module Indus
             dsend(f, i) if i.op == :dsend
             float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
             # printing/inspecting by type is irreversible, so it waits for the types to settle (below)
+            if i.op == :cmp && arr(of(f, i.args[0])) && arr(of(f, i.args[1])) && %i[eq ne].include?(i.cond) # Array#== is elementwise
+              l, r = i.args; fn = @lower.funcs.fetch(:__arr_eq)
+              c = Inst.new(:call, [fn, l, r]); c.ty = :bool; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+              z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
+              i.args = [c, z]; i.cond = i.cond == :eq ? :ne : :eq; changed = true # (a == b) is (eq_result != 0)
+            end
             if i.op == :mul && of(f, i.args[0]) == :str # "ab" * n
               fn = @lower.funcs.fetch(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
             end
@@ -426,7 +432,9 @@ module Indus
       when :float then i.op = :call; i.args = [@lower.funcs.fetch(:__float_to_s), i.args[0]]
       when :int, :int? then i.op = :itos
       when :bool then i.op = :bool_to_s
-      else raise "inspect of #{t.inspect} not supported"
+      else
+        if arr(t) then i.op = :call; i.args = [@lower.funcs.fetch(:__arr_inspect), i.args[0]]
+        else raise "inspect of #{t.inspect} not supported" end
       end
     end
 
@@ -447,7 +455,7 @@ module Indus
       if t == :str && (fn = @lower.funcs[:"__str_#{name.to_s.sub('?', '_p')}"]) # String methods written in the prelude
         i.op = :call; i.args = [fn, recv, *args]; return
       end
-      if arr(t) && (fn = @lower.funcs[:"__arr_#{name.to_s.sub('?', '_p')}"])
+      if arr(t) && (fn = @lower.funcs[:"__arr_#{name.to_s.sub('?', '_p')}"] || @lower.funcs[:"__arr_#{name}"])
         i.op = :call; i.args = [fn, recv, *args]; return
       end
       return unless t.is_a?(Symbol) && (klass = @classes[t])
@@ -560,7 +568,7 @@ module Indus
       when :mkbuf, :bufappend then :strbuf
       when :bufderef then :str
       when :apop then (t = of(f, a[0])) && arr(t) ? t[1] : nil
-      when :hcap then :int
+      when :hcap, :gcepoch, :hsave then :int
       when :hkey_at then (t = of(f, a[0])) && hsh(t) ? t[1] : nil
       when :hval_at then (t = of(f, a[0])) && hsh(t) ? t[2] : nil
       when :seq, :sne, :scmp then :bool

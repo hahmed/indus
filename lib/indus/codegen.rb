@@ -249,12 +249,24 @@ module Indus
         when :rawmmap then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_mmap); @asm.mov(d, 0)
         when :adrlbl then @asm.adr(d, i.args[0])
         when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer
+        when :gcepoch then @asm.ldr_off(d, Asm::GBASE, @asm.global(:__gc_count)) # ...and the collection count it is valid for
         when :hrestore # ...and drop the iteration's garbage
-          if GC.enabled? # unless a collection moved the heap since the save
-            skip = @asm.uniq; r = reg(i.args[0])
-            @asm.ldr_off(16, Asm::GBASE, @asm.global(:__gc_from)); @asm.cmp(r, 16); @asm.bcond(:lo, skip)
-            @asm.ldr_off(16, Asm::GBASE, @asm.global(:__gc_from_end)); @asm.cmp(r, 16); @asm.bhs(skip)
-            @asm.mov(Asm::HEAP, r); @asm.label(skip)
+          if GC.enabled? # unless a collection ran since the save (semispaces swap, so a range test would be fooled)
+            skip = @asm.uniq; r = reg(i.args[0]); e = reg(i.args[1], 9)
+            @asm.ldr_off(16, Asm::GBASE, @asm.global(:__gc_count)); @asm.cmp(e, 16); @asm.bcond(:ne, skip)
+            @asm.mov(Asm::HEAP, r)
+            # frame maps are per function, so a dead slot may still hold a pointer into the memory
+            # just handed back; the next allocation would turn it into an interior pointer. Clear
+            # every pointer slot the body wrote.
+            header = b.succs.find { |sb| sb != b }
+            Escape.loop_body(@f, header, [b]).each_key do |bb|
+              (bb.phis + bb.insts).each do |v|
+                next unless GC.pointer?(v.ty)
+                @asm.str(31, slot_off(v)) if v.slot
+                @asm.str(31, @spill_base + 8 * v.home) if v.home
+              end
+            end
+            @asm.label(skip)
           else
             @asm.mov(Asm::HEAP, reg(i.args[0]))
           end

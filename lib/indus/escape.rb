@@ -35,7 +35,7 @@ module Indus
         end
         break unless changed
       end
-      funcs.each { |f| tier0(f); tier1(f) }
+      funcs.each { |f| tier0(f) unless ENV["NOTIER0"]; tier1(f) unless ENV["NOTIER1"] || ENV["NOTIER1_FN"] == f.name.to_s }
     end
 
     # values of f that escape: worklist over the "keeps it" positions
@@ -129,8 +129,9 @@ module Indus
         next unless region_safe?(f, h, body)
         # save the bump pointer before the loop, restore on every back edge
         save = Inst.new(:hsave); save.ty = :int; save.block = pre
-        pre.insts.insert(pre.insts.index(pre.term), save)
-        latches.each { |l| r = Inst.new(:hrestore, [save]); r.block = l; l.insts.insert(l.insts.index(l.term), r) }
+        epoch = Inst.new(:gcepoch); epoch.ty = :int; epoch.block = pre # the collection count: a restore is valid only if nothing moved since
+        pre.insts.insert(pre.insts.index(pre.term), save); pre.insts.insert(pre.insts.index(pre.term), epoch)
+        latches.each { |l| r = Inst.new(:hrestore, [save, epoch]); r.block = l; l.insts.insert(l.insts.index(l.term), r) }
       end
     end
 
