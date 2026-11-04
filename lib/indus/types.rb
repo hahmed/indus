@@ -55,6 +55,13 @@ module Indus
     def self.hsh(t) = t.is_a?(Array) && t[0] == :hash
 
     def self.reset! = (@ivars = nil; @consts = nil; @instances = nil)
+    # a prelude function by name: lowered on first use, typed in the current fixpoint
+    def self.fn(name)
+      f = @lower.demand(name)
+      @lower.lowered_late!.each { |g| g.ptypes ||= Array.new(g.params.size); Passes.trivial_phis(g); @funcs_live << g unless @funcs_live.include?(g) }
+      f
+    end
+    def self.fnq(name) = @lower.funcs.key?(name) ? fn(name) : nil
     # a snapshot of the program-wide tables, to detect a seam widening a type
     # that compiled code already relies on
     def self.snapshot = Marshal.load(Marshal.dump([@ivars.to_h { |k, v| [k, v.dup] }, @consts.dup]))
@@ -64,6 +71,7 @@ module Indus
       # function against the tables the whole program built
       @ivars ||= Hash.new { |h, k| h[k] = {} } # class name -> ivar index -> type
       @consts ||= {}
+      @funcs_live = funcs
       funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = f.cls.name if f.cls }
       @seams = funcs.any? { |f| f.all.any? { _1.op == :seam } }
       loop do
@@ -74,6 +82,14 @@ module Indus
           f.all.each do |i|
             # a value entering a slot whose type is wider than its own: two representation
             # changes happen at the value's *origin*, so a slot never mixes representations
+            # int -> Bignum coercions are inserted here, inside the fixpoint: the call names a
+            # prelude function that must be lowered and typed before the fixpoint ends
+            if @settled # once the operators have settled: an int operand of an add may still become a __big_add result
+              each_slot(f, i) { |v, dest, set| (set.(coerce(f, i.block, i, v, dest)); changed = true) if big?(dest) && v.is_a?(Inst) && %i[int int?].include?(of(f, v)) }
+              if i.op == :phi && big?(i.ty)
+                i.args.map! { |(pred, v)| %i[int int?].include?(of(f, v)) ? (changed = true; [pred, coerce(f, pred, pred.term, v, BIG)]) : [pred, v] }
+              end
+            end
             each_flow(f, i) do |v, dest|
               next unless v.is_a?(Inst)
               if @settled && dest == :int? && v.op == :const && v.ty == :nil then v.args[0] = INT_NIL; v.ty = :int; changed = true end # nil in a nullable int slot is the sentinel (settled: the slot might still widen to a pointer type)
@@ -109,7 +125,7 @@ module Indus
             dsend(f, i) if i.op == :dsend
             float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
             if %i[puts_v p_v print_v to_s].include?(i.op) && big?(of(f, i.args[0])) # Bignum prints through the prelude
-              c = Inst.new(:call, [@lower.funcs.fetch(:__big_to_s), i.args[0]]); c.ty = :str; c.block = i.block
+              c = Inst.new(:call, [fn(:__big_to_s), i.args[0]]); c.ty = :str; c.block = i.block
               i.block.insts.insert(i.block.insts.index(i), c)
               if i.op == :to_s then i.op = :nop; i.args = [c]; i.ty = :str else i.args = [c] end
               changed = true
@@ -117,9 +133,9 @@ module Indus
             if i.op == :eputs_v && (t = of(f, i.args[0])) # $stderr.puts: make it a string, then write to fd 2
               c = case t
                   when :str then i.args[0]
-                  when :float then Inst.new(:call, [@lower.funcs.fetch(:__float_to_s), i.args[0]])
+                  when :float then Inst.new(:call, [fn(:__float_to_s), i.args[0]])
                   when :int, :int? then Inst.new(:itos, [i.args[0]])
-                  when :dyn then Inst.new(:call, [@lower.funcs.fetch(:__dyn_to_s), i.args[0]])
+                  when :dyn then Inst.new(:call, [fn(:__dyn_to_s), i.args[0]])
                   else raise "$stderr.puts of #{t.inspect}"
                   end
               unless c.equal?(i.args[0]) then c.ty = :str; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c) end
@@ -127,7 +143,7 @@ module Indus
             end
             # printing/inspecting by type is irreversible, so it waits for the types to settle (below)
             if i.op == :cmp && arr(of(f, i.args[0])) && arr(of(f, i.args[1])) && %i[eq ne].include?(i.cond) # Array#== is elementwise
-              l, r = i.args; fn = @lower.funcs.fetch(:__arr_eq)
+              l, r = i.args; fn = fn(:__arr_eq)
               c = Inst.new(:call, [fn, l, r]); c.ty = :bool; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
               z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
               i.args = [c, z]; i.cond = i.cond == :eq ? :ne : :eq; changed = true # (a == b) is (eq_result != 0)
@@ -136,17 +152,22 @@ module Indus
               big_op(f, i); changed = true
             end
             if i.op == :mul && of(f, i.args[0]) == :str # "ab" * n
-              fn = @lower.funcs.fetch(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
+              fn = fn(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
             end
             if @settled
               if i.op == :alen && of(f, i.args[0]) == :dyn # length of a tagged value: by tag
-                i.op = :call; i.args = [@lower.funcs.fetch(:__dyn_length), i.args[0]]; i.ty = :int; changed = true
+                i.op = :call; i.args = [fn(:__dyn_length), i.args[0]]; i.ty = :int; changed = true
               end
-              if i.op == :to_s && of(f, i.args[0]) == :dyn # Object#to_s by tag
-                i.op = :call; i.args = [@lower.funcs.fetch(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true
+              if i.op == :to_s && (t = of(f, i.args[0])) # to_s by type; a prelude call must be made here, so it gets typed
+                case t
+                when :str then i.op = :nop; changed = true
+                when :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]; i.ty = :str; changed = true
+                when :bool then i.op = :bool_to_s; changed = true
+                when :dyn then i.op = :call; i.args = [fn(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true
+                end
               end
               if %i[sappend scat bufappend lshift_or_append].include?(i.op) && of(f, i.args[1]) == :dyn # must be a String at run time
-                c = Inst.new(:call, [@lower.funcs.fetch(:__dyn_str), i.args[1]]); c.ty = :str; c.block = i.block
+                c = Inst.new(:call, [fn(:__dyn_str), i.args[1]]); c.ty = :str; c.block = i.block
                 i.block.insts.insert(i.block.insts.index(i), c); i.args[1] = c; changed = true
               end
               dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
@@ -271,13 +292,8 @@ module Indus
           end
           if of(f, l) == :int? && of(f, r) == :nil then r.args[0] = INT_NIL; r.ty = :int
           elsif of(f, r) == :int? && of(f, l) == :nil then l.args[0] = INT_NIL; l.ty = :int end
-        when :to_s
-          case of(f, i.args[0])
-          when :str then i.op = :nop
-          when :float then i.op = :call; i.args = [@lower.funcs.fetch(:__float_to_s), i.args[0]]; i.ty = :str
-          when :bool then i.op = :bool_to_s
-          else i.op = :itos
-          end
+        when :to_s # (by type, resolved in the fixpoint's settled round; anything left is an int)
+          i.op = :itos
         when :to_i then i.op = :stoi if of(f, i.args[0]) == :str
         when :puts_v, :p_v, :print_v
           t = of(f, i.args[0])
@@ -304,7 +320,7 @@ module Indus
     # puts/p/print of a Float: format with the prelude's __float_to_s (a call,
     # typed by this same fixpoint), then print the string
     def self.float_print(f, i)
-      fts = @lower.funcs[:__float_to_s] or raise "Float#to_s needs the core prelude"
+      fts = fn(:__float_to_s)
       c = Inst.new(:call, [fts, i.args[0]]); c.block = i.block
       i.block.insts.insert(i.block.insts.index(i), c)
       i.args = [c]
@@ -472,12 +488,12 @@ module Indus
     def self.big_op(f, i)
       l, r = i.args.map { |v| big?(of(f, v)) ? v : coerce(f, i.block, i, v, BIG) } # lift the int operand now, so the callee is typed BIG from the start
       if i.op == :cmp
-        c = Inst.new(:call, [@lower.funcs.fetch(:__big_cmp), l, r]); c.ty = :int; c.block = i.block
+        c = Inst.new(:call, [fn(:__big_cmp), l, r]); c.ty = :int; c.block = i.block
         i.block.insts.insert(i.block.insts.index(i), c)
         z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
         i.args = [c, z] # cond unchanged: (a < b) is (cmp(a, b) < 0)
       else
-        fn = @lower.funcs.fetch(BIG_OPS.fetch(i.op))
+        fn = fn(BIG_OPS.fetch(i.op))
         i.op = :call; i.args = [fn, l, r]; i.ty = BIG
       end
     end
@@ -542,7 +558,7 @@ module Indus
                 eq: :__dyn_eq, ne: :__dyn_ne, lt: :__dyn_lt, le: :__dyn_le, gt: :__dyn_gt, ge: :__dyn_ge }.freeze
     def self.dyn_op(f, i)
       name = i.op == :cmp ? DYN_OPS.fetch(i.cond) : DYN_OPS.fetch(i.op)
-      fn = @lower.funcs[name] or raise "#{name} needs the core prelude"
+      fn = fn(name)
       fn.ptypes[0] = fn.ptypes[1] = :dyn
       i.op = :call; i.args = [fn, *i.args]; i.cond = nil
       i.ty = fn.rtype
@@ -551,7 +567,7 @@ module Indus
     # puts/p/inspect of a tagged scalar: the prelude dispatches on the tag
     def self.dyn_print(f, i)
       name = i.op == :inspect_v || i.op == :p_v ? :__dyn_inspect : :__dyn_to_s
-      fn = @lower.funcs[name] or raise "#{name} needs the core prelude"
+      fn = fn(name)
       if i.op == :inspect_v # the value itself becomes the call
         i.op = :call; i.args = [fn, i.args[0]]; i.ty = :str
       else
@@ -565,12 +581,12 @@ module Indus
     def self.inspect_v(f, i)
       t = of(f, i.args[0])
       case t
-      when :str then i.op = :call; i.args = [@lower.funcs.fetch(:__quote), i.args[0]]
-      when :float then i.op = :call; i.args = [@lower.funcs.fetch(:__float_to_s), i.args[0]]
+      when :str then i.op = :call; i.args = [fn(:__quote), i.args[0]]
+      when :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]
       when :int, :int? then i.op = :itos
       when :bool then i.op = :bool_to_s
       else
-        if arr(t) then i.op = :call; i.args = [@lower.funcs.fetch(:__arr_inspect), i.args[0]]
+        if arr(t) then i.op = :call; i.args = [fn(:__arr_inspect), i.args[0]]
         else raise "inspect of #{t.inspect} not supported" end
       end
     end
@@ -588,17 +604,17 @@ module Indus
       if name == :value && args.empty? && !(t.is_a?(Symbol) && @classes[t]) && !poly?(t) && t
         i.op = :nop; i.args = [recv]; i.ty = t; return # a finished Thread is its value (threads run at Thread.new)
       end
-      if t == :int && (fn = @lower.funcs[:"__fd_#{name}"]) # a file descriptor is an Integer: fd.puts, fd.write, fd.close
+      if t == :int && (fn = fnq(:"__fd_#{name}")) # a file descriptor is an Integer: fd.puts, fd.write, fd.close
         i.op = :call; i.args = [fn, recv, *args]; return
       end
       if t == :int && %i[succ pred].include?(name) && args.empty? # Integer#succ / #pred
         c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
         i.op = name == :succ ? :add : :sub; i.args = [recv, c]; return
       end
-      if t == :str && (fn = @lower.funcs[:"__str_#{name.to_s.sub('?', '_p')}"]) # String methods written in the prelude
+      if t == :str && (fn = fnq(:"__str_#{name.to_s.sub('?', '_p')}")) # String methods written in the prelude
         i.op = :call; i.args = [fn, recv, *args]; return
       end
-      if arr(t) && (fn = @lower.funcs[:"__arr_#{name.to_s.sub('?', '_p')}"] || @lower.funcs[:"__arr_#{name}"])
+      if arr(t) && (fn = fnq(:"__arr_#{name.to_s.sub('?', '_p')}") || fnq(:"__arr_#{name}"))
         i.op = :call; i.args = [fn, recv, *args]; return
       end
       return unless t.is_a?(Symbol) && (klass = @classes[t])
@@ -722,7 +738,9 @@ module Indus
       when :lshift_or_append then (t = of(f, a[0])) && (t == :int ? :int : t)
       when :to_s then (t = of(f, a[0])) && (t == :str ? :str : narrow(t) == :int ? :str : nil)
       when :puts_v then of(f, a[0]) && :int
-      when :add, :sub, :mul, :div then join(narrow(of(f, a[0])), narrow(of(f, a[1])))
+      when :add, :sub, :mul, :div
+        l, r = of(f, a[0]), of(f, a[1])
+        l && r ? join(narrow(l), narrow(r)) : nil # both sides known, or no guess: a str * n is not an int
       when :and, :or then (of(f, a[0]) == :bool && of(f, a[1]) == :bool) ? :bool : :int
       when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub then :int
       when :cmp, :ucmp, :isa, :isa_dyn then :bool
@@ -813,7 +831,7 @@ module Indus
       c = case
           when dest == :float && t == :int then Inst.new(:itof, [v]).tap { _1.ty = :float }
           when dest == :dyn && t != :dyn then Inst.new(:box, [v, t]).tap { _1.ty = :dyn }
-          when big?(dest) && %i[int int?].include?(t) then Inst.new(:call, [@lower.funcs.fetch(:__big_from_int), v]).tap { _1.ty = BIG }
+          when big?(dest) && %i[int int?].include?(t) then Inst.new(:call, [fn(:__big_from_int), v]).tap { _1.ty = BIG }
           else return v
           end
       c.block = blk

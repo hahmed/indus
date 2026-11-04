@@ -52,11 +52,13 @@ module Indus
         f = @funcs[:"#{owner}.#{d.name}"] = Func.new(:"#{owner}.#{d.name}", (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0))
         @defs_by_func[f] = d
       end
+      @lazy = {} # prelude functions (__name): lowered on first demand, see `demand`
       defs.each do |d|
         next if yields?(d)
         ps = d.parameters
         f = @funcs[d.name] = Func.new(d.name, (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0))
         @defs_by_func[f] = d
+        @lazy[d.name] = d if d.name.to_s.start_with?("__")
       end
       methods = [] # [klass, def, func]
       structs.each do |st|
@@ -91,7 +93,9 @@ module Indus
       @pre = Pretype.new(@ast, @classes) # receiver kinds for the structural decisions below
       main = Func.new(:main, 0)
       lower_body(main, [], top)
-      defs.each { |d| lower_body(@funcs[d.name], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || []) if @funcs[d.name] }
+      # prelude functions are lowered only when something names them (most of the prelude is
+      # never used by a given program, and typing it first was half the compile)
+      defs.each { |d| lower_body(@funcs[d.name], def_param_names(d), d.body&.body || []) if @funcs[d.name] && !@lazy.key?(d.name) && !(@lowered_late || []).include?(@funcs[d.name]) }
       @dm_bodies.each { |f, (params, stmts)| lower_body(f, params, stmts) }
       sdefs.each do |owner, d|
         @owner = owner
@@ -107,10 +111,41 @@ module Indus
           lower_body(f, names, body, k, ct)
         end
       end
-      all = [main, *@funcs.values, *methods.map { _1[2] }]
+      demand(:__gc_run) if @funcs[:__gc_run] # the collector is entered from the runtime, not by a call
+      drain_demands
+      all = [main, *@funcs.values.reject { @lazy.key?(_1.name) }, *methods.map { _1[2] }]
       all.each { prune(_1) }
       all
     end
+
+    def def_param_names(d) = (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || [])
+
+    # a prelude function named by lowered code or by a Types rule: lowered now (once).
+    # Returns the Func; `lowered_late` collects the ones Types has to pick up.
+    public
+    def demand(name)
+      f = @funcs.fetch(name) { raise "unknown prelude function #{name}" }
+      if (d = @lazy&.delete(name))
+        saved = [@f, @locals, @cur, @klass, @ct, @owner, @loop, @blk_pfx]
+        lower_body(f, def_param_names(d), d.body&.body || [])
+        @f, @locals, @cur, @klass, @ct, @owner, @loop, @blk_pfx = saved
+        prune(f)
+        (@lowered_late ||= []) << f
+      end
+      f
+    end
+    def lowered_late! = (l = @lowered_late || []; @lowered_late = []; l)
+
+    # lowering a body may name more prelude functions; lower until nothing new is named
+    def drain_demands
+      loop do
+        late = lowered_late!
+        break if late.empty?
+        @early_lowered = (@early_lowered || []) + late
+      end
+      @funcs # the late ones are in @funcs already
+    end
+    public
 
     # the resident compiler: lower one `def` from a string into a Func that
     # replaces `old` (same class, same signature)
@@ -604,14 +639,14 @@ module Indus
       elsif %i[lock synchronize sleep].include?(n.name) || n.receiver.is_a?(Prism::ConstantReadNode) && %i[Mutex Queue].include?(n.receiver.name)
         raise "#{n.name}: threads run to completion at Thread.new here; anything that would observe interleaving is not supported"
       elsif n.name == :delete && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :File
-        emit(:call, [@funcs.fetch(:__file_delete), expr(args[0])])
+        emit(:call, [demand(:__file_delete), expr(args[0])])
       elsif n.name == :clock_gettime && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Process
         emit(:clock, [])                 # Process.clock_gettime(any clock): monotonic seconds as a Float
       elsif n.name == :round && args.size == 1 && n.receiver
         if args[0].is_a?(Prism::IntegerNode) && args[0].value <= 0 # x.round(0) is an Integer in Ruby
-          emit(:call, [@funcs.fetch(:__float_round0), expr(n.receiver)])
+          emit(:call, [demand(:__float_round0), expr(n.receiver)])
         else
-          emit(:call, [@funcs.fetch(:__float_round), expr(n.receiver), expr(args[0])])
+          emit(:call, [demand(:__float_round), expr(n.receiver), expr(args[0])])
         end
       elsif n.name == :raise && n.receiver.nil?
         emit(:trap, []); return const(0)  # no exceptions yet: die where Ruby would raise
@@ -665,6 +700,7 @@ module Indus
         emit(:fld_get, [me_val, @klass.ivar(iv)]) # a bare attr_reader call inside a method
       else
         f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
+        f = demand(n.name) if n.name.to_s.start_with?("__")
         emit(:call, [f, *call_args(f, args)])
       end
     end
@@ -785,21 +821,21 @@ module Indus
         return @locals.delete(outv)
       when :open # File.open(path, mode) { |f| ... }: f is the descriptor, closed after the block
         raise "block passed to #{recv&.name}.open" unless recv.is_a?(Prism::ConstantReadNode) && recv.name == :File
-        fd = emit(:call, [@funcs.fetch(:__file_open), expr(args[0]), args[1] ? expr(args[1]) : emit(:sconst, ["r"])])
+        fd = emit(:call, [demand(:__file_open), expr(args[0]), args[1] ? expr(args[1]) : emit(:sconst, ["r"])])
         pfx = :"blk#{@f.blocks.size}:"
         @locals[:"#{pfx}#{params[0]}"] = fd if params[0]
         @blk_pfx = (@blk_pfx || []) << pfx
         body.each { expr(_1) }
         @blk_pfx.pop
         @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
-        return emit(:call, [@funcs.fetch(:__file_close), fd])
+        return emit(:call, [demand(:__file_close), fd])
       when :each_line # fd.each_line { |line| }: the whole file, split keeping each newline
-        lines = emit(:call, [@funcs.fetch(:__fd_lines), expr(recv)])
+        lines = emit(:call, [demand(:__fd_lines), expr(recv)])
         return array_loop(lines, :each, params, body)
       when :sort_by, :min_by, :max_by # Schwartzian: keys once by `map`, then the prelude sorts/selects by key
         arr = expr(recv)
         keys = array_loop(arr, :map, params, body)
-        return emit(:call, [@funcs.fetch(:"__arr_#{n.name}"), arr, keys])
+        return emit(:call, [demand(:"__arr_#{n.name}"), arr, keys])
       when :sum, :count # accumulate the block's value / truthiness
         accv = :"acc#{@f.blocks.size}:v"
         @locals[accv] = const(0)

@@ -26,22 +26,26 @@ module Indus
       funcs.select { |f| live[f] || (seams && f.ptypes.none?(&:nil?)) }
     end
 
+    # dead phis (the value of an if whose arms are statements) and phis of one value: gone.
+    # Per round: one scan for uses, decide every phi, then one substitution pass.
     def self.trivial_phis(f)
       loop do
-        changed = false
+        all = f.all
         used = {}
-        f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { used[_1] = true if _1.is_a?(Inst) } }
+        all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { used[_1] = true if _1.is_a?(Inst) } }
+        subst = {}; removed = false
         f.blocks.each do |b|
-          b.phis.dup.each do |p|
-            unless used[p] # dead phi (e.g. the value of an if whose arms are statements)
-              b.phis.delete(p); changed = true; next
-            end
+          b.phis.reject! do |p|
+            next (removed = true) unless used[p]
             others = p.args.map(&:last).reject { _1 == p }.uniq
-            next unless others.size == 1
-            f.replace_uses(p, others[0]); b.phis.delete(p); changed = true
+            next false unless others.size == 1
+            subst[p] = others[0]; removed = true
           end
         end
-        break unless changed
+        break unless removed
+        next if subst.empty?
+        resolve = ->(v) { v = subst[v] while subst.key?(v); v }
+        f.all.each { |i| i.op == :phi ? i.args.map! { |(bb, v)| [bb, resolve.(v)] } : i.args.map! { |a| a.is_a?(Inst) ? resolve.(a) : a } }
       end
     end
 
