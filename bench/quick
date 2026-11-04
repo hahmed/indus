@@ -1,0 +1,16 @@
+#!/bin/bash
+# bench/quick -- 30-second sanity check: CRuby vs Spinel vs Indus on three programs
+# that exercise different things (calls, allocation, dispatch). Best of 3, host-side.
+# CRuby/Spinel: whole-process wall time. Indus: in-process run after compile.
+# For the fair, cold-start comparison use bench/report.
+cd "$(dirname "$0")/.."
+trap 'pkill -9 -P $$ 2>/dev/null' EXIT INT TERM
+SP=${SPINEL:-$HOME/src/github.com/matz/spinel/spinel}; OUT=/tmp/indus-quick; mkdir -p $OUT
+best() { for i in 1 2 3; do /usr/bin/time -p "$@" 2>&1 >/dev/null | awk '/real/{print $2}'; done | sort -n | head -1; }
+printf "%-14s %8s %8s %8s\n" bench cruby spinel indus
+for b in ${@:-fib binary_trees tree_walker}; do
+  [ -x $OUT/$b ] || (cd $OUT && cp "$OLDPWD/bench/$b.rb" . && GEM_HOME=/nonexistent "$SP" $b.rb -o $b >/dev/null 2>&1)
+  r=$(best ruby bench/$b.rb); s=$([ -x $OUT/$b ] && best $OUT/$b || echo n/a)
+  ind=$(for i in 1 2 3; do timeout -k 2 60 bin/indus bench/$b.rb 2>&1 >/dev/null | grep -o '[0-9.]* ms' | cut -d' ' -f1; done | sort -n | head -1)
+  printf "%-14s %7ss %7ss %7sms\n" $b "$r" "$s" "$ind"
+done
