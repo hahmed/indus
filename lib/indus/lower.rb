@@ -59,7 +59,8 @@ module Indus
       defs.each do |d|
         next if yields?(d) && !d.parameters&.block # a yielder without &blk inlines at its call sites
         ps = d.parameters
-        f = @funcs[d.name] = Func.new(d.name, (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0) + (ps&.block ? 1 : 0))
+        f = @funcs[d.name] = Func.new(d.name, def_param_names(d).size)
+        f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
         @defs_by_func[f] = d
         @lazy[d.name] = d if d.name.to_s.start_with?("__")
       end
@@ -91,8 +92,8 @@ module Indus
             next if st.receiver.is_a?(Prism::SelfNode) # Owner.m, registered above
             if yields?(st) then @yielders[st.name] = [k, st]; next end # inlined only
             ps = st.parameters
-            f = Func.new(:"#{k.name}##{st.name}", 1 + (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0) + (ps&.rest ? 1 : 0))
-            f.rest = true if ps&.rest
+            f = Func.new(:"#{k.name}##{st.name}", 1 + def_param_names(st).size)
+            f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
             f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
           when Prism::CallNode
             next if st.name == :include # mixed in above
@@ -117,7 +118,6 @@ module Indus
       methods.each do |k, d, f, names, body, ct|
         if d
           names = [:self, *def_param_names(d)]
-          names << d.parameters.rest.name if d.parameters&.rest # *args arrives as an array
           lower_body(f, names, d.body&.body || [], k)
         else
           lower_body(f, names, body, k, ct)
@@ -132,7 +132,12 @@ module Indus
       all
     end
 
-    def def_param_names(d) = (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []) + (d.parameters&.block ? [d.parameters.block.name || :__blk] : [])
+    def def_param_names(d)
+      ps = d.parameters
+      return [] unless ps
+      (ps.requireds.map(&:name)) + (ps.optionals.map(&:name)) + (ps.rest.is_a?(Prism::RestParameterNode) ? [ps.rest.name || :__rest] : []) +
+        (ps.keywords.map(&:name)) + (ps.block ? [ps.block.name || :__blk] : [])
+    end
 
     # a prelude function named by lowered code or by a Types rule: lowered now (once).
     # Returns the Func; `lowered_late` collects the ones Types has to pick up.
@@ -243,19 +248,20 @@ module Indus
       args = args.dup
       kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
       vals = args.map { expr(_1) }
-      return vals if f.rest
+      if f.rest && (d = @defs_by_func[f]) # the extra positionals become the *rest array
+        ps = d.parameters
+        nfixed = ps.requireds.size + ps.optionals.size
+        fixed, extra = vals[0, nfixed], vals[nfixed..] || []
+        vals = fixed + [pack_values(extra)]
+      elsif f.rest
+        return vals
+      end
       vals = fill_defaults(f, vals, kw) if (vals.size + skip < f.params.size || kw) && @defs_by_func[f]
       vals
     end
 
     # positional and keyword arguments for a call to f, defaults filled
-    def call_args(f, args)
-      args = args.dup
-      kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
-      vals = args.map { expr(_1) }
-      vals = fill_defaults(f, vals, kw) if vals.size < f.params.size || kw
-      vals
-    end
+    def call_args(f, args) = call_args_raw(f, args, 0)
 
     # the type a constant names, for refinement
     def kind_for(cname)
@@ -382,6 +388,7 @@ module Indus
     def kind_of(n)
       if @pre && (k = @pre[n])
         return :array if k.is_a?(Array) && k[0] == :array
+        return :hash if k.is_a?(Array) && k[0] == :hash
         return :range if k == [:range]
         return k if k.is_a?(Symbol) && (@classes[k] || %i[int str].include?(k))
       end
@@ -392,6 +399,7 @@ module Indus
     def syntactic_kind(n)
       case n
       when Prism::ArrayNode then :array
+      when Prism::HashNode then :hash
       when Prism::RangeNode then :range
       when Prism::IntegerNode then :int
       when Prism::StringNode, Prism::InterpolatedStringNode then :str
@@ -399,6 +407,7 @@ module Indus
       when Prism::LocalVariableReadNode then (@kinds || {})[lname(n.name)]
       when Prism::InstanceVariableReadNode then (@ivar_kinds || {})[[@klass&.name, n.name]]
       when Prism::CallNode
+        return :hash if n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash
         if n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode)
           n.receiver.name == :Array ? :array : (@classes[n.receiver.name] ? n.receiver.name : nil)
         elsif %i[map keys to_a].include?(n.name) then :array
@@ -482,6 +491,11 @@ module Indus
       when Prism::InstanceVariableReadNode
         return emit(:gget, [:"#{@owner}#{n.name}"]) if @owner # a module's / class object's own ivar
         emit(:fld_get, [me_val, @klass.ivar(n.name)])
+      when Prism::InstanceVariableOperatorWriteNode # @x += v
+        cur = @owner ? emit(:gget, [:"#{@owner}#{n.name}"]) : emit(:fld_get, [me_val, @klass.ivar(n.name)])
+        v = emit(ARITH.fetch(n.binary_operator), [cur, expr(n.value)])
+        @owner ? emit(:gset, [:"#{@owner}#{n.name}", v]) : emit(:fld_set, [me_val, @klass.ivar(n.name), v])
+        v
       when Prism::InstanceVariableWriteNode
         if @owner then v = expr(n.value); emit(:gset, [:"#{@owner}#{n.name}", v]); return v end
         (@hash_defaults ||= {})[[@klass&.name, n.name]] = n.value.arguments.arguments[0] if hash_new_with_default?(n.value)
@@ -497,7 +511,8 @@ module Indus
       when Prism::GlobalVariableWriteNode
         v = expr(n.value); emit(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode
-        if @ct&.key?(n.name) then (c = const(sym_id(@ct[n.name])); c.ty = :sym; c) # compile-time symbol
+        if @in_safe_nav && @in_safe_nav_node.equal?(n) then @in_safe_nav
+        elsif @ct&.key?(n.name) then (c = const(sym_id(@ct[n.name])); c.ty = :sym; c) # compile-time symbol
         elsif shared?(n.name) then emit(:cell_get, [@locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" }])
         else @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" } end
       when Prism::LocalVariableWriteNode
@@ -652,6 +667,15 @@ module Indus
 
     def call(n)
       args = n.arguments&.arguments || []
+      if n.safe_navigation? && !@in_safe_nav # x&.m: nil when x is nil
+        r = expr(n.receiver)
+        return (c = const(0); c.ty = :nil; c) if r.ty == :nil
+        tb, eb, mb = @f.new_block(:snthen), @f.new_block(:snelse), @f.new_block(:snmerge)
+        emit(:condbr, [r, tb, eb])
+        @cur = tb; @in_safe_nav = r; @in_safe_nav_node = n.receiver; v = call(n); @in_safe_nav = nil; tend = @cur; emit(:br, [mb])
+        @cur = eb; nilv = const(0); nilv.ty = :nil; emit(:br, [mb])
+        @cur = mb; ph = mb.phi; ph.args = [[tend, v], [eb, nilv]]; return ph
+      end
       # a receiver known to be a user object: its method, whatever the name (size, push, to_s ...
       # all mean the class's own method, not the builtin shortcut below)
       if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send respond_to? class_eval instance_variable_get].include?(n.name)
@@ -663,21 +687,8 @@ module Indus
         c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
         return emit(:call, [f, *call_args(f, args), c])
       end
-      if n.block.is_a?(Prism::BlockArgumentNode) && n.block.expression.is_a?(Prism::SymbolNode) && n.receiver # map(&:upcase): call that method on each element
-        sym = n.block.expression.unescaped.to_sym
-        arr = expr(n.receiver); pn = :__e
-        kind = %i[select reject].include?(n.name) ? n.name : n.name
-        return array_loop(arr, kind, [pn], ->(pfx) { emit(:mcall, [sym, @locals.fetch(:"#{pfx}#{pn}")]) }) if %i[map each].include?(n.name)
-        if %i[select reject].include?(n.name)
-          outv = :"sel#{@f.blocks.size}:out"
-          @locals[outv] = emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)])
-          counted_loop(const(0), emit(:alen, [arr]), :lt, [pn], ->(pfx) { emit(:mcall, [sym, @locals.fetch(:"#{pfx}#{pn}")]) }) do |i, ps, pfx|
-            @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i])
-            @select_target = [outv, emit(:aget, [arr, i]), n.name == :reject]
-          end
-          return @locals.delete(outv)
-        end
-        raise "&:#{sym} with #{n.name}: not supported"
+      if n.block.is_a?(Prism::BlockArgumentNode) && n.block.expression.is_a?(Prism::SymbolNode) && n.receiver
+        return block_call(n, args) # map(&:upcase), group_by(&:length), ...: the block { |e| e.sym }
       end
       if n.block.is_a?(Prism::BlockArgumentNode) # m(&b): the block is already a value
         bv = expr(n.block.expression)
@@ -811,6 +822,7 @@ module Indus
         n.name == :printf ? emit(:print_v, [str]) : str
 
       elsif n.name == :split && args.empty? && n.receiver then emit(:mcall, [:split, expr(n.receiver), emit(:sconst, [" "])]) # split on whitespace
+      elsif n.name == :each_with_index && args.empty? && n.receiver && !n.block then emit(:mcall, [:each_with_index_pairs, expr(n.receiver)]) # arr.each_with_index.map { |x, i| }
       elsif n.name == :times && args.empty? && n.receiver && !n.block then range_array(n)                 # 3.times.to_a
       elsif n.name == :each_char && args.empty? && n.receiver && !n.block then emit(:mcall, [:chars, expr(n.receiver)]) # "ab".each_char.to_a
       elsif n.name == :to_a && args.empty? && n.receiver && (k = kind_of(n.receiver)) == :array then expr(n.receiver)
@@ -834,6 +846,12 @@ module Indus
         if n.receiver.is_a?(Prism::LocalVariableReadNode) then @locals[lname(n.receiver.name)] = r
         else emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
         r
+      elsif n.name == :[] && args.size == 1 && args[0].is_a?(Prism::RangeNode) # s[a..b], a[2..], a[..-2]
+        rg = args[0]
+        lo = rg.left ? expr(rg.left) : const(0)
+        hi = rg.right ? expr(rg.right) : const(-1) # to the end (an endless range)
+        excl = rg.exclude_end? && rg.right ? const(1) : const(0)
+        emit(:mcall, [:slice_range, expr(n.receiver), lo, hi, excl])
       elsif n.name == :[] # array / hash / string: Types decides
         r = expr(n.receiver)
         return (c = const(0); c.ty = :nil; c) if r.ty == :nil # nil[k] (ARGV) is nil at compile time
@@ -883,7 +901,7 @@ module Indus
     def fill_defaults(f, vals, kw = nil)
       d = @defs_by_func[f] or raise "#{f.name}: wrong number of arguments"
       ps = d.parameters
-      names = ps.requireds.map(&:name) + ps.optionals.map(&:name) + ps.keywords.map(&:name)
+      names = ps.requireds.map(&:name) + ps.optionals.map(&:name) + (ps.rest.is_a?(Prism::RestParameterNode) ? [ps.rest.name || :__rest] : []) + ps.keywords.map(&:name)
       pfx = :"dflt#{@f.blocks.size}:"
       names.each_with_index { |nm, k| @locals[:"#{pfx}#{nm}"] = vals[k] if vals[k] }
       @blk_pfx = (@blk_pfx || []) << pfx
@@ -895,7 +913,7 @@ module Indus
       given = {}
       kw&.elements&.each { |el| given[el.key.unescaped.to_sym] = el.value }
       ps.keywords.each_with_index do |kp, k|
-        idx = ps.requireds.size + ps.optionals.size + k
+        idx = ps.requireds.size + ps.optionals.size + (ps.rest.is_a?(Prism::RestParameterNode) ? 1 : 0) + k
         node = given.fetch(kp.name) { kp.respond_to?(:value) && kp.value or raise "missing keyword #{kp.name} for #{f.name}" }
         vals[idx] = expr(node); @locals[:"#{pfx}#{kp.name}"] = vals[idx]
       end
@@ -912,6 +930,8 @@ module Indus
       when :__ld8 then emit(:rawld8, [expr(args[0]), expr(args[1])])          # byte i of string s
       when :__st8 then (a = expr(args[0]); ix = expr(args[1]); v = expr(args[2]); emit(:rawst8, [a, ix, v]); v)
       when :__sdup then emit(:sdup, [expr(args[0])])
+      when :__is_sym then emit(:is_sym, [expr(args[0])]) # true when the value's static type is Symbol (Types folds it)
+      when :__is_dyn then emit(:is_dyn, [expr(args[0])])
       when :__hcount then emit(:hcap, [expr(args[0])])                      # entries in insertion order: count, key i, value i
       when :__hkey_at then emit(:hkey_at, [expr(args[0]), expr(args[1])])
       when :__hval_at then emit(:hval_at, [expr(args[0]), expr(args[1])])
@@ -952,6 +972,7 @@ module Indus
       when :__unbox_arr then emit(:unbox, [expr(args[0]), [:arr, :dyn]])
       when :__unbox_float then emit(:unbox, [expr(args[0]), :float])
       when :__unbox_bool then emit(:unbox, [expr(args[0]), :bool])
+      when :__unbox_sym then emit(:unbox, [expr(args[0]), :sym])
       when :__gset_int then (v = expr(args[1]); emit(:gset, [args[0].unescaped.to_sym, v]); v)
       when :__gget_int then emit(:gget, [args[0].unescaped.to_sym])
       else raise "unknown intrinsic #{name}"
@@ -976,12 +997,18 @@ module Indus
       if n.receiver && !@recv_value && n.name == :map && times_enum?(n.receiver)
         return iterate_array_value(n, args, range_array(n.receiver))
       end
-      params = case blk.parameters
-               when Prism::NumberedParametersNode then (1..blk.parameters.maximum).map { :"_#{_1}" }
-               when nil then []
-               else blk.parameters.parameters.requireds.map(&:name)
-               end
-      body = blk.body&.body || []
+      if blk.is_a?(Prism::BlockArgumentNode) # m(&:sym) is m { |e| e.sym }
+        sym = blk.expression.unescaped.to_sym
+        params = [:__e]
+        body = ->(pfx) { call_on_value(sym, @locals.fetch(:"#{pfx}__e")) }
+      else
+        params = case blk.parameters
+                 when Prism::NumberedParametersNode then (1..blk.parameters.maximum).map { :"_#{_1}" }
+                 when nil then []
+                 else blk.parameters.parameters.requireds.map(&:name)
+                 end
+        body = blk.body&.body || []
+      end
       recv = n.receiver
       case n.name
       when :times then counted_loop(const(0), expr(recv), :lt, params, body)
@@ -1028,7 +1055,7 @@ module Indus
         lines = emit(:call, [demand(:__fd_lines), expr(recv)])
         return array_loop(lines, :each, params, body)
       when :sort_by, :min_by, :max_by # Schwartzian: keys once by `map`, then the prelude sorts/selects by key
-        if recv && !@recv_value && @pre && (pk = @pre[recv]).is_a?(Array) && pk[0] == :hash # a hash: sort its pairs
+        if recv && !@recv_value && kind_of(recv) == :hash # a hash: sort its pairs
           return iterate_array_value(n, args, hash_pairs(expr(recv)))
         end
         arr = recv_val(recv)
@@ -1047,6 +1074,59 @@ module Indus
           @fold_target = accv
         end
         return @locals.delete(accv)
+      when :any?, :all?, :none?, :find, :detect, :find_index, :count_if # one boolean / one element out of a pass
+        arr = recv_val(recv)
+        resv = :"pred#{@f.blocks.size}:v"
+        @locals[resv] = case n.name when :all? then const(1) when :any?, :none? then const(0) when :find, :detect then (c = const(0); c.ty = :nil; c) else const(-1) end
+        len = emit(:alen, [arr])
+        counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
+          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          @pred_target = [resv, n.name, emit(:aget, [arr, i]), i]
+        end
+        r = @locals.delete(resv)
+        return emit(:cmp, [r, const(0)], n.name == :none? ? :eq : :ne) if %i[any? all? none?].include?(n.name) # a Boolean
+        return r
+      when :group_by # Hash of key -> [elements]
+        arr = recv_val(recv)
+        hv = :"grp#{@f.blocks.size}:h"
+        @locals[hv] = emit(:hnew, [])
+        len = emit(:alen, [arr])
+        counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
+          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          @group_target = [hv, emit(:aget, [arr, i])]
+        end
+        return @locals.delete(hv)
+      when :partition # [accepted, rejected]
+        arr = recv_val(recv)
+        yes = :"part#{@f.blocks.size}:y"; no = :"part#{@f.blocks.size}:n"
+        @locals[yes] = emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)]); @locals[no] = emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)])
+        len = emit(:alen, [arr])
+        counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
+          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          @partition_target = [yes, no, emit(:aget, [arr, i])]
+        end
+        pair = emit(:anew, [const(2), (c = const(0); c.ty = :nil; c)])
+        pair = emit(:aset, [pair, const(0), @locals.delete(yes)]); emit(:aset, [pair, const(1), @locals.delete(no)])
+      when :each_with_object # the memo is the block's second argument and the result
+        arr = recv_val(recv); memo = expr(args[0])
+        mv = :"ewo#{@f.blocks.size}:m"; @locals[mv] = memo
+        len = emit(:alen, [arr])
+        counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
+          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          @locals[:"#{pfx}#{ps[1]}"] = @locals[mv] if ps[1]
+          @memo_target = [mv, :"#{pfx}#{ps[1]}"] if ps[1] # the block may grow the memo: take its view back
+        end
+        return @locals.delete(mv)
+      when :flat_map # map, then one level of concatenation
+        arr = recv_val(recv)
+        outv = :"fm#{@f.blocks.size}:out"
+        @locals[outv] = emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)])
+        len = emit(:alen, [arr])
+        counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
+          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          @flat_target = outv
+        end
+        return @locals.delete(outv)
       when :select, :reject, :filter # the elements the body accepts
         arr = recv_val(recv)
         outv = :"sel#{@f.blocks.size}:out"
@@ -1088,7 +1168,7 @@ module Indus
           end
           return counted_loop(lo, hi, r.exclude_end? ? :lt : :le, params, body)
         end
-        if %i[each each_pair map].include?(n.name) && recv && @pre && (pk = @pre[recv]).is_a?(Array) && pk[0] == :hash
+        if %i[each each_pair map].include?(n.name) && recv && kind_of(recv) == :hash
           return hash_each(expr(recv), params, body, n.name == :map)
         end
         k = recv ? kind_of(recv) : (@klass&.name) # receiverless: self
@@ -1123,7 +1203,8 @@ module Indus
       last = nil
       # the loop's own targets, taken before the body runs: a nested loop sets and clears its own
       map_target, sum_target, fold_target, select_target = @map_target, @sum_target, @fold_target, @select_target
-      @map_target = @sum_target = @fold_target = @select_target = nil
+      pred_target, group_target, partition_target, flat_target, memo_target = @pred_target, @group_target, @partition_target, @flat_target, @memo_target
+      @map_target = @sum_target = @fold_target = @select_target = @pred_target = @group_target = @partition_target = @flat_target = @memo_target = nil
       if (guard = @body_guard) # hash iteration: run the body only for used slots
         @body_guard = nil
         tb, eb, mb = @f.new_block(:gthen), @f.new_block(:gelse), @f.new_block(:gmerge)
@@ -1141,6 +1222,52 @@ module Indus
         @locals[outv] = emit(:aset, [@locals[outv], idx, last || const(0)])
       end
       if fold_target then @locals[fold_target] = last || const(0) end # reduce: the body's value is the next acc
+      if memo_target then mv, pn = memo_target; @locals[mv] = @locals[pn] if @locals[pn] end
+      if pred_target # any?/all?/none?/find: fold the body's truthiness
+        resv, kind, el, idx = pred_target
+        truthy = emit(:cmp, [last || const(0), const(0)], :ne)
+        case kind
+        when :all? then @locals[resv] = emit(:and, [@locals[resv], truthy])
+        when :any?, :none? then @locals[resv] = emit(:or, [@locals[resv], truthy])
+        when :find, :detect, :find_index # first hit wins: keep the earlier value once set
+          tb, eb, mb = @f.new_block(:fthen), @f.new_block(:felse), @f.new_block(:fmerge)
+          found = kind == :find_index ? emit(:cmp, [@locals[resv], const(-1)], :ne) : emit(:cmp, [@locals[resv], const(0)], :ne)
+          take = emit(:and, [truthy, emit(:cmp, [found, const(0)], :eq)])
+          before = @locals.dup
+          emit(:condbr, [take, tb, eb])
+          @cur = tb; @locals[resv] = kind == :find_index ? idx : el; tl = @locals; tend = @cur; emit(:br, [mb])
+          @cur = eb; @locals = before.dup; emit(:br, [mb])
+          @cur = mb; @locals = merge_locals(mb, [[tend, tl], [eb, before]])
+        end
+      end
+      if group_target # group_by: h[key] ||= []; h[key] << el
+        hv, el = group_target
+        key = last || const(0)
+        has = emit(:hkey, [@locals[hv], key])
+        tb, eb, mb = @f.new_block(:gthen), @f.new_block(:gelse), @f.new_block(:gmerge)
+        before = @locals.dup
+        emit(:condbr, [has, tb, eb])
+        @cur = tb; bucket = emit(:idx, [@locals[hv], key]); b1 = emit(:aset, [bucket, emit(:alen, [bucket]), el]); @locals[hv] = emit(:idx_set, [@locals[hv], key, b1]); tl = @locals; tend = @cur; emit(:br, [mb])
+        @cur = eb; @locals = before.dup
+        fresh = emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)]); fresh = emit(:aset, [fresh, const(0), el]); @locals[hv] = emit(:idx_set, [@locals[hv], key, fresh]); el2 = @locals; eend = @cur; emit(:br, [mb])
+        @cur = mb; @locals = merge_locals(mb, [[tend, tl], [eend, el2]])
+      end
+      if partition_target
+        yes, no, el = partition_target
+        truthy = emit(:cmp, [last || const(0), const(0)], :ne)
+        tb, eb, mb = @f.new_block(:pthen), @f.new_block(:pelse), @f.new_block(:pmerge)
+        before = @locals.dup
+        emit(:condbr, [truthy, tb, eb])
+        @cur = tb; @locals[yes] = emit(:aset, [@locals[yes], emit(:alen, [@locals[yes]]), el]); tl = @locals; tend = @cur; emit(:br, [mb])
+        @cur = eb; @locals = before.dup; @locals[no] = emit(:aset, [@locals[no], emit(:alen, [@locals[no]]), el]); el2 = @locals; eend = @cur; emit(:br, [mb])
+        @cur = mb; @locals = merge_locals(mb, [[tend, tl], [eend, el2]])
+      end
+      if flat_target # flat_map: append each element of the body's array
+        inner = last || const(0)
+        iv = :"fmi#{@f.blocks.size}:i"
+        n_ = emit(:alen, [inner])
+        counted_loop(const(0), n_, :lt, [], []) { |j, _ps, _pfx| @locals[flat_target] = emit(:aset, [@locals[flat_target], emit(:alen, [@locals[flat_target]]), emit(:aget, [inner, j])]) }
+      end
       if select_target # select { }: push the element when the body is truthy
         outv, el, invert = select_target
         tb, eb, mb = @f.new_block(:sthen), @f.new_block(:selse), @f.new_block(:smerge)
@@ -1287,7 +1414,7 @@ module Indus
       params.each_with_index { |p, k| @locals[:"#{bpfx}#{p}"] = vals[k] || const(0) }
       @blk_pfx = (@blk_pfx || []) << bpfx
       last = nil
-      body.each { last = expr(_1) }
+      last = run_body(body, bpfx)
       @blk_pfx.pop
       @locals.delete_if { |k, _| k.to_s.start_with?(bpfx.to_s) }
       @name_pfx, @ret_exit = saved_pfx, saved_ret
@@ -1402,6 +1529,16 @@ module Indus
     def free_locals(node, bound, out = []) = free_locals_plain(node, bound, out)
 
     def recv_val(recv) = @recv_value || expr(recv)
+
+    # values as a fresh array (Types gives it the elements' join)
+    def pack_values(vals)
+      arr = emit(:anew, [const(vals.size), (c = const(0); c.ty = :nil; c)])
+      vals.each_with_index { |v, k| arr = emit(:aset, [arr, const(k), v]) }
+      arr
+    end
+
+    # `v.name` for a value with no AST: ints/strings/arrays through Types, user objects through dispatch
+    def call_on_value(name, v) = emit(:mcall, [name, v])
     # Mod.m / Klass.m: a constant naming a class or module, not a value
     def const_recv?(n) = n.receiver.is_a?(Prism::ConstantReadNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name) || @funcs.key?(:"#{n.receiver.name}.#{n.name}"))
 
@@ -1416,7 +1553,7 @@ module Indus
     # every Symbol the program names, as a String array in the global SYMBOL_NAMES, built at the top of
     # main: Symbol#to_s / inspect / puts read it. (Symbols are ids at run time.)
     def install_symbol_names(main)
-      return unless @syms && !@syms.empty?
+      @syms ||= {}
       saved = [@f, @locals, @cur, @klass, @ct, @owner, @shared]
       @f, @cur, @locals, @klass, @ct, @owner, @shared = main, main.entry, {}, nil, {}, nil, []
       head = main.entry.insts.dup; main.entry.insts.clear

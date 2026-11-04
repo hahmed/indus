@@ -534,6 +534,31 @@ def __hash_inspect(h)
   out + "}"
 end
 
+# symbol keys print as `name: value`
+def __hash_inspect_sym(h)
+  out = "{"
+  i = 0
+  while i < __hcount(h)
+    out = out + ", " if i > 0
+    out = out + __sym_name(__hkey_at(h, i)) + ": " + __hval_at(h, i).inspect
+    i = i + 1
+  end
+  out + "}"
+end
+
+# tagged keys: a symbol prints as `name:`, anything else as inspect =>
+def __hash_inspect_dyn(h)
+  out = "{"
+  i = 0
+  while i < __hcount(h)
+    out = out + ", " if i > 0
+    k = __hkey_at(h, i)
+    out = out + (__dyn_sym_p(k) ? __dyn_to_s(k) + ": " : __dyn_inspect(k) + " => ") + __hval_at(h, i).inspect
+    i = i + 1
+  end
+  out + "}"
+end
+
 def __arr_slice(a, start, len)
   start = a.length + start if start < 0
   out = []
@@ -555,3 +580,53 @@ def __arr_lines(a)
   end
   out.length > 0 ? out[0, out.length - 1] : out
 end
+
+# s[a..b] / a[a..b]: negative indices count from the end; hi -1 with excl 0 means "to the end"
+def __str_slice_range(s, lo, hi, excl)
+  n = s.length
+  lo = lo + n if lo < 0
+  hi = hi + n if hi < 0
+  hi = hi - 1 if excl == 1
+  return "" if lo > n || lo < 0
+  hi = n - 1 if hi >= n
+  len = hi - lo + 1
+  len = 0 if len < 0
+  s[lo, len]
+end
+
+def __arr_slice_range(a, lo, hi, excl)
+  n = a.length
+  lo = lo + n if lo < 0
+  hi = hi + n if hi < 0
+  hi = hi - 1 if excl == 1
+  return [] if lo > n || lo < 0
+  hi = n - 1 if hi >= n
+  len = hi - lo + 1
+  len = 0 if len < 0
+  __arr_slice(a, lo, len)
+end
+
+# Array <=>: lexicographic, elementwise
+def __arr_cmp(a, b)
+  i = 0
+  while i < a.length && i < b.length
+    return -1 if a[i] < b[i]
+    return 1 if a[i] > b[i]
+    i = i + 1
+  end
+  return -1 if a.length < b.length
+  return 1 if a.length > b.length
+  0
+end
+
+def __arr_each_with_index_pairs(a)
+  out = []
+  i = 0
+  while i < a.length
+    out.push([a[i], i])
+    i = i + 1
+  end
+  out
+end
+
+def __arr_join0(a) = __arr_join(a, "")

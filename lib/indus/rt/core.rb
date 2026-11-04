@@ -143,8 +143,13 @@ def __dyn_to_s(v)
   if t == 4
     return __dyn_arr_inspect(__unbox_arr(v))
   end
+  if t == 12
+    return __sym_name(__unbox_sym(v))
+  end
   "#<object>"
 end
+
+def __dyn_sym_p(v) = __tag(v) == 12
 
 def __dyn_inspect(v)
   t = __tag(v)
@@ -153,6 +158,9 @@ def __dyn_inspect(v)
   end
   if t == 2
     return __quote(__unbox_str(v))
+  end
+  if t == 12
+    return ":" + __sym_name(__unbox_sym(v))
   end
   __dyn_to_s(v)
 end
@@ -242,12 +250,18 @@ def __dyn_lt(a, b)
   if __dyn_both_int(a, b)
     return __unbox_int(a) < __unbox_int(b)
   end
+  if __tag(a) == 2 && __tag(b) == 2
+    return __unbox_str(a) < __unbox_str(b)
+  end
   __dyn_num(a) < __dyn_num(b)
 end
 
 def __dyn_le(a, b)
   if __dyn_both_int(a, b)
     return __unbox_int(a) <= __unbox_int(b)
+  end
+  if __tag(a) == 2 && __tag(b) == 2
+    return __unbox_str(a) <= __unbox_str(b)
   end
   __dyn_num(a) <= __dyn_num(b)
 end
@@ -975,3 +989,13 @@ def __hash_key_p(h, k) = __hkey_p(h, k)
 def __hash_has_key_p(h, k) = __hkey_p(h, k)
 def __hash_include_p(h, k) = __hkey_p(h, k)
 def __hash_empty_p(h) = __hcount(h) == 0
+
+# unbox-or-trap for a tagged value used as one builtin kind
+def __dyn_int(v)
+  __trap if __tag(v) & 1 != 1
+  __unbox_int(v)
+end
+def __dyn_arr(v)
+  __trap if __tag(v) != 4
+  __unbox_arr(v)
+end
