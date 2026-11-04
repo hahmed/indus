@@ -21,6 +21,9 @@ module Indus
       mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
       defs = body.grep(Prism::DefNode)
       cdefs = body.grep(Prism::ClassNode) + mod_classes
+      # `def self.m` in a class or module body: a function named Owner.m, no self
+      @modules = mods.map { _1.constant_path.name }
+      sdefs = (cdefs + mods).flat_map { |c| (c.body&.body || []).grep(Prism::DefNode).select { _1.receiver.is_a?(Prism::SelfNode) }.map { [c.constant_path.name, _1] } }
       # constants written inside class bodies run before everything else
       class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode) }
       # Name = Struct.new(:a, :b) defines a class with accessors and an initialize
@@ -32,6 +35,11 @@ module Indus
       @yielders = {} # name -> [klass or nil, def]
       defs.each { |d| @yielders[d.name] = [nil, d] if yields?(d) }
       @defs_by_func = {}
+      sdefs.each do |owner, d|
+        ps = d.parameters
+        f = @funcs[:"#{owner}.#{d.name}"] = Func.new(:"#{owner}.#{d.name}", (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0))
+        @defs_by_func[f] = d
+      end
       defs.each do |d|
         next if yields?(d)
         ps = d.parameters
@@ -56,6 +64,7 @@ module Indus
         (c.body&.body || []).each do |st|
           case st
           when Prism::DefNode
+            next if st.receiver.is_a?(Prism::SelfNode) # Owner.m, registered above
             if yields?(st) then @yielders[st.name] = [k, st]; next end # inlined only
             f = Func.new(:"#{k.name}##{st.name}", 1 + (st.parameters&.requireds&.size || 0) + (st.parameters&.rest ? 1 : 0))
             f.rest = true if st.parameters&.rest
@@ -71,6 +80,11 @@ module Indus
       main = Func.new(:main, 0)
       lower_body(main, [], top)
       defs.each { |d| lower_body(@funcs[d.name], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || []) if @funcs[d.name] }
+      sdefs.each do |owner, d|
+        @owner = owner
+        lower_body(@funcs[:"#{owner}.#{d.name}"], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || [])
+        @owner = nil
+      end
       methods.each do |k, d, f, names, body, ct|
         if d
           names = [:self, *(d.parameters&.requireds&.map(&:name) || [])]
@@ -155,6 +169,15 @@ module Indus
         end.join.to_sym
       else raise "not a compile-time symbol: #{node.class}"
       end
+    end
+
+    # positional and keyword arguments for a call to f, defaults filled
+    def call_args(f, args)
+      args = args.dup
+      kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
+      vals = args.map { expr(_1) }
+      vals = fill_defaults(f, vals, kw) if vals.size < f.params.size || kw
+      vals
     end
 
     # the type a constant names, for refinement
@@ -485,29 +508,9 @@ module Indus
         a = args[0]
         if a.is_a?(Prism::StringNode) then emit(:puts_s, [a.unescaped])
         else emit(:puts_v, [expr(a)]) end # Types picks puts_i / puts_str
-      elsif n.name == :p && n.receiver.nil? && args.size == 1
-        if kind_of(args[0]) == :array # Array#inspect: "[" + elements.inspect.join(", ") + "]"
-          arr = expr(args[0])
-          outv = :"insp#{@f.blocks.size}:out"
-          @locals[outv] = emit(:sconst, ["["])
-          len = emit(:alen, [arr])
-          counted_loop(const(0), len, :lt, [], []) do |i, _ps, _pfx|
-            # out = out + (i > 0 ? ", " : "") + inspect(arr[i])
-            sep = emit(:sconst, [", "]); none = emit(:sconst, [""])
-            tb, eb, mb = @f.new_block(:ithen), @f.new_block(:ielse), @f.new_block(:imerge)
-            emit(:condbr, [emit(:cmp, [i, const(0)], :gt), tb, eb])
-            @cur = tb; emit(:br, [mb])
-            @cur = eb; emit(:br, [mb])
-            @cur = mb
-            ph = mb.phi; ph.args = [[tb, sep], [eb, none]]
-            el = emit(:aget, [arr, i])
-            @locals[outv] = emit(:scat, [emit(:scat, [@locals[outv], ph]), emit(:inspect_v, [el])])
-          end
-          out = emit(:scat, [@locals.delete(outv), emit(:sconst, ["]"])])
-          emit(:puts_str, [out])
-        else
-          emit(:p_v, [expr(args[0])])       # inspect form: strings quoted, nil as "nil"
-        end
+      elsif n.name == :p && n.receiver.nil? && args.size > 1
+        args.each { |a| p_one(a) }; return const(0)   # p a, b: one line each
+      elsif n.name == :p && n.receiver.nil? && args.size == 1 then p_one(args[0])
       elsif n.name == :print && n.receiver.nil? && args.size == 1
         emit(:print_v, [expr(args[0])])   # no newline
       elsif n.name == :Integer && n.receiver.nil? && args.size == 1
@@ -575,6 +578,12 @@ module Indus
         emit(:hkey, [expr(n.receiver), expr(args[0])])
       elsif n.name == :keys && args.empty? && n.receiver
         emit(:hkeys, [expr(n.receiver)])
+      elsif n.receiver.is_a?(Prism::ConstantReadNode) && (sf = @funcs[:"#{n.receiver.name}.#{n.name}"])
+        emit(:call, [sf, *call_args(sf, args)])                           # Owner.m(...)
+      elsif n.receiver.nil? && @owner && (sf = @funcs[:"#{@owner}.#{n.name}"])
+        emit(:call, [sf, *call_args(sf, args)])                           # m(...) inside Owner's singleton methods
+      elsif n.receiver.is_a?(Prism::ConstantReadNode) && !@classes[n.receiver.name] && !@modules.include?(n.receiver.name) && n.receiver.name != :Math
+        emit(:mcall, [n.name, expr(n.receiver), *args.map { expr(_1) }]) # a constant holding an object: RAND.rand
       elsif n.receiver && !n.receiver.is_a?(Prism::ConstantReadNode)
         # a method call on an object: resolved by Types once the receiver's class is known
         emit(:mcall, [n.name, expr(n.receiver), *args.map { expr(_1) }])
@@ -585,10 +594,7 @@ module Indus
         emit(:fld_get, [me_val, @klass.ivar(iv)]) # a bare attr_reader call inside a method
       else
         f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
-        kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
-        vals = args.map { expr(_1) }
-        vals = fill_defaults(f, vals, kw) if vals.size < f.params.size || kw
-        emit(:call, [f, *vals])
+        emit(:call, [f, *call_args(f, args)])
       end
     end
 
@@ -987,8 +993,10 @@ module Indus
       last || const(0)
     end
 
+    MATH_CONSTS = { PI: Math::PI, E: Math::E }.freeze
     def expr_const_path(n)
       # Mod::NAME -> the constant; Mod::Klass handled by callers (Klass.new)
+      return fconst(MATH_CONSTS.fetch(n.name)) if n.parent.is_a?(Prism::ConstantReadNode) && n.parent.name == :Math
       emit(:gget, [n.name])
     end
 
@@ -1003,9 +1011,44 @@ module Indus
       end
     end
 
+    # p of one value: arrays are inspected element by element, everything else by type
+    def p_one(a)
+      if kind_of(a) == :array # Array#inspect: "[" + elements.inspect.join(", ") + "]"
+          arr = expr(a)
+        outv = :"insp#{@f.blocks.size}:out"
+        @locals[outv] = emit(:sconst, ["["])
+        len = emit(:alen, [arr])
+        counted_loop(const(0), len, :lt, [], []) do |i, _ps, _pfx|
+          # out = out + (i > 0 ? ", " : "") + inspect(arr[i])
+          sep = emit(:sconst, [", "]); none = emit(:sconst, [""])
+          tb, eb, mb = @f.new_block(:ithen), @f.new_block(:ielse), @f.new_block(:imerge)
+          emit(:condbr, [emit(:cmp, [i, const(0)], :gt), tb, eb])
+          @cur = tb; emit(:br, [mb])
+          @cur = eb; emit(:br, [mb])
+          @cur = mb
+          ph = mb.phi; ph.args = [[tb, sep], [eb, none]]
+          el = emit(:aget, [arr, i])
+          @locals[outv] = emit(:scat, [emit(:scat, [@locals[outv], ph]), emit(:inspect_v, [el])])
+      end
+        out = emit(:scat, [@locals.delete(outv), emit(:sconst, ["]"])])
+        emit(:puts_str, [out])
+      else
+        emit(:p_v, [expr(a)])       # inspect form: strings quoted, nil as "nil"
+      end
+    end
+
+    # locals a loop body assigns exist (as nil) before the loop in Ruby: `while ..; result = f; end; result`
+    def assigned_locals(node, out = [])
+      return out unless node.is_a?(Prism::Node)
+      out << lname(node.name) if node.is_a?(Prism::LocalVariableWriteNode) || node.is_a?(Prism::LocalVariableOperatorWriteNode)
+      node.compact_child_nodes.each { assigned_locals(_1, out) } unless node.is_a?(Prism::BlockNode)
+      out
+    end
+
     def while_stmt(n, negate: false)
       hb, bb, xb = @f.new_block(:head), @f.new_block(:body), @f.new_block(:exit)
       xb.cold = true
+      assigned_locals(n.statements).uniq.each { |nm| @locals[nm] ||= (c = const(0); c.ty = :nil; c) }
       pre = @cur
       emit(:br, [hb])
       phis = @locals.to_h { |nm, v| ph = hb.phi; ph.args << [pre, v]; [nm, ph] }

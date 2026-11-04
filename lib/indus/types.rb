@@ -173,6 +173,7 @@ module Indus
         end
       end
       @settled = false
+      funcs.each { |f| f.all.each { |i| raise "uninitialized constant #{i.args[0]}" if i.op == :gget && !@consts.key?(i.args[0]) } }
       # classes that appear in any poly type carry a tag word
       tag = ->(t) { classes_of(t)&.each { @classes[_1].tagged = true } if poly?(t) || arr(t) && poly?(t[1]) }
       # a user object boxed into a :dyn must carry its class id: tag every class that is boxed
@@ -438,6 +439,10 @@ module Indus
         raise "no method #{name} on any of #{t[1].join(', ')}" if arms.all? { |(_, kind, _)| kind == :trap }
         i.op = :pcall; i.args = [arms, recv, *args]
         return
+      end
+      if t == :int && %i[succ pred].include?(name) && args.empty? # Integer#succ / #pred
+        c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+        i.op = name == :succ ? :add : :sub; i.args = [recv, c]; return
       end
       if t == :str && (fn = @lower.funcs[:"__str_#{name.to_s.sub('?', '_p')}"]) # String methods written in the prelude
         i.op = :call; i.args = [fn, recv, *args]; return
