@@ -38,7 +38,7 @@ module Indus
       # methods that take a block (contain yield) are inlined at call sites with a literal block;
       # they still get compiled as functions for block-less callers
       @yielders = {} # name -> [klass or nil, def]
-      defs.each { |d| @yielders[d.name] = [nil, d] if yields?(d) }
+      defs.each { |d| @yielders[d.name] = [nil, d] if yields?(d) && !d.parameters&.block }
       @defs_by_func = {}
       @dm_bodies = {}
       dm.each do |st|
@@ -54,9 +54,9 @@ module Indus
       end
       @lazy = {} # prelude functions (__name): lowered on first demand, see `demand`
       defs.each do |d|
-        next if yields?(d)
+        next if yields?(d) && !d.parameters&.block # a yielder without &blk inlines at its call sites
         ps = d.parameters
-        f = @funcs[d.name] = Func.new(d.name, (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0))
+        f = @funcs[d.name] = Func.new(d.name, (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0) + (ps&.block ? 1 : 0))
         @defs_by_func[f] = d
         @lazy[d.name] = d if d.name.to_s.start_with?("__")
       end
@@ -115,14 +115,15 @@ module Indus
           lower_body(f, names, body, k, ct)
         end
       end
+      lower_deferred_lambdas
       demand(:__gc_run) if @funcs[:__gc_run] # the collector is entered from the runtime, not by a call
       drain_demands
-      all = [main, *@funcs.values.reject { @lazy.key?(_1.name) }, *methods.map { _1[2] }]
+      all = [main, *@funcs.values.reject { @lazy.key?(_1.name) }, *methods.map { _1[2] }, *@classes.values.select(&:closure).map { _1.methods[:call] }]
       all.each { prune(_1) }
       all
     end
 
-    def def_param_names(d) = (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || [])
+    def def_param_names(d) = (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []) + (d.parameters&.block ? [d.parameters.block.name || :__blk] : [])
 
     # a prelude function named by lowered code or by a Types rule: lowered now (once).
     # Returns the Func; `lowered_late` collects the ones Types has to pick up.
@@ -341,8 +342,11 @@ module Indus
     end
     private
 
-    def lower_body(f, names, stmts, klass = nil, ct = {})
+    def lower_body(f, names, stmts, klass = nil, ct = {}, captured = nil, shared_in = [])
       @f, @locals, @cur, @klass, @ct = f, names.zip(f.params).to_h, f.entry, klass, ct
+      @block_param = (d = @defs_by_func[f]) && d.parameters&.block ? (d.parameters.block.name || :__blk) : (f.name.to_s.end_with?("$blk") ? :__blk : nil)
+      @shared = (stmts.is_a?(Array) ? shared_locals(stmts) : []) + shared_in
+      captured&.each { |nm| @locals[nm] = emit(:fld_get, [@locals[:self], klass.ivar(:"@#{nm}")]) } # a lambda's captures: the value, or the shared cell
       if f.name == :main && @mod_ivars # `module M; @x = 1; end` runs before the program
         @mod_ivars.each { |owner, w| @owner = owner; expr(w); @owner = nil }
       end
@@ -483,16 +487,22 @@ module Indus
         v = expr(n.value); emit(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode
         if @ct&.key?(n.name) then (c = const(sym_id(@ct[n.name])); c.ty = :sym; c) # compile-time symbol
+        elsif shared?(n.name) then emit(:cell_get, [@locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" }])
         else @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" } end
       when Prism::LocalVariableWriteNode
-        if n.value.is_a?(Prism::LambdaNode) # a lambda is inlined at its call sites
+        if n.value.is_a?(Prism::LambdaNode) # inlined at `x.call(...)` sites; a value wherever else x is used
           (@lambdas ||= {})[lname(n.name)] = n.value
-          return const(0)
+          return (@locals[lname(n.name)] = lambda_value(n.value))
         end
         v = expr(n.value) # value first: loops replace @locals
         (@kinds ||= {})[lname(n.name)] = kind_of(n.value)
+        return write_shared(n.name, v) if shared?(n.name)
         @locals[lname(n.name)] = v
       when Prism::LocalVariableOperatorWriteNode
+        if shared?(n.name)
+          l = emit(:cell_get, [@locals.fetch(lname(n.name))]); r = expr(n.value)
+          return write_shared(n.name, emit(ARITH.fetch(n.binary_operator), [l, r]))
+        end
         l = @locals.fetch(lname(n.name)); r = expr(n.value)
         @locals[lname(n.name)] = emit(ARITH.fetch(n.binary_operator), [l, r])
       when Prism::MultiWriteNode # a, @b = x, y  (evaluate all, then bind each target); a, b = arr destructures
@@ -534,6 +544,9 @@ module Indus
         emit(:br, [@loop[:next]])
         @cur = @f.new_block(:dead); const(0)
       when Prism::YieldNode
+        if (bv = @locals[@block_param || :__none]) && !@block # yield in a method holding its block as a value
+          return emit(:mcall, [:call, bv, *(n.arguments&.arguments || []).map { expr(_1) }])
+        end
         raise "yield outside an inlined block method" unless @block
         yield_block(n.arguments&.arguments || [])
       when Prism::RangeNode then raise "a Range is only supported as the receiver of each/map/to_a"
@@ -627,6 +640,16 @@ module Indus
 
     def call(n)
       args = n.arguments&.arguments || []
+      if n.block.is_a?(Prism::BlockNode) && n.receiver.nil? && (f = @funcs[n.name]) && (d = @defs_by_func[f]) && d.parameters&.block
+        blk = n.block
+        params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+        c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
+        return emit(:call, [f, *call_args(f, args), c])
+      end
+      if n.block.is_a?(Prism::BlockArgumentNode) # m(&b): the block is already a value
+        bv = expr(n.block.expression)
+        return block_arg_call(n, args, bv)
+      end
       return block_call(n, args) if n.block.is_a?(Prism::BlockNode)
       if n.name == :<< && (root = append_root(n)) # `<<` is append on strings/arrays and shift on integers; Types fixes up a misguess
         a = expr(n.receiver); v = expr(args[0])
@@ -912,6 +935,12 @@ module Indus
           @map_target = [outv, i]
         end
         return @locals.delete(outv)
+      when :lambda, :proc # lambda { |x| } / proc { |x| }: a closure value
+        if recv.nil? || (n.name == :new && recv.is_a?(Prism::ConstantReadNode) && recv.name == :Proc)
+          blk = n.block
+          raise "a block inside a method cannot yet refer to self or @ivars" if @klass && refers_to_self?(blk.body)
+          return closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, body)
+        end
       when :open # File.open(path, mode) { |f| ... }: f is the descriptor, closed after the block
         raise "block passed to #{recv&.name}.open" unless recv.is_a?(Prism::ConstantReadNode) && recv.name == :File
         fd = emit(:call, [demand(:__file_open), expr(args[0]), args[1] ? expr(args[1]) : emit(:sconst, ["r"])])
@@ -1000,11 +1029,11 @@ module Indus
         tb, eb, mb = @f.new_block(:gthen), @f.new_block(:gelse), @f.new_block(:gmerge)
         emit(:condbr, [guard, tb, eb])
         before = @locals.dup
-        @cur = tb; body.each { last = expr(_1) }; tend, tl = @cur, @locals; emit(:br, [mb]) unless @cur.term
+        @cur = tb; last = run_body(body, pfx); tend, tl = @cur, @locals; emit(:br, [mb]) unless @cur.term
         @cur = eb; @locals = before.dup; emit(:br, [mb])
         @cur = mb; @locals = merge_locals(mb, [[tend, tl], [eb, before]])
       else
-        body.each { last = expr(_1) }
+        last = run_body(body, pfx)
       end
       @blk_pfx.pop
       if map_target && @locals[map_target[0]]
@@ -1213,9 +1242,132 @@ module Indus
     end
 
     # lambdas are inlined at .call / .() sites: a lambda value is its AST
+    # A lambda literal is an anonymous class: the locals it captures are its ivars (copied at
+    # the moment of capture), its body is `call`. Dispatch, GC and escape analysis then treat
+    # it like any object. The body is lowered after the enclosing function (deferred_lambdas).
     def lambda_value(n)
-      @pending_lambda = n
-      c = const(0); c.ty = :lambda; c
+      params = n.parameters&.parameters&.requireds&.map(&:name) || []
+      captured = free_locals(n.body, params).select { |nm| @locals.key?(lname(nm)) }
+      raise "a lambda inside a method cannot yet refer to self or @ivars" if @klass && refers_to_self?(n.body)
+      closure_value(params, captured, n.body&.body || [])
+    end
+
+    def closure_value(params, captured, stmts)
+      @lambda_count = (@lambda_count || 0) + 1
+      k = @classes[:"__lambda#{@lambda_count}"] = Klass.new(:"__lambda#{@lambda_count}")
+      k.id = @classes.size; k.closure = true
+      captured.each { k.ivar(:"@#{_1}") }
+      f = Func.new(:"#{k.name}#call", 1 + params.size); f.cls = k; k.methods[:call] = f
+      (@deferred_lambdas ||= []) << [k, f, params, captured, stmts, captured.select { shared?(_1) }]
+      o = emit(:onew, [k])
+      captured.each { |nm| emit(:fld_set, [o, k.ivar(:"@#{nm}"), @locals.fetch(lname(nm))]) } # a shared capture stores its cell
+      o
+    end
+
+    def free_locals(node, bound, out = []) = free_locals_plain(node, bound, out)
+
+    # A local a closure captures and that is assigned after the capture (in either scope) is
+    # shared, not copied: it lives in a one-word heap cell and every read and write goes
+    # through it. Decided per function body by a scan before lowering.
+    def shared?(name) = @shared&.include?(name)
+
+    def write_shared(name, v)
+      key = lname(name)
+      if (cell = @locals[key]) && cell.op != :const then emit(:cell_set, [cell, v]); v
+      else @locals[key] = emit(:cell_new, [v]); v end
+    end
+
+    def shared_locals(stmts)
+      closures = []; collect_closures(stmts, closures)
+      shared = []
+      all_assigned = assigned_locals_plain(stmts)
+      closures.each do |(params, body)|
+        free = free_locals_plain(body, params)
+        assigned_in = assigned_locals_plain(body)
+        free.each { |nm| shared << nm if assigned_in.include?(nm) || all_assigned.count(nm) > 1 }
+      end
+      shared.uniq
+    end
+
+    def collect_closures(nodes, out)
+      Array(nodes).each do |n|
+        next unless n.is_a?(Prism::Node)
+        if n.is_a?(Prism::LambdaNode) then out << [n.parameters&.parameters&.requireds&.map(&:name) || [], n.body]
+        elsif closure_block?(n) then out << [n.block.parameters&.parameters&.requireds&.map(&:name) || [], n.block.body]
+        end
+        collect_closures(n.compact_child_nodes, out)
+      end
+    end
+
+    # a block that becomes a value: lambda {}, proc {}, Proc.new {}, m { } where m takes &blk
+    def closure_block?(n)
+      return false unless n.is_a?(Prism::CallNode) && n.block.is_a?(Prism::BlockNode)
+      return true if n.receiver.nil? && %i[lambda proc].include?(n.name)
+      return true if n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Proc
+      n.receiver.nil? && (f = @funcs[n.name]) && (d = @defs_by_func[f]) && d.parameters&.block ? true : false
+    end
+
+    def free_locals_plain(node, bound, out = [])
+      return out unless node.is_a?(Prism::Node)
+      case node
+      when Prism::LocalVariableReadNode, Prism::LocalVariableWriteNode, Prism::LocalVariableOperatorWriteNode, Prism::LocalVariableOrWriteNode
+        out << node.name unless bound.include?(node.name) || out.include?(node.name)
+      end
+      node.compact_child_nodes.each { free_locals_plain(_1, bound, out) }
+      out
+    end
+
+    def assigned_locals_plain(node, out = [])
+      return out unless node.is_a?(Prism::Node)
+      out << node.name if node.is_a?(Prism::LocalVariableWriteNode) || node.is_a?(Prism::LocalVariableOperatorWriteNode) || node.is_a?(Prism::LocalVariableOrWriteNode)
+      node.compact_child_nodes.each { assigned_locals_plain(_1, out) }
+      out
+    end
+
+    def refers_to_self?(node)
+      return false unless node.is_a?(Prism::Node)
+      return true if node.is_a?(Prism::SelfNode) || node.is_a?(Prism::InstanceVariableReadNode) || node.is_a?(Prism::InstanceVariableWriteNode)
+      return true if node.is_a?(Prism::CallNode) && node.receiver.nil? && @klass.find_method(node.name)
+      node.compact_child_nodes.any? { refers_to_self?(_1) }
+    end
+
+    # m(args, &b): a def with &blk takes b as its last argument; a yielder gets a variant with
+    # a block parameter; a builtin iterator calls b per element
+    def block_arg_call(n, args, bv)
+      if n.receiver.nil? && (f = @funcs[n.name]) && (d = @defs_by_func[f]) && d.parameters&.block
+        return emit(:call, [f, *call_args(f, args), bv])
+      end
+      if n.receiver.nil? && (y = @yielders[n.name])
+        return emit(:call, [yield_variant(n.name, y[1]), *args.map { expr(_1) }, bv])
+      end
+      if %i[each map select reject].include?(n.name) && n.receiver # arr.each(&b)
+        pn = :__e
+        return array_loop(expr(n.receiver), n.name, [pn], ->(pfx) { emit(:mcall, [:call, bv, @locals.fetch(:"#{pfx}#{pn}")]) })
+      end
+      raise "block argument to #{n.name}: not supported"
+    end
+
+    # a yielder called with a block value: compiled once more with the block as a parameter
+    def yield_variant(name, d)
+      @funcs[:"#{name}$blk"] ||= begin
+        f = Func.new(:"#{name}$blk", def_param_names(d).size + 1)
+        @defs_by_func[f] = d
+        (@deferred_variants ||= []) << [f, def_param_names(d) + [:__blk], d.body&.body || []]
+        f
+      end
+    end
+
+    # the body of each lambda: a method of its class, captures read from self first
+    def lower_deferred_lambdas
+      loop do
+        if (job = @deferred_lambdas&.shift)
+          k, f, params, captured, stmts, shared = job
+          lower_body(f, [:self, *params], stmts, k, {}, captured, shared)
+        elsif (job = @deferred_variants&.shift)
+          f, names, stmts = job
+          lower_body(f, names, stmts)
+        else break end
+      end
     end
 
     def inline_lambda(lam, args)
@@ -1277,6 +1429,12 @@ module Indus
       else
         emit(:inspect_v, [expr(a)])
       end
+    end
+
+    # a loop body: statements, or a Proc given the block prefix (a block passed as a value)
+    def run_body(body, pfx)
+      return body.call(pfx) if body.is_a?(Proc)
+      last = nil; body.each { last = expr(_1) }; last
     end
 
     def assigned_ivars(node, out = [])

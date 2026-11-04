@@ -21,6 +21,7 @@ module Indus
       return :int? if (a == :int? && b == :nil) || (a == :nil && b == :int?)
       return :strbuf if (a == :str && b == :strbuf) || (a == :strbuf && b == :str) # a string that grew a stable handle
       return [:arr, join_elem(a[1], b[1])] if arr(a) && arr(b)
+      return [:cell, join(a[1], b[1])] if cell?(a) && cell?(b)
       return [:hash, join_elem(a[1], b[1]), join_elem(a[2], b[2])] if hsh(a) && hsh(b)
       # two classes meet: a closed poly set (whole program, so it is finite)
       ca, cb = classes_of(a), classes_of(b)
@@ -49,10 +50,11 @@ module Indus
     # does a value of this type hold a heap pointer the collector must follow?
     def self.heap_pointer?(t)
       return true if t == :str || t == :dyn || t == :strbuf
-      return true if t.is_a?(Array) && %i[arr hash poly].include?(t[0])
+      return true if t.is_a?(Array) && %i[arr hash poly cell].include?(t[0])
       t.is_a?(Symbol) && !!@classes&.[](t)
     end
     def self.hsh(t) = t.is_a?(Array) && t[0] == :hash
+    def self.cell?(t) = t.is_a?(Array) && t[0] == :cell # a shared local: one word on the heap
 
     def self.reset! = (@ivars = nil; @consts = nil; @instances = nil)
     # a prelude function by name: lowered on first use, typed in the current fixpoint
@@ -212,6 +214,12 @@ module Indus
                 end
               end
             when :ret then set.(f.rtype, of(f, i.args[0])) { f.rtype = _1 } unless f.result_unused
+            when :cell_set
+              c, v = i.args
+              if (vt = of(f, v)) && (ct = of(f, c)) && cell?(ct) && join(ct[1], vt) != ct[1]
+                nt = [:cell, join(ct[1], vt)]
+                (c.op == :param ? f.ptypes[f.params.index(c)] = nt : c.ty = nt); changed = true
+              end
             when :aset
               a, _, v = i.args
               nt = [:arr, of(f, v)]
@@ -418,6 +426,7 @@ module Indus
       when :hset
         t = of(f, i.args[0]); (yield i.args[1], t[1]; yield i.args[2], t[2]) if hsh(t)
       when :fld_set then yield i.args[2], ivar_type(of(f, i.args[0]), i.args[1])
+      when :cell_set then (t = of(f, i.args[0])) && cell?(t) && (yield i.args[1], t[1])
       when :gset then yield i.args[1], @consts[i.args[0]]
       when :call then i.args[1..].each_with_index { |v, k| yield v, i.args[0].ptypes[k] }
       when :ret then yield i.args[0], f.rtype unless f.result_unused
@@ -748,6 +757,9 @@ module Indus
       when :bufderef then :str
       when :apop then (t = of(f, a[0])) && arr(t) ? t[1] : nil
       when :hcap, :gcepoch, :hsave, :sys then :int
+      when :cell_new then (t = of(f, a[0])) && [:cell, t]
+      when :cell_get then (t = of(f, a[0])) && t.is_a?(Array) && t[0] == :cell ? t[1] : nil
+      when :cell_set then :int
       when :try_push, :try_pop, :raise then :int
       when :exc_value then @exc_type
       when :hkey_at then (t = of(f, a[0])) && hsh(t) ? t[1] : nil
@@ -847,6 +859,7 @@ module Indus
         t = of(f, i.args[0])
         if hsh(t) then yield i.args[1], t[1], ->(w) { i.args[1] = w }; yield i.args[2], t[2], ->(w) { i.args[2] = w } end
       when :fld_set then yield i.args[2], ivar_type(of(f, i.args[0]), i.args[1]), ->(w) { i.args[2] = w }
+      when :cell_set then (t = of(f, i.args[0])) && cell?(t) && (yield i.args[1], t[1], ->(w) { i.args[1] = w })
       when :gset then yield i.args[1], @consts[i.args[0]], ->(w) { i.args[1] = w }
       when :call then i.args[1..].each_with_index { |v, k| yield v, i.args[0].ptypes[k], ->(w) { i.args[k + 1] = w } }
       when :ret then yield i.args[0], f.rtype, ->(w) { i.args[0] = w }

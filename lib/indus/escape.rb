@@ -45,6 +45,8 @@ module Indus
       f.all.each do |i|
         case i.op
         when :fld_set then mark.(i.args[2])
+        when :cell_new then mark.(i.args[0])
+        when :cell_set then mark.(i.args[1])
         when :box, :mkbuf, :raise then mark.(i.args[0]) # a tagged value / a cell's content / an exception is tracked no further
         when :aset then mark.(i.args[2])
         when :hset then mark.(i.args[1]); mark.(i.args[2])
@@ -97,6 +99,7 @@ module Indus
           o, _, v = i.args
           into.(o) if heap?(ty(f, v))
         when :bufappend then into.(i.args[0]) # the grown string is stored into the cell
+        when :cell_set then into.(i.args[0]) if heap?(ty(f, i.args[1]))
         when :aset, :hset
           a, k, v = i.args
           into.(a) if heap?(ty(f, v)) || (i.op == :hset && heap?(ty(f, k)))
@@ -146,7 +149,7 @@ module Indus
       body
     end
 
-    OWN_ALLOC = %i[onew anew hnew sconst scat sappend itos ssub chr sdup salloc mkbuf box aset hset bufappend].freeze
+    OWN_ALLOC = %i[onew anew hnew sconst scat sappend itos ssub chr sdup salloc cell_new mkbuf box aset hset bufappend].freeze
     def self.region_safe?(f, h, body)
       fresh = {} # heap-typed values defined this iteration (may be fresh: used to detect leaks)
       body.each_key { |b| (b.phis + b.insts).each { |i| fresh[i] = true if heap?(i.ty) && !(b == h && i.op == :phi) } }
@@ -158,6 +161,7 @@ module Indus
         b.insts.each do |i|
           case i.op
           when :bufappend then return false unless own[i.args[0]] # a grown buffer into a pre-existing cell
+          when :cell_set then return false if heap?(ty(f, i.args[1])) && !own[i.args[0]]
           when :fld_set, :aset, :hset
             o, k, v = i.args
             return false if heap?(ty(f, v)) && !own[o]      # heap value into pre-existing memory

@@ -187,6 +187,16 @@ module Indus
           @asm.emit(0xF84107F0); @asm.str_off(16, 0, 0) # ldr x16, [sp], #16 ; str x16, [x0]
           @asm.mov(d, 0)
         when :bufderef then @asm.ldr_off(d, reg(i.args[0]), 0)
+        when :cell_new # a shared local: one word on the heap holding the current value
+          v = i.args[0]
+          if v.float? then @asm.emit(0xFC1F0FE0 | freg(v, 16)) else @asm.emit(0xF81F0FE0 | reg(v, 9)) end # push the value (survives the allocation call)
+          @asm.mov_imm(0, 8); @asm.bl(:__onew)
+          @asm.emit(0xF84107F0); @asm.str_off(16, 0, 0) # pop into x16; store
+          @asm.mov(d, 0)
+        when :cell_get then i.float? ? @asm.fldr_off(d, reg(i.args[0]), 0) : @asm.ldr_off(d, reg(i.args[0]), 0)
+        when :cell_set
+          c, v = i.args
+          v.float? ? @asm.fstr_off(freg(v), reg(c), 0) : @asm.str_off(reg(v, 9), reg(c), 0)
         when :bufappend # *cell = rt_str_append(*cell, v); result is the cell
           rb = reg(i.args[0], 9); @asm.mov(1, reg(i.args[1], 1)) # operands first: spill slots are sp-relative
           @asm.emit(0xF81F0FE0 | rb); @asm.ldr_off(0, rb, 0)
