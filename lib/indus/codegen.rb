@@ -15,8 +15,8 @@ module Indus
         seen[b] = true; order << b
         sc = b.succs
         if b.term.op == :condbr
-          t, e = sc
-          sc = e.cold ? [t, e] : [e, t] # fall into the loop body; else-first otherwise
+          t, e, *handlers = sc # a try_push in this block adds its handler after the branch targets
+          sc = (e.cold ? [t, e] : [e, t]) + handlers # fall into the loop body; else-first otherwise
         end
         work = sc + work
       end
@@ -212,6 +212,10 @@ module Indus
         when :rawst then @asm.str_off(reg(i.args[1], 9), reg(i.args[0]), 0)
         when :gbase then @asm.mov(d, Asm::GBASE)
         when :trap then @asm.emit(0xD4200000) # brk #0: heap exhausted
+        when :zcheck # divisor nonzero, or raise (the raiser never returns here)
+          ok = @asm.uniq
+          @asm.cbnz(reg(i.args[1]), ok); @asm.bl(i.args[0].name); @asm.label(ok)
+        when :class_id then @asm.ldr_off(d, reg(i.args[0]), 0) # word 0 of an object: its class id
         when :isa_tag then @asm.ldr_off(16, reg(i.args[0]), 0); @asm.cmpi(16, i.args[1]); @asm.cset(d, :eq)
         when :isa_tags # class id in word 0 is one of several (a rescue matching a class and its descendants)
           @asm.ldr_off(16, reg(i.args[0]), 0); @asm.mov_imm(d, 0); yes = @asm.uniq

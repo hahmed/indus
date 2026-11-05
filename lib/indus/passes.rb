@@ -15,7 +15,7 @@ module Indus
         live[f] = true
         f.all.each do |i|
           case i.op
-          when :call then work << i.args[0]
+          when :call, :zcheck then work << i.args[0]
           when :pcall, :sendsw then i.args[0].each { |(_, kind, payload)| work << payload if kind == :call }
           when :dsend then i.args.each { |a| work << a if a.is_a?(Func) }
           end

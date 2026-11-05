@@ -11,7 +11,26 @@ module Indus
     # symbols are small integers, interned at compile time
     def sym_id(name) = (@syms ||= {})[name.to_sym] ||= @syms.size + 1
 
-    def initialize(src) = (@ast, @funcs, @classes, @consts = Prism.parse(src).value, {}, {}, {})
+    def initialize(src) = (@ast, @funcs, @classes, @consts = Lower.normalize(Prism.parse(src).value), {}, {}, {})
+
+    # `def m ... rescue ... end` is a def whose body is a begin: give it the statements body
+    # every def site expects, so one shape reaches the lowering
+    def self.normalize(node)
+      return node.map { normalize(_1) } if node.is_a?(Array)
+      return node unless node.is_a?(Prism::Node)
+      if node.is_a?(Prism::DefNode) && node.body.is_a?(Prism::BeginNode)
+        node = node.copy(body: Prism::StatementsNode.new(node.send(:source), 0, node.body.location, 0, [node.body]))
+      end
+      fields = node.class.instance_method(:initialize).parameters.map(&:last).reject { %i[source node_id location flags].include?(_1) }
+      changes = {}
+      fields.each do |fl|
+        next unless node.respond_to?(fl)
+        v = node.public_send(fl)
+        nv = normalize(v)
+        changes[fl] = nv unless nv.equal?(v) || v.is_a?(Array) && nv == v
+      end
+      changes.empty? ? node : node.copy(**changes)
+    end
 
     def run
       body = @ast.statements.body
@@ -146,9 +165,7 @@ module Indus
     def demand(name)
       f = @funcs.fetch(name) { raise "unknown prelude function #{name}" }
       if (d = @lazy&.delete(name))
-        saved = [@f, @locals, @cur, @klass, @ct, @owner, @loop, @blk_pfx]
-        lower_body(f, def_param_names(d), d.body&.body || [])
-        @f, @locals, @cur, @klass, @ct, @owner, @loop, @blk_pfx = saved
+        nested { lower_body(f, def_param_names(d), d.body&.body || []) }
         prune(f)
         (@lowered_late ||= []) << f
       end
@@ -308,16 +325,31 @@ module Indus
     # begin body rescue K => e; handler end [ensure fin end]
     # try_push installs the handler record; a raise inside the body (or any callee) lands at
     # the handler block with the exception value; try_pop on the normal path.
-    def begin_expr(n)
-      stmts = n.statements&.body || []
-      rescues = []
-      r = n.rescue_clause
-      while r
-        rescues << r; r = r.subsequent
+    def rescue_modifier(n) = begin_expr(nil, stmts: [n.expression], rescues: [[[:StandardError], nil, [n.rescue_expression]]])
+
+    def begin_expr(n, stmts: nil, rescues: nil, ensure_body: nil)
+      stmts ||= n.statements&.body || []
+      unless rescues
+        rescues = []
+        r = n.rescue_clause
+        while r
+          classes = r.exceptions.map { |c| c.is_a?(Prism::ConstantReadNode) ? c.name : raise("rescue needs a class name") }
+          classes = [:StandardError] if classes.empty?
+          rescues << [classes, r.reference, r.statements&.body || []]; r = r.subsequent
+        end
       end
-      ensure_body = n.ensure_clause&.statements&.body || []
+      ensure_body ||= n&.ensure_clause&.statements&.body || []
       return (stmts + ensure_body).map { expr(_1) }.last || const(0) if rescues.empty? && ensure_body.empty?
       hb, mb = @f.new_block(:handler), @f.new_block(:merge)
+      retrying = rescues.any? { |(_, _, body)| body.any? { has_node?(_1, Prism::RetryNode) } }
+      if retrying # `retry` re-enters the protected body: a header of phis, as a loop has
+        rh = @f.new_block(:retry)
+        assigned_locals_plain(stmts).uniq.each { |nm| @locals[nm] ||= (c = const(0); c.ty = :nil; c) }
+        pre = @cur; emit(:br, [rh])
+        rphis = @locals.to_h { |nm, v| ph = rh.phi; ph.args << [pre, v]; [nm, ph] }
+        @locals = rphis.dup; @cur = rh
+        outer_retry, @retry = @retry, { head: rh, sites: [] }
+      end
       before = @locals.dup
       tp = emit(:try_push, [hb])
       bv = stmts.map { expr(_1) }.last || const(0)
@@ -327,19 +359,19 @@ module Indus
       # the handler: the exception value, then rescue clauses by class
       @cur = hb; @locals = before.dup
       exc = emit(:exc_value, [])
-      arms = rescues.map do |rc|
-        classes = rc.exceptions.map { |c| c.is_a?(Prism::ConstantReadNode) ? c.name : raise("rescue needs a class name") }
-        classes = [:StandardError] if classes.empty?
+      arms = rescues.map do |(classes, ref, body)|
         test = classes.map { |cn| emit(:isa, [exc, cn]) }.reduce { |a, b| emit(:or, [a, b]) }
-        [test, rc]
+        [test, ref, body]
       end
       ends = []
-      arms.each do |test, rc|
+      arms.each do |test, ref, body|
         tb, nb = @f.new_block(:rescue), @f.new_block(:norescue)
         emit(:condbr, [test, tb, nb])
         @cur = tb; @locals = before.dup
-        @locals[lname(rc.reference.name)] = exc if rc.reference.is_a?(Prism::LocalVariableTargetNode)
-        rv = (rc.statements&.body || []).map { expr(_1) }.last || const(0)
+        if ref.is_a?(Prism::LocalVariableTargetNode) # the bound exception is narrowed to the rescued class (one class; several stay the union)
+          @locals[lname(ref.name)] = classes.size == 1 && @classes[classes[0]] ? emit(:unbox, [exc, classes[0]]) : exc
+        end
+        rv = body.map { expr(_1) }.last || const(0)
         ensure_body.each { expr(_1) }
         ends << [@cur, @locals, rv] unless @cur.term
         emit(:br, [mb]) unless @cur.term
@@ -353,6 +385,10 @@ module Indus
       arms_all = [[bend, blocals, bv], *ends]
       @locals = merge_locals(mb, arms_all.map { |(b, l, _)| [b, l] })
       ph = mb.phi; ph.args = arms_all.map { |(b, _, v)| [b, v] }
+      if retrying
+        @retry[:sites].each { |(b, l)| rphis.each { |nm, p| p.args << [b, l.fetch(nm)] } }
+        @retry = outer_retry
+      end
       ph
     end
 
@@ -367,9 +403,7 @@ module Indus
       @instances ||= Hash.new(0); n = @instances[f.name] += 1
       g = Func.new(:"#{f.name}$#{n}", f.params.size)
       @defs_by_func[g] = d
-      saved = [@f, @locals, @cur, @klass, @ct, @owner]
-      lower_body(g, (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || [])
-      @f, @locals, @cur, @klass, @ct, @owner = saved
+      nested { lower_body(g, (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || []) }
       prune(g)
       g
     end
@@ -460,6 +494,7 @@ module Indus
       when Prism::UntilNode then while_stmt(n, negate: true)
       when Prism::CaseNode then case_expr(n)
       when Prism::BeginNode then begin_expr(n)
+      when Prism::RescueModifierNode then rescue_modifier(n) # expr rescue fallback
       when Prism::SuperNode, Prism::ForwardingSuperNode # super(args) / super: the superclass's version of this method
         raise "super outside a method" unless @klass && @f.cls
         mname = @f.name.to_s.split("#").last.to_sym
@@ -583,6 +618,11 @@ module Indus
           end
         end
         vals.last
+      when Prism::RetryNode
+        raise "retry outside rescue" unless @retry
+        @retry[:sites] << [@cur, @locals.dup]
+        emit(:br, [@retry[:head]])
+        @cur = @f.new_block(:dead); const(0)
       when Prism::BreakNode
         raise "break outside loop" unless @loop
         @loop[:breaks] << [@cur, @locals.dup]
@@ -1632,6 +1672,11 @@ module Indus
       arr = emit(:anew, [const(@syms.size + 1), emit(:sconst, [""])])
       @syms.each { |name, id| arr = emit(:aset, [arr, const(id), emit(:sconst, [name.to_s])]) }
       emit(:gset, [:SYMBOL_NAMES, arr])
+      # and every class name by class id: obj.class reads it (classes are ids in the header)
+      ks = @classes.values.reject(&:closure)
+      carr = emit(:anew, [const((ks.map(&:id).max || 0) + 1), emit(:sconst, [""])])
+      ks.each { |k| carr = emit(:aset, [carr, const(k.id), emit(:sconst, [k.name.to_s])]) }
+      emit(:gset, [:CLASS_NAMES, carr])
       main.entry.insts.concat(head)
       @f, @locals, @cur, @klass, @ct, @owner, @shared = saved
     end
@@ -1683,6 +1728,17 @@ module Indus
     # through it. Decided per function body by a scan before lowering.
     def shared?(name) = @shared&.include?(name)
 
+    # lower another function in the middle of this one: every piece of per-function state
+    # goes back as it was
+    NESTED_STATE = %i[@f @locals @cur @klass @ct @owner @loop @blk_pfx @shared @retry @ret_exit @block_param @kinds @hash_defaults @lambdas @name_pfx @default_self @in_safe_nav @in_safe_nav_node].freeze
+    def nested
+      saved = NESTED_STATE.map { instance_variable_get(_1) }
+      NESTED_STATE.each { instance_variable_set(_1, nil) } # the other function starts clean (lower_body sets what it needs)
+      yield
+    ensure
+      NESTED_STATE.zip(saved) { |k, v| instance_variable_set(k, v) }
+    end
+
     def write_shared(name, v)
       key = lname(name)
       if (cell = @locals[key]) && cell.op != :const then emit(:cell_set, [cell, v]); v
@@ -1698,7 +1754,21 @@ module Indus
         assigned_in = assigned_locals_plain(body)
         free.each { |nm| shared << nm if assigned_in.include?(nm) || all_assigned.count(nm) > 1 }
       end
+      # a local assigned inside a rescued body is read by the handler as it was at the raise:
+      # a cell, not a value, since the raise can come from anywhere in the body
+      rescued_bodies(stmts).each { |body| shared.concat(assigned_locals_plain(body).select { all_assigned.count(_1) > 0 }) }
       shared.uniq
+    end
+
+    def rescued_bodies(node, out = [])
+      case node
+      when Array then node.each { rescued_bodies(_1, out) }
+      when Prism::BeginNode
+        out << node.statements if node.rescue_clause && node.statements
+        node.compact_child_nodes.each { rescued_bodies(_1, out) }
+      when Prism::Node then node.compact_child_nodes.each { rescued_bodies(_1, out) }
+      end
+      out
     end
 
     def collect_closures(nodes, out)
@@ -1729,7 +1799,14 @@ module Indus
       out
     end
 
+    def has_node?(node, klass)
+      return false unless node.is_a?(Prism::Node)
+      return true if node.is_a?(klass)
+      node.compact_child_nodes.any? { has_node?(_1, klass) }
+    end
+
     def assigned_locals_plain(node, out = [])
+      return (node.each { assigned_locals_plain(_1, out) }; out) if node.is_a?(Array)
       return out unless node.is_a?(Prism::Node)
       out << node.name if node.is_a?(Prism::LocalVariableWriteNode) || node.is_a?(Prism::LocalVariableOperatorWriteNode) || node.is_a?(Prism::LocalVariableOrWriteNode)
       node.compact_child_nodes.each { assigned_locals_plain(_1, out) }

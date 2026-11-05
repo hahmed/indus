@@ -13,6 +13,7 @@ module Indus
       return b if a.nil?
       return a if b.nil? || a == b
       return :int? if (a == :int && b == :nil) || (a == :nil && b == :int) || [a, b].sort_by(&:to_s) == %i[int int?]
+      return :dyn if (a == :nil && (b == :float || b == :bool || b == :sym)) || (b == :nil && (a == :float || a == :bool || a == :sym)) # no spare bit pattern in these: tag
       return b if a == :nil
       return a if b == :nil
       return :float if (a == :int && b == :float) || (a == :float && b == :int)
@@ -305,6 +306,7 @@ module Indus
           if !@settled && !@promoted && promote_geometric(funcs) then @promoted = true; changed = true; next end
           break if @settled # second convergence: prints resolved and types stable
           @settled = true; changed = true # one more round with the by-type rewrites enabled
+          zero_checks(funcs)
         end
       end
       @settled = false; @promoted = false; @no_defer = false
@@ -371,7 +373,8 @@ module Indus
           if of(f, l) == :int? && of(f, r) == :nil then r.args[0] = INT_NIL; r.ty = :int
           elsif of(f, r) == :int? && of(f, l) == :nil then l.args[0] = INT_NIL; l.ty = :int end
         when :to_s # (by type, resolved in the fixpoint's settled round; anything left is an int)
-          i.op = :itos
+          if of(f, i.args[0]) == :int? then i.op = :call; i.args = [fn(:__opt_to_s), i.args[0]]
+          else i.op = :itos end
         when :to_i then i.op = :stoi if of(f, i.args[0]) == :str
         when :puts_v, :p_v, :print_v
           t = of(f, i.args[0])
@@ -423,6 +426,23 @@ module Indus
     # flow anywhere: a trailing `if` without else would otherwise join (array, nil) into :dyn
     # and widen the array at its origin. Direct calls only; a method reachable through a
     # dispatch (pcall/sendsw/dsend/seam) is assumed read.
+    # an integer division by a divisor not known to be nonzero raises ZeroDivisionError:
+    # a zcheck before it (cbnz + a call to the raiser; nothing on the happy path but the branch)
+    def self.zero_checks(funcs)
+      funcs.each do |f|
+        f.blocks.each do |b|
+          b.insts.dup.each do |i|
+            next unless %i[div mod].include?(i.op) && of(f, i) == :int && !i.float?
+            d = i.args[1]
+            next if d.op == :const && d.args[0] != 0
+            next if d.op == :zcheck
+            z = Inst.new(:zcheck, [fn(:__raise_zero_div), d]); z.ty = :int; z.block = b
+            b.insts.insert(b.insts.index(i), z)
+          end
+        end
+      end
+    end
+
     def self.mark_unused_results(funcs)
       read = {}; read_name = {}
       funcs.each do |f|
@@ -676,7 +696,8 @@ module Indus
       case t
       when :str then i.op = :call; i.args = [fn(:__quote), i.args[0]]
       when :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]
-      when :int, :int? then i.op = :itos
+      when :int then i.op = :itos
+      when :int? then i.op = :call; i.args = [fn(:__opt_inspect), i.args[0]]
       when :bool then i.op = :bool_to_s
       when :nil then i.op = :sconst; i.args = ["nil"]
       when :sym then i.op = :call; i.args = [fn(:__sym_inspect), i.args[0]]
@@ -691,6 +712,10 @@ module Indus
     def self.bind(f, i)
       name, recv, *args = i.args
       t = of(f, recv)
+      if name == :class && args.empty? && classes_of(t) && classes_of(t).none? { @classes[_1].find_method(:class) } # the class's name, as a String (no class objects at run time)
+        cid = Inst.new(:class_id, [recv]); cid.ty = :int; cid.block = i.block; i.block.insts.insert(i.block.insts.index(i), cid)
+        i.op = :call; i.args = [fn(:__class_name), cid]; i.ty = :str; return
+      end
       if poly?(t) # one arm per class: [klass, kind, payload]; a class without the method traps if reached
         arms = t[1].map { |c| [@classes[c], *resolve(@classes[c], name, args.size, trap_missing: true)] }
         raise "no method #{name} on any of #{t[1].join(', ')}" if arms.all? { |(_, kind, _)| kind == :trap }
@@ -877,8 +902,8 @@ module Indus
       when :cell_new then (t = of(f, a[0])) && [:cell, t]
       when :cell_get then (t = of(f, a[0])) && t.is_a?(Array) && t[0] == :cell ? t[1] : nil
       when :cell_set then :int
-      when :try_push, :try_pop, :raise then :int
-      when :exc_value then @exc_type
+      when :try_push, :try_pop, :raise, :class_id, :zcheck then :int
+      when :exc_value then @exc_type || (fn(:__raise_zero_div); :StandardError) # nothing in the program raises yet: the runtime still can (ZeroDivisionError; demanding its raiser types the message)
       when :hkey_at then (t = of(f, a[0])) && hsh(t) ? t[1] : nil
       when :hval_at then (t = of(f, a[0])) && hsh(t) ? t[2] : nil
       when :seq, :sne, :scmp then :bool
@@ -953,7 +978,7 @@ module Indus
           case i.op
           when :add, :sub, :mul, :div, :cmp
             if i.args.any? { of(f, _1) == :float }
-              i.args.map! { |v| of(f, v) == :int ? coerce(f, b, i, v, :float) : v }
+              i.args.map! { |v| %i[int int?].include?(of(f, v)) ? coerce(f, b, i, v, :float) : v }
               i.cond = :"f#{i.cond}" if i.op == :cmp
             end
           when :fsqrt then i.args[0] = coerce(f, b, i, i.args[0], :float)
@@ -993,7 +1018,7 @@ module Indus
       t = of(f, v)
       return v if t.nil? || dest.nil? || t == dest
       c = case
-          when dest == :float && t == :int then Inst.new(:itof, [v]).tap { _1.ty = :float }
+          when dest == :float && (t == :int || t == :int?) then Inst.new(:itof, [v]).tap { _1.ty = :float } # a nil here would have raised already
           when dest == :dyn && t != :dyn then Inst.new(:box, [v, t]).tap { _1.ty = :dyn }
           when big?(dest) && %i[int int?].include?(t) then Inst.new(:call, [fn(:__big_from_int), v]).tap { _1.ty = BIG }
           else return v

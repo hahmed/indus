@@ -999,3 +999,17 @@ def __dyn_arr(v)
   __trap if __tag(v) != 4
   __unbox_arr(v)
 end
+
+# a nullable integer (:int?) carries nil as the most negative word
+def __opt_inspect(v)
+  v == -9223372036854775808 ? "nil" : v.to_s
+end
+def __opt_to_s(v)
+  v == -9223372036854775808 ? "" : v.to_s
+end
+
+def __class_name(id) = CLASS_NAMES[id]
+
+def __raise_zero_div
+  raise ZeroDivisionError, "divided by 0"
+end
