@@ -881,6 +881,7 @@ module Indus
       elsif n.name == :to_s && args.empty? && n.receiver.nil? then raise "to_s with no receiver outside a class defining it"
       elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
       elsif n.name == :+@ && args.empty? then expr(n.receiver) # +"" : literals are already fresh copies
+      elsif n.name == :~ && args.empty? && n.receiver then emit(:xor, [expr(n.receiver), const(-1)]) # bitwise not
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array
         len = args[0] ? expr(args[0]) : const(0); fill = args[1] ? expr(args[1]) : (c = const(0); c.ty = :nil; c)
         emit(:anew, [len, fill])
@@ -1096,11 +1097,13 @@ module Indus
       when :__trap then emit(:trap, [])
       # unsigned / wrapping 64-bit arithmetic for the float printer
       when :__fbits then emit(:fbits, [expr(args[0])])
+      when :__ffrom then emit(:ffrom, [expr(args[0])])
       when :__lsr then emit(:lsr, [expr(args[0]), expr(args[1])])
       when :__clz then emit(:clz, [expr(args[0])])
       when :__umulh then emit(:umulh, [expr(args[0]), expr(args[1])])
       when :__wmul then emit(:wmul, [expr(args[0]), expr(args[1])])
       when :__wadd then emit(:wadd, [expr(args[0]), expr(args[1])])
+      when :__wshl then emit(:shl, [expr(args[0]), expr(args[1])]) # the shift wraps (lslv); the name says so at the call site
       when :__wsub then emit(:wsub, [expr(args[0]), expr(args[1])])
       when :__ult then emit(:ucmp, [expr(args[0]), expr(args[1])], :lo)
       when :__ule then emit(:ucmp, [expr(args[0]), expr(args[1])], :ls)

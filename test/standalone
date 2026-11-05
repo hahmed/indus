@@ -1,0 +1,28 @@
+#!/usr/bin/env ruby
+# every bench as a standalone linux binary, run in podman, against CRuby's output.
+#   test/standalone [files]
+# One container run for all binaries (podman startup dominates otherwise).
+require "fileutils"
+ROOT = File.expand_path("..", __dir__)
+OUT = File.expand_path("~/tmp/standalone"); FileUtils.rm_rf(OUT); FileUtils.mkdir_p(OUT)
+files = ARGV.empty? ? Dir["#{ROOT}/bench/*.rb"].sort : ARGV
+built = []
+files.each do |f|
+  name = File.basename(f, ".rb")
+  err = `cd #{ROOT} && timeout -k 2 120 bin/indus #{f} --linux -o #{OUT}/#{name} 2>&1 >/dev/null`
+  unless $?.success?
+    puts "SKIP #{name}: #{err.lines.grep(/Error|refuse|not available|needs/).first&.strip&.sub(/.*lib\/indus\//, "")&.slice(0, 110)}"
+    next
+  end
+  File.write("#{OUT}/#{name}.want", `ruby #{f} 2>/dev/null`)
+  built << name
+end
+script = built.map { |n| "/w/#{n} > /w/#{n}.got 2>/dev/null; echo \"#{n} rc=$?\"" }.join("\n")
+system("podman run --rm -v #{OUT}:/w indus-bench sh -c '#{script}' > #{OUT}/rcs.txt 2>&1")
+pass = fail = 0
+built.each do |n|
+  got = File.read("#{OUT}/#{n}.got") rescue ""
+  if got == File.read("#{OUT}/#{n}.want") then pass += 1
+  else fail += 1; puts "FAIL #{n}: #{File.read("#{OUT}/rcs.txt")[/#{n} rc=\d+/]}"; puts `diff #{OUT}/#{n}.want #{OUT}/#{n}.got | head -4` end
+end
+puts "#{pass} passed, #{fail} failed, #{files.size - built.size} skipped"

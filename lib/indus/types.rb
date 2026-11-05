@@ -68,6 +68,8 @@ module Indus
     # a snapshot of the program-wide tables, to detect a seam widening a type
     # that compiled code already relies on
     def self.snapshot = Marshal.load(Marshal.dump([@ivars.to_h { |k, v| [k, v.dup] }, @consts.dup]))
+    class << self; attr_accessor :standalone; end # no libc: Math goes to the Ruby libm (rt/libm.rb)
+
     def self.run(funcs, classes, lower = nil)
       @classes = classes; @lower = lower || @lower
       # program-wide state; the resident compiler re-runs inference for one
@@ -237,6 +239,12 @@ module Indus
               inspect_v(f, i) if i.op == :inspect_v && of(f, i.args[0])
             end
             index(f, i) if i.op == :idx || i.op == :idx_set
+            if standalone && (i.op == :libm || i.op == :pow && i.args.any? { of(f, _1) == :float }) # no libc: the Ruby libm
+              name = i.op == :libm ? :"__libm_#{i.args[0]}" : :__libm_pow
+              args = i.op == :libm ? [i.args[1]] : i.args
+              args = args.map { |v| coerce(f, i.block, i, v, :float) }
+              i.op = :call; i.args = [fn(name), *args]; changed = true
+            end
             t = infer(f, i)
             was = i.ty
             set.(i.ty, t) { i.ty = _1 }
@@ -945,7 +953,7 @@ module Indus
         # a generic prelude function may still be swapped for an instance once the argument
         # types are known: commit to no result type before then
         generic?(a[0]) && (a[1..].any? { |v| of(f, v).nil? } || deferred_generic?(a[0], a[1..].map { of(f, _1) })) ? nil : a[0].rtype
-      when :itof then :float
+      when :itof, :ffrom then :float
       when :onew then a[0].name
       when :fld_get then (k = of(f, a[0])) && ivar_type(k, a[1])
       when :fld_set then of(f, a[2])

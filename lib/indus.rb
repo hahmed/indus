@@ -37,7 +37,7 @@ module Indus
 
   # standalone: nil (run in-process via libc write), :darwin or :linux
   PRELUDE_GC = File.read(File.join(__dir__, "indus/rt/gc.rb"))
-  PRELUDE_CORE = %w[grisu core big format enum].map { File.read(File.join(__dir__, "indus/rt/#{_1}.rb")) }.join("\n")
+  PRELUDE_CORE = %w[grisu core big format enum libm].map { File.read(File.join(__dir__, "indus/rt/#{_1}.rb")) }.join("\n")
 
   def self.compile(src, standalone: nil)
     src = PRELUDE_CORE + "\n" + src          # Float#to_s and friends, in Ruby
@@ -46,6 +46,7 @@ module Indus
     lower = Lower.new(src)
     funcs = lower.run
     funcs.each { Passes.trivial_phis(_1) } # dead statement-valued phis would confuse typing
+    Types.standalone = standalone
     Types.run(funcs, lower.classes, lower)
     funcs = Passes.prune(funcs)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
@@ -58,6 +59,7 @@ module Indus
     asm.write_addr = Metal::LIBC["write"].to_i unless standalone
     asm.mmap_addr = Metal::LIBC["mmap"].to_i unless standalone
     asm.libm = %i[sin cos pow clock_gettime open creat read write close unlink exit].to_h { [_1, Metal::LIBC[_1.to_s].to_i] } unless standalone
+    asm.os = standalone
     asm.emit_start_linux if standalone == :linux
     funcs.each { Codegen.new(asm, lower.classes).func(_1) }
     asm.emit_runtime_blob

@@ -3,6 +3,13 @@ module Indus
   class Asm
     attr_reader :words
     attr_accessor :gc_table, :gc_frames, :gc_globals
+    attr_accessor :os # :darwin or :linux when standalone (raw syscalls); nil in-process (libc)
+
+    # syscall numbers for the file primitives and the clock
+    SYSCALLS = {
+      linux:  { open: 56, creat: nil, read: 63, write: 64, close: 57, unlink: 35, exit: 93, clock_gettime: 113 }, # open/unlink are *at variants
+      darwin: { open: 5, creat: nil, read: 3, write: 4, close: 6, unlink: 10, exit: 1, clock_gettime: nil },
+    }.freeze
     def initialize
       @words, @labels, @fixups, @data, @seams = [], {}, [], [], []
       @gc_frames, @gc_globals = [], []

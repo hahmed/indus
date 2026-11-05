@@ -110,6 +110,26 @@ module Indus
 
     # where a definition is written; stored to its slot afterwards if spilled
     def dst(i) = i.reg || (i.float? ? FTMP : SPILL)
+
+    # the file primitives as raw syscalls (a standalone binary has no libc). Linux has only the
+    # *at forms of open/unlink: AT_FDCWD (-100) in x0, the arguments shift up one; creat is
+    # openat with O_WRONLY|O_CREAT|O_TRUNC (0o1101).
+    def raw_syscall(name, a)
+      os = @asm.os or raise "#{name}: no libc in-process and no target OS"
+      raise "#{name}: darwin syscalls report errors in the carry flag, not the result; standalone file I/O is linux only" if os == :darwin
+      nums = Asm::SYSCALLS[os]
+      case [os, name]
+      when [:linux, :open]   then @asm.mov(1, reg(a[0], 1)); @asm.mov(2, reg(a[1], 2)); @asm.mov_imm(0, -100); @asm.mov_imm(8, nums[:open])
+      when [:linux, :creat]  then @asm.mov(1, reg(a[0], 1)); @asm.mov(3, reg(a[1], 3)); @asm.mov_imm(0, -100); @asm.mov_imm(2, 0o1101); @asm.mov_imm(8, nums[:open])
+      when [:linux, :unlink] then @asm.mov(1, reg(a[0], 1)); @asm.mov_imm(0, -100); @asm.mov_imm(2, 0); @asm.mov_imm(8, nums[:unlink])
+      when [:darwin, :creat] then @asm.mov(0, reg(a[0], 0)); @asm.mov(2, reg(a[1], 2)); @asm.mov_imm(1, 0o1101); @asm.mov_imm(16, nums[:open])
+      else
+        a.each_with_index { |v, k| @asm.mov(k, reg(v, k)) }
+        n = nums[name] or raise "#{name}: no syscall on #{os}"
+        os == :linux ? @asm.mov_imm(8, n) : @asm.mov_imm(16, n)
+      end
+      @asm.emit(os == :linux ? 0xD4000001 : 0xD4001001) # svc #0 / svc #0x80
+    end
     def spill!(i)
       return unless i.slot
       i.float? ? @asm.fstr(FTMP, slot_off(i)) : @asm.str(SPILL, slot_off(i))
@@ -278,6 +298,7 @@ module Indus
           end
         when :ucmp then @asm.cmp(reg(i.args[0]), reg(i.args[1], 9)); @asm.cset(d, i.cond)
         when :fbits then @asm.emit(0x9E660000 | (freg(i.args[0]) << 5) | d)                       # fmov d, dn
+        when :ffrom then @asm.emit(0x9E670000 | (reg(i.args[0]) << 5) | d)                        # fmov dn, x: the bits as a float
         when :lsr then @asm.emit(0x9AC02400 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d) # lsrv
         when :clz then @asm.emit(0xDAC01000 | (reg(i.args[0]) << 5) | d)
         when :umulh then @asm.emit(0x9BC07C00 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d)
@@ -461,17 +482,22 @@ module Indus
           @asm.cbz(reg(i.args[0]), f_); @asm.adr(0, :__true); @asm.mov_imm(1, 4); @asm.b(dn); @asm.label(f_); @asm.adr(0, :__false); @asm.mov_imm(1, 5); @asm.label(dn)
           @asm.bl(:rt_str_new); @asm.mov(d, 0)
         when :puts_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_puts_str)
-        when :sys # libc call by name, integer args/result (in-process)
+        when :sys # a file primitive by name, integer args/result: libc in-process, the raw syscall standalone
           name, *a = i.args
-          addr = @asm.libm&.[](name) or raise "File I/O needs libc; not available in a standalone binary yet"
-          a.each_with_index { |v, k| @asm.mov(k, reg(v, k)) }
-          @asm.mov_imm(16, addr); @asm.blr(16); @asm.mov(d, 0)
+          if (addr = @asm.libm&.[](name))
+            a.each_with_index { |v, k| @asm.mov(k, reg(v, k)) }
+            @asm.mov_imm(16, addr); @asm.blr(16); @asm.mov(d, 0)
+          else
+            raw_syscall(name, a); @asm.mov(d, 0)
+          end
         when :eputs_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_eputs_str)
-        when :clock # clock_gettime(CLOCK_MONOTONIC, &ts) in-process; seconds + nanos * 1e-9
-          addr = @asm.libm&.[](:clock_gettime) or raise "Process.clock_gettime needs libc; not available in a standalone binary yet"
+        when :clock # clock_gettime(CLOCK_MONOTONIC, &ts): libc in-process, the syscall standalone; seconds + nanos * 1e-9
+          addr = @asm.libm&.[](:clock_gettime)
+          raise "Process.clock_gettime: no clock_gettime syscall on darwin standalone" if !addr && @asm.os != :linux
           @asm.emit(0xD10043FF)                                  # sub sp, sp, #16
-          @asm.mov_imm(0, RUBY_PLATFORM.include?("darwin") ? 6 : 1); @asm.addi(1, 31, 0)
-          @asm.mov_imm(16, addr); @asm.blr(16)
+          @asm.mov_imm(0, RUBY_PLATFORM.include?("darwin") && addr ? 6 : 1); @asm.addi(1, 31, 0)
+          if addr then @asm.mov_imm(16, addr); @asm.blr(16)
+          else @asm.mov_imm(8, Asm::SYSCALLS[:linux][:clock_gettime]); @asm.emit(0xD4000001) end # svc #0
           @asm.emit(0xF94003E0); @asm.emit(0xF94007E1)          # ldr x0, [sp] ; ldr x1, [sp, #8]
           @asm.emit(0x910043FF)                                  # add sp, sp, #16
           @asm.scvtf(0, 0); @asm.scvtf(1, 1); @asm.fmov_imm(2, 1e-9)
