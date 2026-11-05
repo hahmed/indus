@@ -97,6 +97,19 @@ module Indus
                 i.args.map! { |(pred, v)| %i[int int?].include?(of(f, v)) ? (changed = true; [pred, coerce(f, pred, pred.term, v, BIG)]) : [pred, v] }
               end
             end
+            # a container cell used where the container itself is wanted (a use created after the
+            # parameter became a cell): load through the cell right here
+            unless %i[cell_get cell_set cell_new phi call pcall ret mcall fld_set aset hset gset].include?(i.op)
+              i.args.each_with_index do |a, k|
+                next unless a.is_a?(Inst) && (ct = of(f, a)) && cell?(ct) && (arr(ct[1]) || hsh(ct[1]))
+                g = Inst.new(:cell_get, [a]); g.ty = ct[1]; g.block = i.block; i.block.insts.insert(i.block.insts.index(i), g)
+                i.args[k] = g; changed = true
+              end
+            end
+            if i.op == :mcall && (ct = of(f, i.args[1])) && cell?(ct) && (arr(ct[1]) || hsh(ct[1])) # a method on the container inside a cell
+              g = Inst.new(:cell_get, [i.args[1]]); g.ty = ct[1]; g.block = i.block; i.block.insts.insert(i.block.insts.index(i), g)
+              i.args[1] = g; changed = true
+            end
             each_flow(f, i) do |v, dest|
               next unless v.is_a?(Inst)
               if @settled && dest == :int? && v.op == :const && v.ty == :nil then v.args[0] = INT_NIL; v.ty = :int; changed = true end # nil in a nullable int slot is the sentinel (settled: the slot might still widen to a pointer type)
@@ -207,10 +220,10 @@ module Indus
               fnm = { add: :__arr_plus, sub: :__arr_minus, and: :__arr_and, or: :__arr_or, mul: :__arr_times }.fetch(i.op)
               fn = fn(fnm); i.op = :call; i.args = [fn, *i.args]; i.ty = nil; changed = true
             end
-            if @settled && i.op == :is_sym && (t = of(f, i.args[0])) then i.op = :const; i.args = [t == :sym ? 1 : 0]; i.ty = :bool; changed = true end
+            if @settled && i.op == :is_sym && ((t = of(f, i.args[0])) || true) then i.op = :const; i.args = [t == :sym ? 1 : 0]; i.ty = :bool; changed = true end
             # is_dyn folds early for kinds that cannot still widen into :dyn (strings, containers, objects,
             # dyn itself); an integer-ish operand may yet become tagged, so it waits for the settled round
-            if i.op == :is_dyn && (t = of(f, i.args[0])) && (@settled || t == :dyn || t == :str || t.is_a?(Array) || classes_of(t)) then i.op = :const; i.args = [t == :dyn ? 1 : 0]; i.ty = :bool; changed = true end
+            if i.op == :is_dyn && ((t = of(f, i.args[0])) && (@settled || t == :dyn || t == :str || t.is_a?(Array) || classes_of(t)) || @settled && t.nil?) then i.op = :const; i.args = [t == :dyn ? 1 : 0]; i.ty = :bool; changed = true end
             if i.op == :to_f && of(f, i.args[0]) == :str then i.op = :call; i.args = [fn(:__str_to_f), i.args[0]]; i.ty = :float; changed = true end # "3.5".to_f
             if i.op == :mul && of(f, i.args[0]) == :str # "ab" * n
               fn = fn(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
@@ -259,6 +272,15 @@ module Indus
                 c = Inst.new(:call, [fn(:__dyn_arr), i.args[0]]); c.ty = [:arr, :dyn]; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
                 i.args[0] = c; changed = true
               end
+              if %i[aget alen].include?(i.op) && hsh(of(f, i.args[0])) # a hash iterated as an array (the lowering could not tell): its pairs
+                h = i.args[0]
+                pairs = (@pairs_of ||= {})[h] ||= begin
+                  c = Inst.new(:call, [fn(:__hash_to_a), h]); c.ty = [:arr, [:arr, :dyn]]; c.block = h.op == :param ? f.entry : h.block
+                  at = h.op == :param || h.op == :phi ? 0 : h.block.insts.index(h) + 1
+                  c.block.insts.insert(at, c); c
+                end
+                i.args[0] = pairs; changed = true
+              end
               if %i[hget hset hkey hkeys hcap hkey_at hval_at].include?(i.op) && of(f, i.args[0]) == :dyn
                 c = Inst.new(:call, [fn(:__dyn_hash), i.args[0]]); c.ty = [:hash, :dyn, :dyn]; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
                 i.args[0] = c; changed = true
@@ -282,13 +304,20 @@ module Indus
             end
             t = infer(f, i)
             was = i.ty
-            set.(i.ty, t) { i.ty = _1 }
+            if i.op == :call && generic?(i.args[0]) && t && i.ty && t != i.ty && !deferred_generic?(i.args[0], i.args[1..].map { of(f, _1) })
+              i.ty = t; changed = true # an instance's result is exact: a re-instanced call takes the new callee's type, it does not join the old
+            else
+              set.(i.ty, t) { i.ty = _1 }
+            end
             bufferize(f, i) if i.ty == :strbuf && was != :strbuf # the cell now flows through this value (phi, call result, ...)
             case i.op
             when :call
               callee = i.args[0]
               if generic?(callee) && clashes?(callee, i.args[1..].map { of(f, _1) }) # a call rewritten into a generic this very visit
                 callee = i.args[0] = instance_for(callee, i.args[1..].map { of(f, _1) }, funcs); changed = true
+                # the old callee's result shaped this value and (inside a generic) this function's result; both re-derive
+                i.ty = nil
+                if generic?(f) then f.rtype = nil; funcs.each { |g| g.all.each { |u| u.ty = nil if u.op == :call && u.args[0].equal?(f) } } end
               end
               i.args[1..].each_with_index { |a, k| (make_arr_cell(f, a, i); changed = true) if (pt = callee.ptypes[k]) && cell?(pt) && (arr(pt[1]) && arr(of(f, a)) || hsh(pt[1]) && hsh(of(f, a))) } # the callee grows this container: pass a cell
               unless generic?(callee) && deferred_generic?(callee, i.args[1..].map { of(f, _1) })
@@ -296,14 +325,34 @@ module Indus
               end
             when :pcall
               arms, recv, *args = i.args
+              # the receiver's class set may have grown since this dispatch was built: add the new classes' arms
+              if (rt = of(f, recv)) && (cs = classes_of(rt)) && (missing = cs - arms.map { |(k, _, _)| k.name }).any?
+                mname = arms.find { |(_, kd, pl)| kd == :call }&.then { |(_, _, pl)| pl.name.to_s.split("#").last.delete("'").to_sym }
+                mname ||= (i.respond_to?(:mname) && i.mname)
+                if mname
+                  missing.each { |c| arms << [@classes[c], *resolve(@classes[c], mname, args.size, trap_missing: true)] }
+                  changed = true
+                end
+              end
+              # an arm that grows a container argument wants a cell: every call arm takes the cell, and the argument is wrapped once
+              args.each_with_index do |a, k|
+                pt = arms.map { |_, kd, pl| kd == :call ? pl.ptypes[k + 1] : nil }.find { |t| t && cell?(t) }
+                next unless pt && (arr(pt[1]) && arr(of(f, a)) || hsh(pt[1]) && hsh(of(f, a)) || a.op == :cell_get)
+                make_arr_cell(f, a, i); changed = true
+                arms.each { |_, kd, pl| (pl.ptypes[k + 1] ||= pt[1]; arr_cell_param(pl, pl.params[k + 1])) if kd == :call && !cell?(pl.ptypes[k + 1]) }
+              end
+              args = i.args[2..]
+              args.each_with_index do |a, k| # what the arms store into a cell comes back to the caller's cell
+                next unless (at = of(f, a)) && cell?(at)
+                arms.each do |_, kd, pl|
+                  next unless kd == :call && (pt = pl.ptypes[k + 1]) && cell?(pt) && join(at, pt) != at
+                  at = join(at, pt); a.op == :param ? f.ptypes[f.params.index(a)] = at : a.ty = at; changed = true
+                end
+              end
               arms.each do |klass, kind, payload|
                 case kind
                 when :call
                   payload.ptypes[0] = klass.name
-                  args.each_with_index do |a, k| # a callee that grows this container wants a cell; the other arms then see the cell too
-                    (make_arr_cell(f, a, i); changed = true) if (pt = payload.ptypes[k + 1]) && cell?(pt) && (arr(pt[1]) && arr(of(f, a)) || hsh(pt[1]) && hsh(of(f, a)))
-                  end
-                  args = i.args[2..]
                   args.each_with_index { |a, k| set.(payload.ptypes[k + 1], of(f, a)) { payload.ptypes[k + 1] = _1 } }
                 when :fld_set then set.(@ivars[klass.name][payload], of(f, args[0])) { @ivars[klass.name][payload] = _1 }
                 end
@@ -323,6 +372,8 @@ module Indus
               if (vt = of(f, v)) && (ct = of(f, c)) && cell?(ct) && join(ct[1], vt) != ct[1]
                 nt = [:cell, join(ct[1], vt)]
                 (c.op == :param ? f.ptypes[f.params.index(c)] = nt : c.ty = nt); changed = true
+                if c.op == :fld_get && (k = of(f, c.args[0])) then @ivars[k][c.args[1]] = join(@ivars[k][c.args[1]], nt) end # the field holds the cell: it widens too
+                @consts[c.args[0]] = join(@consts[c.args[0]], nt) if c.op == :gget
               end
             when :cell_new # the allocation inside the cell is what the GC scans: it takes the cell's inner type
               if (ct = i.ty) && cell?(ct) && ct[1].is_a?(Array) && (a = i.args[0]).op != :param && a.ty != ct[1] && (a.ty.nil? || join(a.ty, ct[1]) == ct[1])
@@ -349,6 +400,10 @@ module Indus
             when :fld_set
               o, ix, v = i.args; k = of(f, o)
               set.(@ivars[k][ix], of(f, v)) { @ivars[k][ix] = _1 } if k
+              # a cell stored into a field: what the field's other writers put in it comes back to the cell (shared growth)
+              if k && (vt = of(f, v)) && cell?(vt) && (it = @ivars[k][ix]) && cell?(it) && join(vt, it) != vt
+                nt = join(vt, it); v.op == :param ? f.ptypes[f.params.index(v)] = nt : v.ty = nt; changed = true
+              end
             when :gset then set.(@consts[i.args[0]], of(f, i.args[1])) { @consts[i.args[0]] = _1 }
             end
           end
@@ -370,6 +425,7 @@ module Indus
       tag = ->(t) { classes_of(t)&.each { tag_class.(@classes[_1]) } if poly?(t) || arr(t) && poly?(t[1]) }
       funcs.each { |f| f.all.each { tag.(_1.ty) }; f.ptypes.each { tag.(_1) }; tag.(f.rtype) }
       @ivars.each_value { |h| h.each_value { tag.(_1) } }
+      funcs.each { drop_dead_phis(_1) } # a statement-valued merge nobody reads: boxing its arms would keep dead values alive
       funcs.each { convert(_1) }
       funcs.each { |f| f.all.each { |i| i.op = :hset if i.op == :hset_raw } }
       # a user object boxed into a :dyn carries its class id in word 0 and is listed in the DYN
@@ -426,7 +482,11 @@ module Indus
           if of(f, l) == :int? && of(f, r) == :nil then r.args[0] = INT_NIL; r.ty = :int
           elsif of(f, r) == :int? && of(f, l) == :nil then l.args[0] = INT_NIL; l.ty = :int end
         when :to_s # (by type, resolved in the fixpoint's settled round; anything left is an int)
-          if of(f, i.args[0]) == :int? then i.op = :call; i.args = [fn(:__opt_to_s), i.args[0]]
+          t = of(f, i.args[0])
+          if t == :int? then i.op = :call; i.args = [fn(:__opt_to_s), i.args[0]]
+          elsif (cs = classes_of(t)) # an object in a string: its to_s, or #<Klass>
+            if cs.any? { @classes[_1].find_method(:to_s) } then i.op = :mcall; i.args = [:to_s, i.args[0]]; bind(f, i); i.ty = :str; changed = true
+            else i.op = :sconst; i.args = ["#<#{cs.first}>"] end
           else i.op = :itos end
         when :to_i then i.op = :stoi if of(f, i.args[0]) == :str
         when :puts_v, :p_v, :print_v
@@ -503,6 +563,7 @@ module Indus
           case i.op
           when :pcall, :sendsw then i.args[0].each { |(_, kind, payload)| read[payload] = true if kind == :call }
           when :dsend then i.args.each { read[_1] = true if _1.is_a?(Func) }
+          when :to_s, :puts_v, :p_v, :print_v, :inspect_v then read_name[:to_s] = read_name[:inspect] = true # printing an object calls its to_s / inspect once the types say so
           end
           (i.op == :phi ? i.args.map(&:last) : i.args).each do |a|
             next unless a.is_a?(Inst)
@@ -684,6 +745,7 @@ module Indus
           u.args = u.args.map { |(bb, _)| [bb, c] }; u.ty = of(f, c)
           f.replace_uses(u, c); next
         when :call then next if (pt = u.args[0].ptypes[u.args.index(c) - 1]) && cell?(pt)
+        when :pcall then next if u.args[0].any? { |_, kd, pl| kd == :call && (pt = pl.ptypes[u.args.index(c) - 1]) && cell?(pt) }
         end
         # every use loads afresh right before it: a call or a store in between may have replaced the handle
         g = Inst.new(:cell_get, [c]); g.ty = of(f, c)[1]; g.block = u.block
@@ -846,6 +908,7 @@ module Indus
     def self.bind(f, i)
       name, recv, *args = i.args
       t = of(f, recv)
+      if name == :class && args.empty? && t == :dyn then i.op = :call; i.args = [fn(:__dyn_class_name), recv]; i.ty = :str; return end
       if name == :class && args.empty? && classes_of(t) && classes_of(t).none? { @classes[_1].find_method(:class) } # the class's name, as a String (no class objects at run time)
         if classes_of(t).size == 1 then i.op = :sconst; i.args = [classes_of(t)[0].to_s]; i.ty = :str; return end # one class: no header to read
         cid = Inst.new(:class_id, [recv]); cid.ty = :int; cid.block = i.block; i.block.insts.insert(i.block.insts.index(i), cid)
@@ -889,6 +952,14 @@ module Indus
         end
       end
       if t == :int && name == :to_s && args.empty? then i.op = :itos; i.args = [recv]; return end
+      if t == :dyn && (cands = @classes.values.reject(&:closure).select { |k| k.find_method(name) || k.find_reader(name) || k.find_writer(name) }).any? && !%i[str arr hash num].any? { |fm| prelude_method(fm, name, args.size) }
+        # a method of user classes on a tagged value: the object (tag 8, class id in word 0), dispatched over the classes defining it
+        cs = cands.map(&:name).sort
+        un = Inst.new(:unbox, [recv, cs.size == 1 ? cs[0] : [:poly, cs]]); un.ty = cs.size == 1 ? cs[0] : [:poly, cs]; un.block = i.block
+        i.block.insts.insert(i.block.insts.index(i), un)
+        cands.each { |k| related(k).each { _1.tagged = true; _1.boxed = true } }
+        i.args[1] = un; return bind(f, i)
+      end
       if t == :dyn # a method on a tagged value: if exactly one builtin family defines it, unbox (trapping on a wrong tag) and call
         fams = %w[str arr hash num].select { |fm| prelude_method(fm, name, args.size) }
         fams = ["str"] if fams.empty? && %i[length size upcase downcase].include?(name)
@@ -1152,6 +1223,16 @@ module Indus
       when :gset then yield i.args[1], @consts[i.args[0]], ->(w) { i.args[1] = w }
       when :call then i.args[1..].each_with_index { |v, k| yield v, i.args[0].ptypes[k], ->(w) { i.args[k + 1] = w } }
       when :ret then yield i.args[0], f.rtype, ->(w) { i.args[0] = w }
+      end
+    end
+
+    def self.drop_dead_phis(f)
+      loop do
+        used = {}
+        f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { |a| used[a] = true if a.is_a?(Inst) } }
+        dead = f.blocks.flat_map { |b| b.phis.select { |p| !used[p] } }
+        break if dead.empty?
+        f.blocks.each { |b| b.phis.reject! { |p| dead.include?(p) } }
       end
     end
 

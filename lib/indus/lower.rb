@@ -107,6 +107,7 @@ module Indus
         init.cls = k; k.methods[:initialize] = init
         # body: @a = a; @b = b ...  built as AST-free lowering below
         methods << [k, nil, init, [:self, *fields], fields.map { |f| [:struct_set, f] }, {}]
+        register_class_body(k, st.value.block.body&.body || [], methods) if st.value.block.is_a?(Prism::BlockNode) # Struct.new(...) do ... end
       end
       cdefs.each do |c|
         sup = c.superclass && @classes.fetch(c.superclass.name) { raise "superclass #{c.superclass.name} must be defined first" }
@@ -114,34 +115,7 @@ module Indus
         k.id = @classes.size
         # every @ivar this class body writes, registered now: a subclass declared below copies
         # the parent's layout at declaration, before the parent's methods are lowered
-        assigned_ivars(c.body).each { k.ivar(_1) }
-        # the method resolution order, flattened into this class: included modules first (a
-        # later definition overrides an earlier one), the body, then prepended modules on top.
-        # An overridden definition stays reachable as the overrider's `shadowed`: super's target
-        mods_named = ->(kind) { (c.body&.body || []).select { |st| st.is_a?(Prism::CallNode) && st.name == kind && st.receiver.nil? }
-                                  .flat_map { |st| st.arguments.arguments.map { |a| a.is_a?(Prism::ConstantReadNode) ? a.name : raise("#{kind} needs a module name") } } }
-        mod_defs = ->(m) { @module_defs.fetch(m) { m == :Comparable ? [] : raise("include #{m}: unknown module") } }
-        included, prepended = mods_named.(:include), mods_named.(:prepend)
-        (k.mixins ||= []).concat(included + prepended)
-        mixed_in, prepended_defs = included.flat_map(&mod_defs), prepended.flat_map(&mod_defs)
-        (mixed_in + prepended_defs).each { |d| assigned_ivars(d).each { k.ivar(_1) } }
-        (mixed_in + (c.body&.body || []) + prepended_defs).each do |st|
-          case st
-          when Prism::DefNode
-            next if st.receiver.is_a?(Prism::SelfNode) # Owner.m, registered above
-            if yields?(st) then @yielders[st.name] = [k, st]; next end # inlined only
-            ps = st.parameters
-            f = Func.new(:"#{k.name}##{st.name}#{k.methods[st.name] ? "'" * (1 + k.methods[st.name].name.to_s.count("'")) : ""}", 1 + def_param_names(st).size)
-            f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
-            f.shadowed = k.methods[st.name] if k.methods[st.name]&.cls == k
-            f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
-          when Prism::CallNode
-            next if st.name == :include || st.name == :prepend # mixed in above
-            class_body_call(k, st, {}, methods)
-          when Prism::ConstantWriteNode then nil # hoisted above
-          else raise "unsupported in class body: #{st.class}"
-          end
-        end
+        register_class_body(k, c.body&.body || [], methods)
       end
       @pre = Pretype.new(@ast, @classes) # receiver kinds for the structural decisions below
       main = Func.new(:main, 0)
@@ -422,6 +396,46 @@ module Indus
       ph
     end
 
+
+    # a class body's statements, registered into k: defs, mixins, attr_* and friends
+    def register_class_body(k, stmts, methods)
+      assigned_ivars(stmts).each { k.ivar(_1) }
+      # the method resolution order, flattened into this class: included modules first (a
+      # later definition overrides an earlier one), the body, then prepended modules on top.
+      # An overridden definition stays reachable as the overrider's `shadowed`: super's target
+      mods_named = ->(kind) { stmts.select { |st| st.is_a?(Prism::CallNode) && st.name == kind && st.receiver.nil? }
+                                .flat_map { |st| st.arguments.arguments.map { |a| a.is_a?(Prism::ConstantReadNode) ? a.name : raise("#{kind} needs a module name") } } }
+      mod_defs = ->(m) { @module_defs.fetch(m) { m == :Comparable || m == :Enumerable ? [] : raise("include #{m}: unknown module") } }
+      included, prepended = mods_named.(:include), mods_named.(:prepend)
+      if included.include?(:Enumerable) # every Enumerable method is the array method on what each yields
+        k.enumerable = true
+        unless stmts.any? { |st| st.is_a?(Prism::DefNode) && st.name == :to_a }
+          @enum_to_a_defs ||= Prism.parse("def to_a\n  __out = []\n  each { |__x| __out << __x }\n  __out\nend").value.statements.body
+          stmts = stmts + @enum_to_a_defs
+        end
+      end
+      (k.mixins ||= []).concat(included + prepended)
+      mixed_in, prepended_defs = included.flat_map(&mod_defs), prepended.flat_map(&mod_defs)
+      (mixed_in + prepended_defs).each { |d| assigned_ivars(d).each { k.ivar(_1) } }
+      (mixed_in + stmts + prepended_defs).each do |st|
+        case st
+        when Prism::DefNode
+          next if st.receiver.is_a?(Prism::SelfNode) # Owner.m, registered above
+          if yields?(st) then @yielders[st.name] = [k, st]; next end # inlined only
+          ps = st.parameters
+          f = Func.new(:"#{k.name}##{st.name}#{k.methods[st.name] ? "'" * (1 + k.methods[st.name].name.to_s.count("'")) : ""}", 1 + def_param_names(st).size)
+          f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
+          f.shadowed = k.methods[st.name] if k.methods[st.name]&.cls == k
+          f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
+        when Prism::CallNode
+          next if st.name == :include || st.name == :prepend # mixed in above
+          class_body_call(k, st, {}, methods)
+        when Prism::ConstantWriteNode then nil # hoisted above
+        else raise "unsupported in class body: #{st.class}"
+        end
+      end
+    end
+
     def struct_new?(v) = v.is_a?(Prism::CallNode) && v.name == :new && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Struct
 
     public
@@ -454,6 +468,7 @@ module Indus
       end
       last = nil
       stmts.each { last = expr(_1) }
+      last = const(0) if f.name == :main # the program's last expression is not a value anyone reads
       emit(:ret, [last || const(0)]) unless @cur.term
     end
 
@@ -499,6 +514,13 @@ module Indus
     end
 
     def nil_const = (c = const(0); c.ty = :nil; c)
+
+    # obj.x = v with the receiver already evaluated: the class's writer (an attr_accessor's
+    # field store, or a user-defined x=)
+    def attr_assign(recv_node, rv, writer, v)
+      emit(:mcall, [writer, rv, v])
+      v
+    end
     def me_val = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
     # append to the *current* block after the arguments have been evaluated
     # (lowering an argument may move @cur: loops, inlining)
@@ -553,6 +575,19 @@ module Indus
         when Prism::InstanceVariableReadNode then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
         end
         v
+      when Prism::CallOperatorWriteNode # obj.x += v  ->  obj.x = (obj.x + v)
+        recv = n.receiver
+        read = Prism::CallNode.new(n.send(:source), 0, n.location, 0, recv, nil, n.read_name, nil, nil, nil, nil, nil, nil)
+        rv = expr(recv)
+        cur = call(read)
+        v = emit(ARITH.fetch(n.binary_operator), [cur, expr(n.value)])
+        attr_assign(recv, rv, n.write_name, v)
+      when Prism::CallOrWriteNode # obj.x ||= v
+        recv = n.receiver
+        read = Prism::CallNode.new(n.send(:source), 0, n.location, 0, recv, nil, n.read_name, nil, nil, nil, nil, nil, nil)
+        rv = expr(recv)
+        cur = call(read)
+        cond_assign(cur, false, -> { expr(n.value) }, ->(v) { attr_assign(recv, rv, n.write_name, v) })
       when Prism::IndexOrWriteNode # h[k] ||= v
         recv = expr(n.receiver); k = expr(n.arguments.arguments[0])
         cur = emit(:idx, [recv, k])
@@ -774,8 +809,24 @@ module Indus
       end
     end
 
+    ENUMERABLE = %i[map collect select filter reject sum count min max min_by max_by sort sort_by group_by partition each_with_index each_with_object
+                    reduce inject find detect find_index any? all? none? one? include? first take drop take_while drop_while flat_map
+                    each_slice each_cons zip to_a entries tally uniq reverse_each filter_map minmax each_entry to_set lazy].freeze
+
+    # a receiver whose class includes Enumerable and does not define the method itself: the
+    # array method on what each yields (to_a is synthesized from each at declaration)
+    def enumerable_receiver(n)
+      recv = n.receiver
+      k = if recv.nil? then @klass
+          elsif (kd = kind_of(recv)).is_a?(Symbol) then @classes[kd] end
+      return nil unless k&.enumerable && ENUMERABLE.include?(n.name) && n.name != :to_a && !k.find_method(n.name)
+      src = recv || Prism::SelfNode.new(n.send(:source), 0, n.location, 0)
+      Prism::CallNode.new(n.send(:source), 0, n.location, 0, src, nil, :to_a, nil, nil, nil, nil, nil, nil)
+    end
+
     def call(n)
       args = n.arguments&.arguments || []
+      if (ta = enumerable_receiver(n)) then return call(n.copy(receiver: ta)) end
       if n.safe_navigation? && !@in_safe_nav # x&.m: nil when x is nil
         r = expr(n.receiver)
         return (c = const(0); c.ty = :nil; c) if r.ty == :nil
@@ -797,6 +848,18 @@ module Indus
         c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
         return emit(:call, [f, *call_args(f, args), c])
       end
+      # a method taking &blk on self or on an object of a known class, called with a block literal: the block is a closure value
+      if n.block.is_a?(Prism::BlockNode)
+        mk = n.receiver.nil? ? @klass : ((kd = kind_of(n.receiver)).is_a?(Symbol) ? @classes[kd] : nil)
+        if mk && (mf = mk.find_method(n.name)) && (d = @defs_by_func[mf]) && d.parameters&.block
+          blk = n.block
+          params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+          raise "a block passed to #{n.name} cannot yet refer to self or @ivars" if @klass && refers_to_self?(blk.body)
+          c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
+          rv = n.receiver ? expr(n.receiver) : me_val
+          return emit(:mcall, [n.name, rv, *method_args(mf, args, rv), c])
+        end
+      end
       if n.block.is_a?(Prism::BlockArgumentNode) && n.block.expression.is_a?(Prism::SymbolNode) && n.receiver
         return block_call(n, args) # map(&:upcase), group_by(&:length), ...: the block { |e| e.sym }
       end
@@ -809,7 +872,7 @@ module Indus
         a = expr(n.receiver); v = expr(args[0])
         r = emit(:lshift_or_append, [a, v])
         case root # the chain's home is rebound to the result (a grown string/array may have moved)
-        when Prism::LocalVariableReadNode then @locals[lname(root.name)] = r
+        when Prism::LocalVariableReadNode then shared?(root.name) ? write_shared(root.name, r) : @locals[lname(root.name)] = r
         when Prism::InstanceVariableReadNode then emit(:fld_set, [@locals.fetch(:self), @klass.ivar(root.name), r])
         when Prism::CallNode
           if root.name == :[] # h[k] << v / a[i] << v: the element slot takes the grown handle
@@ -977,7 +1040,9 @@ module Indus
               elsif (k = kind_of(args[0])).is_a?(Symbol) && @classes[k] then expr(args[0]) # raise exc_object
               else new_exception(:RuntimeError, [args[0]]) end # raise "message" (any String expression)
         emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc]) # rt_raise returns only when nothing catches (then exit)
-        return const(0)
+        emit(:ret, [nil_const]) unless @cur.term # never reached (rt_raise does not return): what follows a raise is dead and contributes no type
+        @cur = @f.new_block(:dead)
+        return nil_const
       elsif %i[printf format sprintf].include?(n.name) && n.receiver.nil? && args[0]
         str = emit(:call, [demand(:__format), expr(args[0]), dyn_array(args[1..])])
         n.name == :printf ? emit(:print_v, [str]) : str
@@ -1006,13 +1071,13 @@ module Indus
         @locals.delete(outv)
       elsif n.name == :insert && args.size == 2 && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode) || n.receiver.is_a?(Prism::ArrayNode))
         r = emit(:call, [demand(:__arr_insert), expr(n.receiver), expr(args[0]), expr(args[1])]) # grows: rebind the home, as push does
-        if n.receiver.is_a?(Prism::LocalVariableReadNode) then @locals[lname(n.receiver.name)] = r
+        if n.receiver.is_a?(Prism::LocalVariableReadNode) then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
         elsif n.receiver.is_a?(Prism::InstanceVariableReadNode) then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
         r
       elsif n.name == :push && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode)) && !((k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k])
         a = expr(n.receiver); v = expr(args[0]); len = emit(:alen, [a])
         r = emit(:aset, [a, len, v]) # may grow: rebind the home
-        if n.receiver.is_a?(Prism::LocalVariableReadNode) then @locals[lname(n.receiver.name)] = r
+        if n.receiver.is_a?(Prism::LocalVariableReadNode) then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
         else emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
         r
       elsif n.name == :[] && args.size == 1 && args[0].is_a?(Prism::RangeNode) # s[a..b], a[2..], a[..-2]
@@ -1167,6 +1232,7 @@ module Indus
       when :__unbox_arr then emit(:unbox, [expr(args[0]), [:arr, :dyn]])
       when :__unbox_float then emit(:unbox, [expr(args[0]), :float])
       when :__unbox_bool then emit(:unbox, [expr(args[0]), :bool])
+      when :__unbox_obj_addr then emit(:xor, [emit(:handle, [expr(args[0])]), const(8)]) # an object's tag is 8: the raw word with the tag cleared
       when :__unbox_sym then emit(:unbox, [expr(args[0]), :sym])
       when :__unbox_hash then emit(:unbox, [expr(args[0]), [:hash, :dyn, :dyn]])
       when :__gset_int then (v = expr(args[1]); emit(:gset, [args[0].unescaped.to_sym, v]); v)
@@ -1196,6 +1262,29 @@ module Indus
       end
       if n.receiver && !@recv_value && n.name == :map && times_enum?(n.receiver)
         return iterate_array_value(n, args, range_array(n.receiver))
+      end
+      # s.each_char { |c| } / s.each_byte / s.each_line: iterate the string's pieces as an array
+      if n.receiver && blk.is_a?(Prism::BlockNode) && %i[each_char each_byte each_line].include?(n.name) && !@recv_value && kind_of(n.receiver) != :array
+        pieces = { each_char: :chars, each_byte: :bytes, each_line: :lines }[n.name]
+        return iterate_array_value(n.copy(name: :each), args, emit(:mcall, [pieces, expr(n.receiver)]))
+      end
+      # h.fetch(k) { default }: the block runs only on a miss
+      if n.receiver && blk.is_a?(Prism::BlockNode) && n.name == :fetch && args.size == 1
+        h = expr(n.receiver); k = expr(args[0])
+        has = emit(:mcall, [:key?, h, k])
+        tb, eb, mb = @f.new_block(:fhit), @f.new_block(:fmiss), @f.new_block(:fmerge)
+        emit(:condbr, [has, tb, eb])
+        @cur = tb; hit = emit(:idx, [h, k]); tend = @cur; emit(:br, [mb])
+        @cur = eb; before = @locals.dup
+        miss = run_body(blk.body&.body || [], nil) || nil_const
+        mend = @cur
+        reaches = !@cur.term
+        emit(:br, [mb]) if reaches
+        @cur = mb
+        arms = [[tend, before]] + (reaches ? [[mend, @locals]] : [])
+        @locals = merge_locals(mb, arms)
+        ph = mb.phi; ph.args = [[tend, hit]] + (reaches ? [[mend, miss]] : [])
+        return ph
       end
       # block methods defined by a map over the receiver plus a prelude pass on the results
       # (a mask of truths, or the mapped values): one lowering each, no new loop kinds
@@ -1896,7 +1985,7 @@ module Indus
       all_assigned = assigned_locals_plain(stmts)
       closures.each do |(params, body)|
         free = free_locals_plain(body, params)
-        assigned_in = assigned_locals_plain(body)
+        assigned_in = assigned_locals_plain(body) + grown_locals_plain(body) # `out << x` / out.push(x) inside: the handle may move, so the outer sees it through a cell
         free.each { |nm| shared << nm if assigned_in.include?(nm) || all_assigned.count(nm) > 1 }
       end
       # a local assigned inside a rescued body is read by the handler as it was at the raise:
@@ -1931,7 +2020,10 @@ module Indus
       return false unless n.is_a?(Prism::CallNode) && n.block.is_a?(Prism::BlockNode)
       return true if n.receiver.nil? && %i[lambda proc].include?(n.name)
       return true if n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Proc
-      n.receiver.nil? && (f = @funcs[n.name]) && (d = @defs_by_func[f]) && d.parameters&.block ? true : false
+      return true if n.receiver.nil? && (f = @funcs[n.name]) && (d = @defs_by_func[f]) && d.parameters&.block
+      # a method with &blk on self or on an object: any class defining the name that way (the receiver's class is known only later)
+      cands = n.receiver.nil? ? [@klass].compact : @classes.values
+      cands.any? { |k| (mf = k.find_method(n.name)) && (d = @defs_by_func[mf]) && d.parameters&.block }
     end
 
     def free_locals_plain(node, bound, out = [])
@@ -1948,6 +2040,17 @@ module Indus
       return false unless node.is_a?(Prism::Node)
       return true if node.is_a?(klass)
       node.compact_child_nodes.any? { has_node?(_1, klass) }
+    end
+
+    # locals that are grown in place (<<, push, insert, concat, []= with a new key): their handle may change
+    def grown_locals_plain(node, out = [])
+      return (node.each { grown_locals_plain(_1, out) }; out) if node.is_a?(Array)
+      return out unless node.is_a?(Prism::Node)
+      if node.is_a?(Prism::CallNode) && %i[<< push insert concat unshift []= store].include?(node.name) && node.receiver.is_a?(Prism::LocalVariableReadNode)
+        out << node.receiver.name
+      end
+      node.compact_child_nodes.each { grown_locals_plain(_1, out) }
+      out
     end
 
     def assigned_locals_plain(node, out = [])

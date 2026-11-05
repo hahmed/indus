@@ -748,7 +748,21 @@ class IndexError < StandardError
 end
 class KeyError < IndexError
 end
-class NoMethodError < StandardError
+class NameError < StandardError
+end
+class RangeError < StandardError
+end
+class FloatDomainError < RangeError
+end
+class StopIteration < IndexError
+end
+class FrozenError < RuntimeError
+end
+class IOError < StandardError
+end
+class NotImplementedError < StandardError
+end
+class NoMethodError < NameError
 end
 
 # nothing rescued it: Ruby prints the message to stderr and exits 1
@@ -1042,4 +1056,18 @@ end
 def __dyn_sym(v)
   __trap if __tag(v) != 12
   __unbox_sym(v)
+end
+
+# the class name of a tagged value, by tag; objects carry their class id in word 0
+def __dyn_class_name(v)
+  t = __tag(v)
+  return "Integer" if t & 1 == 1
+  return "NilClass" if v == 0
+  return "String" if t == 2
+  return "Array" if t == 4
+  return "Hash" if t == 6
+  return "Symbol" if t == 12
+  return "Float" if t == 14
+  return (__unbox_bool(v) ? "TrueClass" : "FalseClass") if t == 10
+  __class_name(__ld(__unbox_obj_addr(v)))
 end

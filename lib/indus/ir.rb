@@ -32,7 +32,7 @@ module Indus
   # a user class: ivar layout (8 bytes each, no header), methods, attrs
   class Klass
     attr_reader :name, :ivars, :methods, :readers, :writers
-    attr_accessor :superclass, :tagged, :boxed, :id, :closure, :mixins # closure: a lambda literal's anonymous class; mixins: modules included/prepended here
+    attr_accessor :superclass, :tagged, :boxed, :id, :closure, :mixins, :enumerable # closure: a lambda literal's anonymous class; mixins: modules included/prepended here
     def initialize(name, superclass = nil)
       @name, @methods, @readers, @writers = name, {}, {}, {}
       @superclass = superclass

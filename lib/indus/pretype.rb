@@ -198,7 +198,14 @@ module Indus
       when :[]= then (store_into(recv, n.receiver, akinds, env, klass); akinds[1])
       when :push then (store_into(recv, n.receiver, [nil, akinds[0]], env, klass); recv)
       when :keys then recv.is_a?(Array) && recv[0] == :hash ? [:array, recv[1]] : nil
-      when :map then [:array, nil]
+      when :map, :select, :reject, :sort, :sort_by, :reverse, :uniq, :flatten, :compact, :first, :take, :drop, :shuffle, :zip, :each_slice, :each_cons, :partition, :chars, :split, :lines, :to_a, :values, :filter_map, :flat_map, :min_by, :max_by
+        if %i[min_by max_by first].include?(n.name) && (n.name != :first || akinds.empty?) then (recv.is_a?(Array) && recv[0] == :array ? recv[1] : nil)
+        elsif recv.is_a?(Array) && recv[0] == :hash then (%i[select reject].include?(n.name) ? recv : [:array, nil])
+        elsif %i[select reject sort reverse uniq compact first take drop shuffle].include?(n.name) && recv.is_a?(Array) then recv
+        else [:array, nil] end
+      when :group_by, :tally, :to_h, :transform_values, :transform_keys, :merge, :invert, :each_with_object
+        n.name == :each_with_object ? (akinds[0].is_a?(Array) ? akinds[0] : nil) : [:hash, nil, nil]
+      when :dup, :clone, :freeze, :itself then recv
       when :send, :public_send then nil
       when :sqrt, :sin, :cos then :float
       when :** then (recv == :float || akinds[0] == :float ? :float : :int)
