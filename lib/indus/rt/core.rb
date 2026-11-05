@@ -1178,3 +1178,21 @@ def __dyn_idx_set_dyn(v, k, x)
   h[k] = x
   v
 end
+
+def __dyn_to_i(v)
+  t = __tag(v)
+  return __unbox_int(v) if t & 1 == 1
+  return __unbox_str(v).to_i if t == 2
+  return __unbox_float(v).to_i if t == 14
+  return 0 if v == 0
+  __trap
+  0
+end
+def __dyn_to_f(v)
+  t = __tag(v)
+  return __unbox_int(v).to_f if t & 1 == 1
+  return __unbox_str(v).to_f if t == 2
+  return __unbox_float(v) if t == 14
+  __trap
+  0.0
+end

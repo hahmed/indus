@@ -24,7 +24,7 @@
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir pretype lower types passes peephole escape gc magic rt/blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir regex pretype lower types passes peephole escape gc magic rt/blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # everything a compiled program knows about itself: enough for the
@@ -37,7 +37,7 @@ module Indus
 
   # standalone: nil (run in-process via libc write), :darwin or :linux
   PRELUDE_GC = File.read(File.join(__dir__, "indus/rt/gc.rb"))
-  PRELUDE_CORE = %w[grisu core big format enum libm].map { File.read(File.join(__dir__, "indus/rt/#{_1}.rb")) }.join("\n")
+  PRELUDE_CORE = %w[grisu core big format enum libm regex].map { File.read(File.join(__dir__, "indus/rt/#{_1}.rb")) }.join("\n")
 
   # require_relative "x" / require "./x" splice the file in, once, where the call is (a
   # program is one compilation unit). require of a library name: a few are built in (set is

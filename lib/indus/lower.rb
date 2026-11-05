@@ -519,6 +519,39 @@ module Indus
 
     def nil_const = (c = const(0); c.ty = :nil; c)
 
+    # a regexp literal: compiled now (lib/indus/regex.rb) into a program the prelude matcher
+    # runs; one Regexp object per literal, built when first evaluated and kept in a global
+    def regexp_groups(n) = Regex.compile(n.unescaped, n.ignore_case? ? "i" : "")[1]
+
+    def regexp_value(n)
+      raise "regexp with interpolation: not supported (the pattern must be known at compile time)" unless n.is_a?(Prism::RegularExpressionNode)
+      fl = +""
+      fl << "i" if n.ignore_case?
+      raise "regexp /x flag: not supported" if n.extended?
+      raise "regexp /m flag: not supported" if n.multi_line?
+      prog, ngroups = Regex.compile(n.unescaped, fl)
+      @regexps ||= {}
+      key = [n.unescaped, fl]
+      gname = (@regexps[key] ||= :"__RE#{@regexps.size}")
+      # the object: lazily built at the use site when the global is still nil (a cheap check)
+      cur = emit(:gget, [gname])
+      tb, eb, mb = @f.new_block(:remk), @f.new_block(:rehave), @f.new_block(:remerge)
+      isnil = emit(:cmp, [cur, nil_const], :eq)
+      emit(:condbr, [isnil, tb, eb])
+      @cur = tb
+      # the program travels as bytes in the data section (4 per word, two's complement), decoded once
+      bytes = prog.map { |w| [w & 0xffffffff].pack("V") }.join
+      arr = emit(:call, [demand(:__re_decode), emit(:sconst, [bytes])])
+      k = @classes.fetch(:Regexp)
+      o = emit(:onew, [k])
+      emit(:call, [k.methods.fetch(:initialize), o, arr, const((ngroups + 1) * 2), emit(:sconst, [n.unescaped])])
+      emit(:gset, [gname, o])
+      tend = @cur; emit(:br, [mb])
+      @cur = eb; emit(:br, [mb])
+      @cur = mb
+      ph = mb.phi; ph.args = [[tend, o], [eb, cur]]; ph
+    end
+
     # obj.x = v with the receiver already evaluated: the class's writer (an attr_accessor's
     # field store, or a user-defined x=)
     def attr_assign(recv_node, rv, writer, v)
@@ -639,6 +672,9 @@ module Indus
       when Prism::ConstantWriteNode
         v = expr(n.value); emit(:gset, [n.name, v]); v
       when Prism::GlobalVariableReadNode then emit(:gget, [n.name])
+      when Prism::NumberedReferenceReadNode then emit(:call, [demand(:__re_group), const(n.number)]) # $1..$9 after the last match
+      when Prism::RegularExpressionNode, Prism::InterpolatedRegularExpressionNode then regexp_value(n)
+      when Prism::MatchWriteNode then expr(n.call) # /(?<x>..)/ =~ s with named captures: the match itself (names unsupported, parser refuses)
       when Prism::GlobalVariableWriteNode
         v = expr(n.value); emit(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode
@@ -978,6 +1014,20 @@ module Indus
         @cur = mb2; inner = mb2.phi; inner.args = [[tb2, hi], [eb2, x]]; emit(:br, [mb])
         @cur = mb; p = mb.phi; p.args = [[tb, lo], [mb2, inner]]; p
       elsif n.name == :~ && args.empty? && n.receiver then emit(:xor, [expr(n.receiver), const(-1)]) # bitwise not
+      elsif %i[match match? scan sub gsub split =~ !~].include?(n.name) && args.size >= 1 && args[0].is_a?(Prism::RegularExpressionNode) && n.receiver && !((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd])
+        re = expr(args[0]); sv = expr(n.receiver)
+        case n.name
+        when :match then emit(:call, [demand(:__str_match_re), sv, re])
+        when :match? then emit(:call, [demand(:__str_match_p_re), sv, re])
+        when :scan then emit(:call, [demand(regexp_groups(args[0]) > 0 ? :__str_scan_groups_re : :__str_scan_re), sv, re])
+        when :sub then emit(:call, [demand(:__str_sub_re), sv, re, expr(args[1])])
+        when :gsub then emit(:call, [demand(:__str_gsub_re), sv, re, expr(args[1])])
+        when :split then emit(:call, [demand(:__str_split_re), sv, re])
+        when :=~ then emit(:call, [demand(:__str_index_re), sv, re])
+        when :!~ then emit(:cmp, [emit(:call, [demand(:__str_match_p_re), sv, re]), (c = const(0); c.ty = :bool; c)], :eq)
+        end
+      elsif n.name == :=~ && args.size == 1 && n.receiver.is_a?(Prism::RegularExpressionNode) # /re/ =~ s
+        emit(:call, [demand(:__str_index_re), expr(args[0]), expr(n.receiver)])
       elsif n.name == :first && args.size == 1 && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :cycle && n.receiver.arguments.nil? && n.receiver.receiver
         emit(:call, [demand(:__arr_cycle_first), expr(n.receiver.receiver), expr(args[0])]) # xs.cycle.first(n): the only finite view of a cycle
       elsif n.name == :step && args.size == 1 && n.receiver.is_a?(Prism::ParenthesesNode) && n.receiver.body.body.last.is_a?(Prism::RangeNode) # (a..b).step(n)
@@ -1195,6 +1245,7 @@ module Indus
       when :__ld then emit(:rawld, [expr(args[0])])
       when :__ld32 then emit(:rawld32, [expr(args[0])])
       when :__ld8 then emit(:rawld8, [expr(args[0]), expr(args[1])])          # byte i of string s
+      when :__byte_at then emit(:rawld8, [expr(args[0]), expr(args[1])])
       when :__st8 then (a = expr(args[0]); ix = expr(args[1]); v = expr(args[2]); emit(:rawst8, [a, ix, v]); v)
       when :__sdup then emit(:sdup, [expr(args[0])])
       when :__is_sym then emit(:is_sym, [expr(args[0])]) # true when the value's static type is Symbol (Types folds it)
@@ -1275,6 +1326,12 @@ module Indus
       end
       if n.receiver && !@recv_value && n.name == :map && times_enum?(n.receiver)
         return iterate_array_value(n, args, range_array(n.receiver))
+      end
+      # s.gsub(/re/) { |m| ... }: the block as a closure value, called per match
+      if n.receiver && blk.is_a?(Prism::BlockNode) && n.name == :gsub && args.size == 1 && args[0].is_a?(Prism::RegularExpressionNode)
+        params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+        c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
+        return emit(:call, [demand(:__str_gsub_blk_re), expr(n.receiver), expr(args[0]), c])
       end
       # s.each_char { |c| } / s.each_byte / s.each_line: iterate the string's pieces as an array
       if n.receiver && blk.is_a?(Prism::BlockNode) && %i[each_char each_byte each_line].include?(n.name) && !@recv_value && kind_of(n.receiver) != :array
@@ -1832,6 +1889,7 @@ module Indus
     def when_test(subj, c)
       return ->() { expr(c) } unless subj
       return ->() { emit(:isa, [subj, c.name]) } if class_const?(c) # `when Klass` is Klass === subj
+      return ->() { emit(:cmp, [emit(:call, [demand(:__str_index_re), subj, expr(c)]), nil_const], :ne) } if c.is_a?(Prism::RegularExpressionNode) # `when /re/` is re === subj, and sets $1..
       if c.is_a?(Prism::RangeNode)
         ->() { lo = expr(c.left); hi = expr(c.right)
                a = emit(:cmp, [subj, lo], :ge); b = emit(:cmp, [subj, hi], c.exclude_end? ? :lt : :le)
