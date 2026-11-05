@@ -50,6 +50,20 @@ module Indus
       # `def self.m` in a class or module body: a function named Owner.m, no self
       @modules = mods.map { _1.constant_path.name }
       sdefs = (cdefs + mods).flat_map { |c| (c.body&.body || []).grep(Prism::DefNode).select { _1.receiver.is_a?(Prism::SelfNode) }.map { [c.constant_path.name, _1] } }
+      # module_function :m (or bare, covering the defs below it): the instance method is also Module.m
+      mods.each do |m|
+        stmts = m.body&.body || []
+        bare = false
+        stmts.each do |st|
+          if st.is_a?(Prism::CallNode) && st.name == :module_function && st.receiver.nil?
+            names = (st.arguments&.arguments || []).map { |a| a.is_a?(Prism::SymbolNode) ? a.unescaped.to_sym : raise("module_function needs symbols") }
+            bare = true if names.empty?
+            names.each { |nm| d = stmts.grep(Prism::DefNode).find { _1.name == nm } or raise("module_function #{nm}: no such def"); sdefs << [m.constant_path.name, d] }
+          elsif bare && st.is_a?(Prism::DefNode) && !st.receiver
+            sdefs << [m.constant_path.name, st]
+          end
+        end
+      end
       # constants written inside class bodies run before everything else
       class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode) }
       # Name = Struct.new(:a, :b) defines a class with accessors and an initialize
@@ -101,21 +115,28 @@ module Indus
         # every @ivar this class body writes, registered now: a subclass declared below copies
         # the parent's layout at declaration, before the parent's methods are lowered
         assigned_ivars(c.body).each { k.ivar(_1) }
-        included = (c.body&.body || []).select { |st| st.is_a?(Prism::CallNode) && st.name == :include && st.receiver.nil? }
-                     .flat_map { |st| st.arguments.arguments.map { |a| a.is_a?(Prism::ConstantReadNode) ? a.name : raise("include needs a module name") } }
-        mixed_in = included.flat_map { |m| @module_defs.fetch(m) { m == :Comparable ? [] : raise("include #{m}: unknown module") } }
-        mixed_in.each { |d| assigned_ivars(d).each { k.ivar(_1) } }
-        (mixed_in + (c.body&.body || [])).each do |st|
+        # the method resolution order, flattened into this class: included modules first (a
+        # later definition overrides an earlier one), the body, then prepended modules on top.
+        # An overridden definition stays reachable as the overrider's `shadowed`: super's target
+        mods_named = ->(kind) { (c.body&.body || []).select { |st| st.is_a?(Prism::CallNode) && st.name == kind && st.receiver.nil? }
+                                  .flat_map { |st| st.arguments.arguments.map { |a| a.is_a?(Prism::ConstantReadNode) ? a.name : raise("#{kind} needs a module name") } } }
+        mod_defs = ->(m) { @module_defs.fetch(m) { m == :Comparable ? [] : raise("include #{m}: unknown module") } }
+        included, prepended = mods_named.(:include), mods_named.(:prepend)
+        (k.mixins ||= []).concat(included + prepended)
+        mixed_in, prepended_defs = included.flat_map(&mod_defs), prepended.flat_map(&mod_defs)
+        (mixed_in + prepended_defs).each { |d| assigned_ivars(d).each { k.ivar(_1) } }
+        (mixed_in + (c.body&.body || []) + prepended_defs).each do |st|
           case st
           when Prism::DefNode
             next if st.receiver.is_a?(Prism::SelfNode) # Owner.m, registered above
             if yields?(st) then @yielders[st.name] = [k, st]; next end # inlined only
             ps = st.parameters
-            f = Func.new(:"#{k.name}##{st.name}", 1 + def_param_names(st).size)
+            f = Func.new(:"#{k.name}##{st.name}#{k.methods[st.name] ? "'" * (1 + k.methods[st.name].name.to_s.count("'")) : ""}", 1 + def_param_names(st).size)
             f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
+            f.shadowed = k.methods[st.name] if k.methods[st.name]&.cls == k
             f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
           when Prism::CallNode
-            next if st.name == :include # mixed in above
+            next if st.name == :include || st.name == :prepend # mixed in above
             class_body_call(k, st, {}, methods)
           when Prism::ConstantWriteNode then nil # hoisted above
           else raise "unsupported in class body: #{st.class}"
@@ -302,6 +323,8 @@ module Indus
     def kind_for(cname)
       { Integer: :int, Float: :float, String: :str, Array: [:arr, :dyn], Hash: [:hash, :dyn, :dyn], Symbol: :sym }.fetch(cname) { @classes[cname] ? cname : raise("is_a?(#{cname}): unknown class") }
     end
+
+    attr_reader :modules
 
     # `x << a << b`: the local or ivar at the root of the chain, nil when it is an integer local
     def append_root(n)
@@ -497,8 +520,8 @@ module Indus
       when Prism::RescueModifierNode then rescue_modifier(n) # expr rescue fallback
       when Prism::SuperNode, Prism::ForwardingSuperNode # super(args) / super: the superclass's version of this method
         raise "super outside a method" unless @klass && @f.cls
-        mname = @f.name.to_s.split("#").last.to_sym
-        sup = @klass.superclass&.find_method(mname) or raise "super: no #{mname} above #{@klass.name}"
+        mname = @f.name.to_s.split("#").last.delete("'").to_sym
+        sup = @f.shadowed || @klass.superclass&.find_method(mname) or raise "super: no #{mname} above #{@klass.name}"
         args = n.is_a?(Prism::SuperNode) ? (n.arguments&.arguments || []) : @f.params[1..].map { nil }
         vals = n.is_a?(Prism::SuperNode) ? method_args(sup, args) : @f.params[1..]
         emit(:call, [sup, me_val, *vals])
@@ -841,10 +864,21 @@ module Indus
         emit(:print_v, [expr(args[0])])   # no newline
       elsif n.name == :Integer && n.receiver.nil? && args.size == 1
         emit(:to_i, [expr(args[0])])      # Integer(x): the parse, no exception on junk (yet)
+      elsif n.name == :include? && args.size == 1 && n.receiver.is_a?(Prism::ConstantReadNode) && (k = @classes[n.receiver.name]) && args[0].is_a?(Prism::ConstantReadNode)
+        c = const(Types.ancestor?(k, args[0].name) ? 1 : 0); c.ty = :bool; c # Klass.include?(M): a compile-time fact
+      elsif n.name == :name && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
+        emit(:sconst, [n.receiver.name.to_s]) # Klass.name
+      elsif n.name == :name && args.empty? && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :class && n.receiver.arguments.nil? && n.receiver.receiver
+        expr(n.receiver) # obj.class.name: the class is already its name (no class objects)
+      elsif n.name == :ancestors && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) then raise "ancestors: no class objects at run time"
+      elsif n.name == :extend && args.size == 1 && n.receiver then raise "extend on an instance: singleton methods are not supported (every object of a class shares its methods)"
       elsif n.name == :is_a? && args.size == 1 && n.receiver && args[0].is_a?(Prism::ConstantReadNode)
         emit(:isa, [expr(n.receiver), args[0].name])
       elsif n.name == :nil? && args.empty? && n.receiver
         v = expr(n.receiver); emit(:cmp, [v, (c = const(0); c.ty = :nil; c)], :eq)
+      elsif n.name == :to_s && args.empty? && n.receiver.nil? && @klass && @klass.find_method(:to_s) # bare to_s: self's
+        emit(:call, [@klass.find_method(:to_s), me_val])
+      elsif n.name == :to_s && args.empty? && n.receiver.nil? then raise "to_s with no receiver outside a class defining it"
       elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
       elsif n.name == :+@ && args.empty? then expr(n.receiver) # +"" : literals are already fresh copies
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array

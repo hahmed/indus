@@ -718,6 +718,11 @@ def __dyn_length(v)
 end
 
 # Exceptions. raise "m" is RuntimeError.new("m"); rescue matches by class.
+# Object.new: an object with no state (a sentinel, a lock token). Singleton methods and
+# extend on one instance are not supported: every object of a class shares its methods.
+class Object
+end
+
 class StandardError
   attr_reader :message
   def initialize(message = "unhandled exception")

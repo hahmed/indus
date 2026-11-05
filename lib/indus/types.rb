@@ -339,7 +339,7 @@ module Indus
         want = { Integer: :int, Float: :float, String: :str, Array: :arr, Hash: :hash }[cname]
         if t == :dyn
           i.op = :isa_dyn; i.args = [v, cname] # tag test, or class id for user classes
-        elsif poly?(t) && @classes[cname]
+        elsif poly?(t) && (@classes[cname] || @lower.modules.include?(cname))
           # which members of the set descend from cname? none -> false; all -> true; some -> compare ids
           hits = t[1].select { |c| ancestor?(@classes[c], cname) }
           if hits.empty? then i.op = :const; i.args = [0]; i.ty = :bool
@@ -713,6 +713,7 @@ module Indus
       name, recv, *args = i.args
       t = of(f, recv)
       if name == :class && args.empty? && classes_of(t) && classes_of(t).none? { @classes[_1].find_method(:class) } # the class's name, as a String (no class objects at run time)
+        if classes_of(t).size == 1 then i.op = :sconst; i.args = [classes_of(t)[0].to_s]; i.ty = :str; return end # one class: no header to read
         cid = Inst.new(:class_id, [recv]); cid.ty = :int; cid.block = i.block; i.block.insts.insert(i.block.insts.index(i), cid)
         i.op = :call; i.args = [fn(:__class_name), cid]; i.ty = :str; return
       end
@@ -849,10 +850,10 @@ module Indus
       [klass, *ups, *@classes.values.select { |c| ancestor?(c, klass.name) && c != klass }]
     end
 
-    def self.ancestor?(klass, cname)
+    def self.ancestor?(klass, cname) # a superclass, or a module mixed into one
       k = klass
       while k
-        return true if k.name == cname
+        return true if k.name == cname || k.mixins&.include?(cname)
         k = k.superclass
       end
       false

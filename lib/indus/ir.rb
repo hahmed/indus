@@ -32,7 +32,7 @@ module Indus
   # a user class: ivar layout (8 bytes each, no header), methods, attrs
   class Klass
     attr_reader :name, :ivars, :methods, :readers, :writers
-    attr_accessor :superclass, :tagged, :boxed, :id, :closure # closure: a lambda literal's anonymous class
+    attr_accessor :superclass, :tagged, :boxed, :id, :closure, :mixins # closure: a lambda literal's anonymous class; mixins: modules included/prepended here
     def initialize(name, superclass = nil)
       @name, @methods, @readers, @writers = name, {}, {}, {}
       @superclass = superclass
@@ -48,7 +48,8 @@ module Indus
   end
 
   class Func
-    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :rest, :allocates, :result_unused
+    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :rest, :allocates, :result_unused,
+                  :shadowed # the definition this one overrides in the same class's chain (a mixin's, or the one a prepend covers): super's target
     def initialize(name, nparams)
       @name, @params, @blocks = name, Array.new(nparams) { Inst.new(:param) }, [Block.new(:entry)]
     end
