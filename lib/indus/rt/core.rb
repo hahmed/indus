@@ -1196,3 +1196,13 @@ def __dyn_to_f(v)
   __trap
   0.0
 end
+
+# the Symbol for a name the program spells somewhere, or -1 (respond_to? of an unknown name)
+def __str_to_sym_q(s)
+  i = 1
+  while i < SYMBOL_NAMES.length
+    return __sym_of_id(i) if SYMBOL_NAMES[i] == s
+    i = i + 1
+  end
+  __sym_of_id(0)
+end

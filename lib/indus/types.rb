@@ -334,7 +334,7 @@ module Indus
               dyn_print(f, i) if %i[puts_v p_v print_v inspect_v].include?(i.op) && of(f, i.args[0]) == :dyn
               # irreversible: a scalar may still widen to :dyn (a string element becoming tagged), so scalars wait for
               # the settled round; containers and objects go as soon as their type is known
-              inspect_v(f, i) if i.op == :inspect_v && (t = of(f, i.args[0])) && (@settled || classes_of(t) || t == :dyn)
+              inspect_v(f, i) if i.op == :inspect_v && (t = of(f, i.args[0])) && (@settled || ((classes_of(t) || t == :dyn) && t != :nil))
             end
             index(f, i) if i.op == :idx || i.op == :idx_set
             if standalone && (i.op == :libm || i.op == :pow && i.args.any? { of(f, _1) == :float }) # no libc: the Ruby libm
@@ -1012,7 +1012,11 @@ module Indus
       when :int then i.op = :itos
       when :int? then i.op = :call; i.args = [fn(:__opt_inspect), i.args[0]]
       when :bool then i.op = :bool_to_s
-      when :nil then i.op = :sconst; i.args = ["nil"]
+      when :nil
+        # :nil as a joined type can still widen (an arm whose type has not arrived yet joins as
+        # nil); only a literal nil is certainly nil
+        return unless i.args[0].op == :const || i.args[0].op == :phi && i.args[0].args.all? { |(_, v)| v.op == :const && v.ty == :nil }
+        i.op = :sconst; i.args = ["nil"]
       when :sym then i.op = :call; i.args = [fn(:__sym_inspect), i.args[0]]
       else
         if arr(t) then i.op = :call; i.args = [fn(:__arr_inspect), i.args[0]]

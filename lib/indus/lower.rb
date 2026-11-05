@@ -517,6 +517,23 @@ module Indus
       end
     end
 
+    # "on_#{event}" where every piece is a literal (a symbol/string constant folded by the
+    # compile-time environment): the name, or nil when it is computed
+    def interpolated_literal(n)
+      parts = n.parts.map do |p|
+        case p
+        when Prism::StringNode then p.unescaped
+        when Prism::EmbeddedStatementsNode
+          e = p.statements.body.last
+          case e
+          when Prism::SymbolNode, Prism::StringNode then e.unescaped
+          when Prism::LocalVariableReadNode then @ct&.key?(e.name) ? @ct[e.name].to_s : nil
+          end
+        end
+      end
+      parts.all? ? parts.join : nil
+    end
+
     def nil_const = (c = const(0); c.ty = :nil; c)
 
     # a regexp literal: compiled now (lib/indus/regex.rb) into a program the prelude matcher
@@ -944,7 +961,9 @@ module Indus
         if name.is_a?(Prism::SymbolNode) # send(:literal) is a plain call
           return emit(:mcall, [name.unescaped.to_sym, recv_v, *rest.map { expr(_1) }])
         end
-        return emit(:dsend, [expr(name), recv_v, *rest.map { expr(_1) }]) # switch over the class's methods
+        nv = expr(name)
+        nv = emit(:call, [demand(:__str_to_sym), nv]) if name.is_a?(Prism::StringNode) || name.is_a?(Prism::InterpolatedStringNode) # a computed name: its symbol
+        return emit(:dsend, [nv, recv_v, *rest.map { expr(_1) }]) # switch over the class's methods
       end
       if n.name == :% && n.receiver && (kind_of(n.receiver) == :str || n.receiver.is_a?(Prism::StringNode) || n.receiver.is_a?(Prism::InterpolatedStringNode))
         list = args[0].is_a?(Prism::ArrayNode) ? args[0].elements : [args[0]] # "fmt" % args
@@ -979,10 +998,35 @@ module Indus
         args.each { |a| p_one(a) }; return const(0)   # p a, b: one line each
       elsif n.name == :p && n.receiver.nil? && args.size == 1 then p_one(args[0])
       elsif n.name == :inspect && args.empty? && n.receiver then inspect_str(n.receiver)
+      elsif n.name == :print && n.receiver.nil? && args.size > 1
+        r = nil
+        args.each { |a| r = emit(:print_v, [expr(a)]) } # print a, b: no separator
+        r
       elsif n.name == :print && n.receiver.nil? && args.size == 1
         emit(:print_v, [expr(args[0])])   # no newline
       elsif n.name == :Integer && n.receiver.nil? && args.size == 1
         emit(:to_i, [expr(args[0])])      # Integer(x): the parse, no exception on junk (yet)
+      elsif n.name == :respond_to? && args.size == 1 && (args[0].is_a?(Prism::SymbolNode) || args[0].is_a?(Prism::StringNode) || args[0].is_a?(Prism::InterpolatedStringNode))
+        # the class is known at compile time, so is the answer; an interpolated name must be a literal-with-constants
+        nm = case args[0]
+             when Prism::SymbolNode, Prism::StringNode then args[0].unescaped
+             else interpolated_literal(args[0])
+             end&.to_sym
+        k = n.receiver.nil? ? @klass : ((kd = kind_of(n.receiver)).is_a?(Symbol) ? @classes[kd] : nil)
+        raise "respond_to?: the receiver's class is not known at compile time" unless k
+        if nm # a literal name: a compile-time fact
+          expr(n.receiver) if n.receiver # the receiver is still evaluated
+          c = const(k.find_method(nm) || k.find_reader(nm) || k.find_writer(nm) ? 1 : 0); c.ty = :bool; c
+        else # a computed name: its symbol against the class's own, at run time
+          nv = expr(args[0])
+          nv = emit(:call, [demand(:__str_to_sym_q), nv]) unless args[0].is_a?(Prism::SymbolNode)
+          ids = []
+          Types.each_method(k) { |mn, _, _, _| ids << sym_id(mn.to_s) }
+          ids.uniq!
+          hit = nil
+          ids.each { |sid| t = emit(:cmp, [nv, const(sid)], :eq); hit = hit ? emit(:or, [hit, t]) : t }
+          hit || (c = const(0); c.ty = :bool; c)
+        end
       elsif n.name == :include? && args.size == 1 && n.receiver.is_a?(Prism::ConstantReadNode) && (k = @classes[n.receiver.name]) && args[0].is_a?(Prism::ConstantReadNode)
         c = const(Types.ancestor?(k, args[0].name) ? 1 : 0); c.ty = :bool; c # Klass.include?(M): a compile-time fact
       elsif n.name == :name && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
@@ -1548,10 +1592,14 @@ module Indus
         pair = emit(:aset, [pair, const(0), @locals.delete(yes)]); emit(:aset, [pair, const(1), @locals.delete(no)])
       when :each_with_object # the memo is the block's second argument and the result
         arr = recv_val(recv); memo = expr(args[0])
+        if hash_new_with_default?(args[0]) && params[1] # Hash.new(0) as the memo: the default follows the block's name for it
+          (@hash_defaults ||= {})[:"#{:"blk#{@f.blocks.size}:"}#{params[1]}"] = args[0].arguments.arguments[0]
+          (@hash_defaults ||= {})[params[1]] = args[0].arguments.arguments[0]
+        end
         mv = :"ewo#{@f.blocks.size}:m"; @locals[mv] = memo
         len = emit(:alen, [arr])
         counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
-          bind_elem(ps, pfx, emit(:aget, [arr, i]))
+          bind_elem([ps[0]], pfx, emit(:aget, [arr, i])) # |elem, memo|: only the first is the element
           @locals[:"#{pfx}#{ps[1]}"] = @locals[mv] if ps[1]
           @memo_target = [mv, :"#{pfx}#{ps[1]}"] if ps[1] # the block may grow the memo: take its view back
         end
