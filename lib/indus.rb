@@ -24,7 +24,7 @@
 gem "prism", "= 1.8.2" rescue nil
 require "prism"
 require "fiddle"
-%w[ir regex pretype lower types passes peephole escape gc magic rt/blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
+%w[ir regex pretype lower types ranges passes peephole escape gc magic rt/blob asm regalloc codegen metal macho elf].each { require_relative "indus/#{_1}" }
 
 module Indus
   # everything a compiled program knows about itself: enough for the
@@ -71,6 +71,7 @@ module Indus
     funcs = Passes.prune(funcs)
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     funcs.each { Peephole.run(_1) unless ENV["NOPEEP"] }
+    funcs.each { Ranges.run(_1) unless ENV["NORANGES"] } # overflow checks that cannot fire
     GC.mark_allocators(funcs)
     Escape.run(funcs, lower.classes) unless ENV["NOESCAPE"]
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]

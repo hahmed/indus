@@ -4,6 +4,8 @@ module Indus
     attr_accessor :bound_to # the generic instance a call last took its result type from
     attr_accessor :assumed # [operand, type] an irreversible by-type rewrite relied on; checked after typing
     attr_accessor :routed # the method name a call was routed from by the receiver's builtin family
+    attr_accessor :nocheck # an add/sub/mul whose range analysis proves it cannot overflow
+    attr_accessor :nonneg # a div/mod whose operands are provably non-negative: no floor fix-up
     attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home, :uses
     attr_reader :id
     @@n = 0

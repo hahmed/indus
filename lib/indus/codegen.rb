@@ -153,11 +153,11 @@ module Indus
           l, r = i.args
           if i.float?
             @asm.send({ add: :fadd, sub: :fsub, mul: :fmul, div: :fdiv }[i.op], d, freg(l), freg(r, FTMP2))
-          elsif i.op == :div && r.op == :const && r.args[0] >= 2 then @asm.divmod_const(d, reg(l), r.args[0], :div)
+          elsif i.op == :div && r.op == :const && r.args[0] >= 2 then @asm.divmod_const(d, reg(l), r.args[0], :div, !!i.nonneg)
           elsif i.op == :div then @asm.sdiv_floor(d, reg(l), reg(r, 9))
-          elsif i.op == :mul then Asm::CHECKED ? @asm.muls(d, reg(l), reg(r, 9)) : @asm.mul(d, reg(l), reg(r, 9))
-          elsif imm?(r) then @asm.send(Asm::CHECKED ? (i.op == :add ? :addsi : :subsi) : (i.op == :add ? :addi : :subi), d, reg(l), r.args[0])
-          else @asm.send(Asm::CHECKED ? (i.op == :add ? :adds : :subs) : i.op, d, reg(l), reg(r, 9)) end
+          elsif i.op == :mul then (Asm::CHECKED && !i.nocheck) ? @asm.muls(d, reg(l), reg(r, 9)) : @asm.mul(d, reg(l), reg(r, 9))
+          elsif imm?(r) then @asm.send((Asm::CHECKED && !i.nocheck) ? (i.op == :add ? :addsi : :subsi) : (i.op == :add ? :addi : :subi), d, reg(l), r.args[0])
+          else @asm.send((Asm::CHECKED && !i.nocheck) ? (i.op == :add ? :adds : :subs) : i.op, d, reg(l), reg(r, 9)) end
         when :itof then @asm.scvtf(d, reg(i.args[0]))
         when :fsqrt then @asm.fsqrt(d, freg(i.args[0]))
         when :libm, :fpow # in-process: call libm by absolute address (d0[, d1] -> d0)
@@ -332,7 +332,7 @@ module Indus
           end
         when :mod # Ruby modulo: floor division remainder
           l, r = i.args
-          if r.op == :const && r.args[0] >= 2 then @asm.divmod_const(d, reg(l), r.args[0], :mod)
+          if r.op == :const && r.args[0] >= 2 then @asm.divmod_const(d, reg(l), r.args[0], :mod, !!i.nonneg)
           else @asm.sdiv_floor(16, reg(l), reg(r, 9)); @asm.emit(0x9B008000 | (reg(r, 9) << 16) | (reg(l) << 10) | (16 << 5) | d) end # msub d, x16, r, l
         when :sendsw # send(name): compare the symbol id against each candidate, direct call
           arms, name_v, recv, *args = i.args

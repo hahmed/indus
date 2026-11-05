@@ -144,14 +144,18 @@ module Indus
     # division / modulo by a constant d >= 2 (Ruby floor semantics) without sdiv:
     # multiply-high by a magic number, shift, truncate, then the floor fix.
     # rd <- quotient (want == :div) or remainder (want == :mod). Scratch: x8, x9, x16, x17.
-    def divmod_const(rd, rn, d, want)
+    def divmod_const(rd, rn, d, want, nonneg = false)
       m, s = Magic.for(d)
       ldr_lit(16, literal(m))                                      # one load from the pool (rn may be x8: a materialized constant)
       emit(0x9B407C00 | (16 << 16) | (rn << 5) | 16)             # smulh x16, rn, x16
       emit(0x8B000000 | (rn << 16) | (16 << 5) | 16) if m < 0      # add x16, x16, rn
       emit(0x9340FC00 | (s << 16) | (16 << 5) | 16) if s > 0       # asr x16, x16, #s
-      emit(0x8B40FC00 | (rn << 16) | (16 << 5) | 16)               # add x16, x16, rn, lsr #63   (toward zero)
+      emit(0x8B40FC00 | (rn << 16) | (16 << 5) | 16) unless nonneg # add x16, x16, rn, lsr #63   (toward zero; a non-negative dividend needs none)
       mov_imm(9, d)
+      if nonneg # a non-negative dividend: the quotient is already floored
+        want == :div ? mov(rd, 16) : emit(0x9B008000 | (9 << 16) | (rn << 10) | (16 << 5) | rd) # msub rd, x16, x9, rn
+        return
+      end
       emit(0x9B008000 | (9 << 16) | (rn << 10) | (16 << 5) | 17)   # msub x17, x16, x9, rn      r = rn - q*d
       emit(0xF100023F)                                             # cmp x17, #0
       emit(0xFA401800 | (rn << 5))                                 # ccmp rn, #0, #0, ne        r != 0 && rn < 0 -> lt
