@@ -120,7 +120,105 @@ class Gen
       -> { "if #{expr(:bool)}\n  puts #{expr(k)}.inspect\nelse\n  puts #{expr(k)}.inspect\nend" },
       -> { "i = 0\nacc = #{expr(:int)}\nwhile i < #{1 + @rng.rand(4)}\n  acc = acc + #{expr(:int)}\n  i += 1\nend\nputs acc" },
       -> { "def f#{@rng.rand(3)}(a)\n  #{pick('a', 'a.to_s', '[a, a]')}\nend\nputs f#{@rng.rand(3)}(#{int}).inspect" },
+      -> { klass },
+      -> { exception },
+      -> { chain },
+      -> { mutation },
+      -> { regexp_stmt },
+      -> { closure },
     ]).call
+  end
+
+  # a small class: ivars, a reader, a method, maybe a module and a comparison
+  def klass
+    n = "K#{@rng.rand(1000)}"
+    mod = chance(3) ? "module M#{n}\n  def tag = \"m\"\nend\n" : nil
+    body = +""
+    body << "  include M#{n}\n" if mod
+    body << "  include Comparable\n" if chance(2)
+    body << "  attr_reader :a, :b\n"
+    body << "  def initialize(a, b)\n    @a = a\n    @b = b\n  end\n"
+    body << "  def sum = @a + @b\n"
+    body << "  def <=>(o) = sum <=> o.sum\n" if body.include?("Comparable")
+    body << "  def to_s = \"#{n}(\#{@a},\#{@b})\"\n"
+    body << "  def bump(k)\n    @a += k\n    self\n  end\n"
+    objs = "xs = [#{(1 + @rng.rand(2)).times.map { "#{n}.new(#{int}, #{int})" }.join(', ')}]"
+    uses = [
+      "puts xs.map(&:sum).inspect",
+      "puts xs.map(&:to_s).inspect",
+      "puts xs.first.bump(#{int}).sum",
+      "puts xs.map { |o| o.a + o.b }.inspect",
+    ]
+    uses << "puts xs.max.to_s" if body.include?("Comparable")
+    uses << "puts xs.first.tag" if mod
+    "#{mod}class #{n}\n#{body}end\n#{objs}\n#{pick_a(uses)}\n"
+  end
+
+  def exception
+    e = "E#{@rng.rand(1000)}"
+    <<~RB
+      class #{e} < StandardError; end
+      def risky#{@rng.rand(100)}(x)
+        raise #{e}, "bad \#{x}" if x #{pick('>', '<', '==')} #{int}
+        x #{pick('+', '*')} 2
+      end
+      [#{(1 + @rng.rand(3)).times.map { int }.join(', ')}].each do |v|
+        begin
+          puts risky#{@rng.rand(100)}(v)
+        rescue #{pick(e, 'StandardError')} => err
+          puts "caught \#{err.message}"
+        end
+      end
+    RB
+  end
+
+  def chain
+    src = expr(:arr)
+    ops = [
+      ".map { |x| x }", ".select { |x| x.to_s.length > 0 }", ".sort_by { |x| x.to_s }",
+      ".group_by { |x| x.to_s.length }", ".each_with_object([]) { |x, acc| acc << x }",
+      ".each_with_index.map { |x, i| [i, x] }", ".partition { |x| x.to_s.length > 1 }",
+      ".tally", ".uniq", ".first(2)", ".flat_map { |x| [x] }", ".reduce(0) { |a, _| a + 1 }",
+      ".min_by { |x| x.to_s }", ".count { |x| true }", ".any? { |x| true }",
+    ]
+    n = 1 + @rng.rand(2)
+    "puts (#{src}#{n.times.map { pick_a(ops) }.join}).inspect"
+  end
+
+  def mutation
+    <<~RB
+      m#{@rng.rand(100)} = #{expr(:arr)}
+      m#{@rng.rand(100)} = m#{@rng.rand(100)}.dup
+      h#{@rng.rand(100)} = Hash.new(0)
+      #{expr(:arr)}.each { |x| h#{@rng.rand(100)}[x.to_s] += 1 }
+      puts h#{@rng.rand(100)}.sort.inspect
+      s#{@rng.rand(100)} = +"#{str}"
+      s#{@rng.rand(100)} << "#{str}"
+      puts s#{@rng.rand(100)}.inspect
+    RB
+  end
+
+  def regexp_stmt
+    re = pick('/\\d+/', '/[a-z]+/', '/\\s+/', '/(\\w)(\\w)/', '/^x/', '/o/')
+    subject = pick('"abc 123 def"', '"x y z"', '"Ruby 2024!"', expr(:str))
+    pick_a([
+      -> { "puts (#{subject}).scan(#{re}).inspect" },
+      -> { "puts (#{subject}).gsub(#{re}, \"-\")" },
+      -> { "puts (#{subject}).match?(#{re})" },
+      -> { "puts ((#{subject}) =~ #{re}).inspect" },
+      -> { "puts (#{subject}).split(#{re}).inspect" },
+    ]).call
+  end
+
+  def closure
+    <<~RB
+      f#{@rng.rand(100)} = lambda { |x| x #{pick('+', '*')} #{1 + @rng.rand(5)} }
+      puts #{expr(:arr)}.map { |v| f#{@rng.rand(100)}.call(v) }.inspect rescue nil
+      def apply#{@rng.rand(100)}(xs, &blk)
+        xs.map { |x| blk.call(x) }
+      end
+      puts apply#{@rng.rand(100)}(#{expr(:arr)}) { |x| x.to_s }.inspect
+    RB
   end
 
   def program
