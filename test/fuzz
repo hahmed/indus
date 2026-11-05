@@ -1,0 +1,166 @@
+#!/usr/bin/env ruby
+# Differential fuzzing against CRuby.
+#
+#   test/fuzz [n] [--seed S] [--keep]
+#
+# Generates random programs from a grammar of what Indus claims to compile, runs each under
+# CRuby and under Indus, and reports any difference. A program whose CRuby run raises, times
+# out, or prints nothing is discarded (nothing to compare). A program Indus *refuses* with a
+# message is not a failure -- refusal is a legal answer (correctness over refusal over wrong
+# answer); only a different answer, a crash, or a hang is.
+#
+# Findings go to test/fuzz-found/ as runnable programs, smallest first after shrinking.
+require "fileutils"
+require "open3"
+
+ROOT = File.expand_path("..", __dir__)
+OUT = File.join(ROOT, "test", "fuzz-found")
+N = (ARGV.find { _1 =~ /\A\d+\z/ } || 200).to_i
+SEED = (ARGV[ARGV.index("--seed") + 1].to_i if ARGV.include?("--seed")) || Random.new_seed
+KEEP = ARGV.include?("--keep")
+
+class Gen
+  def initialize(rng) = @rng = rng
+  def pick(*xs) = xs[@rng.rand(xs.size)]
+  def pick_a(xs) = xs[@rng.rand(xs.size)]
+  def chance(n) = @rng.rand(n).zero?
+  def int = pick(0, 1, 2, 3, 7, 10, -1, -3, 100, 1000, @rng.rand(50))
+  def float = pick(0.0, 1.5, -2.25, 0.1, 3.14159, @rng.rand.round(3))
+  def str = pick("", "a", "ab", "hello", "x y", "Ruby", "a,b,c", "  pad  ", "Mixed Case")
+  def sym = pick(":a", ":b", ":key", ":name")
+
+  # an expression of a kind: :int, :float, :str, :arr, :hash, :bool
+  def expr(kind, d = 0)
+    return leaf(kind) if d > 2 || chance(3)
+    case kind
+    when :int
+      pick_a([
+        -> { "(#{expr(:int, d + 1)} #{pick('+', '-', '*')} #{expr(:int, d + 1)})" },
+        -> { "(#{expr(:int, d + 1)} #{pick('/', '%')} #{pick(2, 3, 7, 10)})" },
+        -> { "#{expr(:arr, d + 1)}.length" },
+        -> { "#{expr(:arr, d + 1)}.sum" },
+        -> { "#{expr(:str, d + 1)}.length" },
+        -> { "#{expr(:int, d + 1)}.abs" },
+        -> { "[#{expr(:int, d + 1)}, #{expr(:int, d + 1)}].max" },
+        -> { "#{expr(:str, d + 1)}.to_i" },
+        -> { "#{expr(:hash, d + 1)}.size" },
+      ]).call
+    when :float
+      pick_a([
+        -> { "(#{expr(:float, d + 1)} #{pick('+', '-', '*')} #{expr(:float, d + 1)})" },
+        -> { "#{expr(:int, d + 1)}.to_f" },
+        -> { "#{expr(:float, d + 1)}.round(#{pick(1, 2, 3)})" },
+        -> { "#{expr(:float, d + 1)}.abs" },
+        -> { "Math.sqrt(#{expr(:int, d + 1)}.abs.to_f)" },
+      ]).call
+    when :str
+      pick_a([
+        -> { "(#{expr(:str, d + 1)} + #{expr(:str, d + 1)})" },
+        -> { "#{expr(:str, d + 1)}.upcase" },
+        -> { "#{expr(:str, d + 1)}.strip" },
+        -> { "#{expr(:str, d + 1)}.reverse" },
+        -> { "#{expr(:int, d + 1)}.to_s" },
+        -> { "#{expr(:arr, d + 1)}.join(#{str.inspect})" },
+        -> { "#{expr(:str, d + 1)}.ljust(#{@rng.rand(8)}, #{pick('.', '-', ' ').inspect})" },
+        -> { "#{expr(:str, d + 1)}.sub(#{str.inspect}, #{str.inspect})" },
+        -> { "\"v=\#{#{expr(:int, d + 1)}}\"" },
+        -> { "#{expr(:float, d + 1)}.to_s" },
+      ]).call
+    when :arr
+      pick_a([
+        -> { "[#{(1 + @rng.rand(3)).times.map { expr(:int, d + 1) }.join(', ')}]" },
+        -> { "[#{(1 + @rng.rand(3)).times.map { str.inspect }.join(', ')}]" },
+        -> { "#{expr(:arr, d + 1)}.map { |x| #{pick('x', 'x * 2', 'x + 1')} }" },
+        -> { "#{expr(:arr, d + 1)}.select { |x| x #{pick('>', '<', '==')} #{int} }" },
+        -> { "#{expr(:arr, d + 1)}.sort" },
+        -> { "#{expr(:arr, d + 1)}.reverse" },
+        -> { "#{expr(:arr, d + 1)}.uniq" },
+        -> { "#{expr(:arr, d + 1)}.first(#{@rng.rand(4)})" },
+        -> { "#{expr(:str, d + 1)}.chars" },
+        -> { "#{expr(:str, d + 1)}.split(#{pick(' ', ',').inspect})" },
+        -> { "(#{@rng.rand(3)}..#{3 + @rng.rand(5)}).to_a" },
+      ]).call
+    when :hash
+      pick_a([
+        -> { "{#{(1 + @rng.rand(2)).times.map { "#{sym} => #{expr(:int, d + 1)}" }.join(', ')}}" },
+        -> { "#{expr(:arr, d + 1)}.tally" },
+        -> { "#{expr(:arr, d + 1)}.group_by { |x| #{pick('x', 'x.to_s')} }" },
+      ]).call
+    when :bool
+      pick_a([
+        -> { "#{expr(:int, d + 1)} #{pick('>', '<', '==', '>=')} #{expr(:int, d + 1)}" },
+        -> { "#{expr(:arr, d + 1)}.include?(#{int})" },
+        -> { "#{expr(:str, d + 1)}.start_with?(#{str.inspect})" },
+        -> { "#{expr(:arr, d + 1)}.empty?" },
+        -> { "#{expr(:arr, d + 1)}.any? { |x| x #{pick('>', '<')} #{int} }" },
+      ]).call
+    end
+  end
+
+  def leaf(kind)
+    case kind
+    when :int then int.to_s
+    when :float then float.to_s
+    when :str then str.inspect
+    when :arr then "[#{(1 + @rng.rand(3)).times.map { int }.join(', ')}]"
+    when :hash then "{#{sym} => #{int}}"
+    when :bool then pick("true", "false")
+    end
+  end
+
+  KINDS = %i[int float str arr hash bool].freeze
+
+  def statement(d = 0)
+    k = pick_a(KINDS)
+    pick_a([
+      -> { "puts (#{expr(k)}).inspect" },
+      -> { "puts #{expr(k)}" },
+      -> { "v#{@rng.rand(5)} = #{expr(k)}\nputs v#{@rng.rand(5)}.inspect rescue nil" },
+      -> { "#{expr(:arr)}.each { |x| puts x.inspect }" },
+      -> { "if #{expr(:bool)}\n  puts #{expr(k)}.inspect\nelse\n  puts #{expr(k)}.inspect\nend" },
+      -> { "i = 0\nacc = #{expr(:int)}\nwhile i < #{1 + @rng.rand(4)}\n  acc = acc + #{expr(:int)}\n  i += 1\nend\nputs acc" },
+      -> { "def f#{@rng.rand(3)}(a)\n  #{pick('a', 'a.to_s', '[a, a]')}\nend\nputs f#{@rng.rand(3)}(#{int}).inspect" },
+    ]).call
+  end
+
+  def program
+    # the locals a program refers to are defined first, so generated reads are never undefined
+    body = (1 + @rng.rand(4)).times.map { statement }.join("\n")
+    (0..4).map { |n| "v#{n} = nil" }.join("\n") + "\n" + body + "\n"
+  end
+end
+
+def run(cmd, src_path, timeout = 20)
+  out, err, st = Open3.capture3("timeout", "-k", "2", timeout.to_s, *cmd, src_path)
+  [out, err, st.exitstatus]
+end
+
+def indus_refused?(err) = err =~ /RuntimeError|not supported|unknown method|unsupported|refus|no such|needs/
+
+FileUtils.mkdir_p(OUT)
+rng = Random.new(SEED)
+gen = Gen.new(rng)
+tmp = "/tmp/indus_fuzz_#{Process.pid}.rb"
+found = 0
+checked = 0
+N.times do |n|
+  src = gen.program
+  File.write(tmp, src)
+  rout, rerr, rst = run(["ruby"], tmp, 10)
+  next unless rst == 0 && !rout.empty?           # CRuby must have an answer to compare against
+  iout, ierr, ist = run([File.join(ROOT, "bin", "indus")], tmp, 20)
+  iout = iout.lines.reject { _1.start_with?("indus:") }.join
+  next if ist != 0 && indus_refused?(ierr)       # a refusal is a legal answer
+  checked += 1
+  next if iout == rout && ist == 0
+  found += 1
+  kind = ist == 124 ? "hang" : ist != 0 ? "crash" : "diff"
+  path = File.join(OUT, format("%s_%d_%d.rb", kind, SEED % 100000, n))
+  File.write(path, src)
+  puts "#{kind}: #{path}"
+  puts "  ruby:  #{rout.lines.first(3).map(&:chomp).inspect}"
+  puts "  indus: #{iout.lines.first(3).map(&:chomp).inspect}#{ist != 0 ? " (exit #{ist}: #{ierr.lines.first&.chomp.to_s[0, 80]})" : ""}"
+end
+File.delete(tmp) if File.exist?(tmp) && !KEEP
+puts "seed #{SEED}: #{checked} compared, #{found} differences"
+exit(found.zero? ? 0 : 1)

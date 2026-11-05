@@ -178,7 +178,8 @@ module Indus
         return l == :int? ? :int : l
       when :==, :!=, :<, :<=, :>, :>=, :key?, :has_key?, :is_a?, :! then :bool
       when :length, :size, :to_i, :ord, :&, :|, :^, :<<, :>> then (n.name == :<< && recv != :int ? recv : :int)
-      when :to_s then :str
+      when :to_s, :upcase, :downcase, :capitalize, :swapcase, :strip, :lstrip, :rstrip, :chomp, :chop, :succ, :next, :tr,
+           :delete, :squeeze, :center, :ljust, :rjust, :inspect, :join, :chr, :sub, :gsub, :slice, :insert, :prepend then :str
       when :to_f then :float
       when :new
         cname = n.receiver.is_a?(Prism::ConstantReadNode) || n.receiver.is_a?(Prism::ConstantPathNode) ? n.receiver.name : nil
@@ -199,7 +200,9 @@ module Indus
       when :push then (store_into(recv, n.receiver, [nil, akinds[0]], env, klass); recv)
       when :keys then recv.is_a?(Array) && recv[0] == :hash ? [:array, recv[1]] : nil
       when :map, :select, :reject, :sort, :sort_by, :reverse, :uniq, :flatten, :compact, :first, :take, :drop, :shuffle, :zip, :each_slice, :each_cons, :partition, :chars, :split, :lines, :to_a, :values, :filter_map, :flat_map, :min_by, :max_by
-        if %i[min_by max_by first].include?(n.name) && (n.name != :first || akinds.empty?) then (recv.is_a?(Array) && recv[0] == :array ? recv[1] : nil)
+        if recv == :str # a String method of the same name: the pieces are an array, the rest is a String
+          %i[chars split lines bytes to_a].include?(n.name) ? [:array, n.name == :bytes ? :int : :str] : :str
+        elsif %i[min_by max_by first].include?(n.name) && (n.name != :first || akinds.empty?) then (recv.is_a?(Array) && recv[0] == :array ? recv[1] : nil)
         elsif recv.is_a?(Array) && recv[0] == :hash then (%i[select reject].include?(n.name) ? recv : [:array, nil])
         elsif %i[select reject sort reverse uniq compact first take drop shuffle].include?(n.name) && recv.is_a?(Array) then recv
         else [:array, nil] end
