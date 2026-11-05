@@ -1050,6 +1050,11 @@ module Indus
       elsif n.name == :to_s && args.empty? && n.receiver.nil? then raise "to_s with no receiver outside a class defining it"
       elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
       elsif n.name == :+@ && args.empty? then expr(n.receiver) # +"" : literals are already fresh copies
+      elsif n.name == :cover? && args.size == 1 && (r = n.receiver.is_a?(Prism::ParenthesesNode) ? n.receiver.body.body.last : n.receiver).is_a?(Prism::RangeNode)
+        v = expr(args[0]) # (a..b).cover?(x) / include?: the comparison, no array
+        lo = emit(:cmp, [v, expr(r.left)], :ge)
+        hi = emit(:cmp, [v, expr(r.right)], r.exclude_end? ? :lt : :le)
+        emit(:and, [lo, hi])
       elsif n.name == :clamp && args.size == 2 && n.receiver && !((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd]) # x.clamp(lo, hi) returns lo or hi themselves (an Integer bound stays an Integer)
         x = expr(n.receiver); lo = expr(args[0]); hi = expr(args[1])
         below = emit(:cmp, [x, lo], :lt)

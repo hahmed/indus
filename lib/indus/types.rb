@@ -1107,6 +1107,16 @@ module Indus
         cands.each { |k| related(k).each { _1.tagged = true; _1.boxed = true } }
         i.args[1] = un; return bind(f, i)
       end
+      if t == :dyn && %i[sum min max sort uniq join length size first last reverse flatten compact each map select reject include? empty? count keys values].include?(name)
+        # a container method on a tagged value: the container families both define it, so the
+        # tag decides at run time (array or hash) and the typed method runs on what comes out
+        fams = %w[arr hash].select { |fm| prelude_method(fm, name, args.size) }
+        if fams.size >= 1 && args.empty?
+          c = Inst.new(:call, [fn(:__dyn_arr), recv]); c.ty = [:arr, :dyn]; c.block = i.block
+          i.block.insts.insert(i.block.insts.index(i), c)
+          i.op = :call; i.args = [prelude_method("arr", name, 0) || fn(:"__arr_#{name}"), c]; return
+        end
+      end
       if t == :dyn # a method on a tagged value: if exactly one builtin family defines it, unbox (trapping on a wrong tag) and call
         fams = %w[str arr hash num].select { |fm| prelude_method(fm, name, args.size) }
         fams = ["str"] if fams.empty? && %i[length size upcase downcase].include?(name)

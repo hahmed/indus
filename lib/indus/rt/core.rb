@@ -146,7 +146,23 @@ def __dyn_to_s(v)
   if t == 12
     return __sym_name(__unbox_sym(v))
   end
+  if t == 6
+    return __dyn_hash_inspect(__unbox_hash(v))
+  end
   "#<object>"
+end
+
+# a tagged hash's inspect: keys and values are tagged too
+def __dyn_hash_inspect(h)
+  out = "{"
+  i = 0
+  while i < __hcount(h)
+    out = out + ", " if i > 0
+    k = __hkey_at(h, i)
+    out = out + (__dyn_sym_p(k) ? __dyn_to_s(k) + ": " : __dyn_inspect(k) + " => ") + __dyn_inspect(__hval_at(h, i))
+    i = i + 1
+  end
+  out + "}"
 end
 
 def __dyn_sym_p(v) = __tag(v) == 12

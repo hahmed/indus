@@ -373,28 +373,87 @@ def __str_chomp(s)
   __sdup(s)
 end
 
+# "0.75".to_f: the digits as one integer mantissa, scaled once (digit-by-digit scaling
+# accumulates error: 0.75 came out 0.7500000000000001). An exponent is applied by powers
+# of ten, halving the number of roundings.
 def __str_to_f(s)
   i = 0
   neg = false
-  if i < s.length && __ld8(s, i) == 45
-    neg = true
+  if i < s.length && (__ld8(s, i) == 45 || __ld8(s, i) == 43)
+    neg = __ld8(s, i) == 45
     i = i + 1
   end
-  v = 0.0
-  while i < s.length && __ld8(s, i) >= 48 && __ld8(s, i) <= 57
-    v = v * 10.0 + (__ld8(s, i) - 48)
-    i = i + 1
-  end
-  if i < s.length && __ld8(s, i) == 46
-    i = i + 1
-    scale = 0.1
-    while i < s.length && __ld8(s, i) >= 48 && __ld8(s, i) <= 57
-      v = v + (__ld8(s, i) - 48) * scale
-      scale = scale / 10.0
+  mant = 0
+  digits = 0
+  over = 0
+  dec = -1
+  while i < s.length
+    c = __ld8(s, i)
+    if c >= 48 && c <= 57
+      if mant <= 900719925474099 # room for one more digit inside 2^53 (a double's exact integers)
+        mant = mant * 10 + (c - 48)
+        digits = digits + 1
+        dec = dec + 1 if dec >= 0 # a fractional digit that was taken: the point moves
+      else
+        over = over + 1 if dec < 0 # an integer digit past the mantissa: scale up instead (a dropped fractional digit changes nothing)
+      end
       i = i + 1
+    elsif c == 46 && dec < 0
+      dec = 0
+      i = i + 1
+    else
+      break
+    end
+  end
+  exp = 0
+  if i < s.length && (__ld8(s, i) == 101 || __ld8(s, i) == 69)
+    i = i + 1
+    eneg = false
+    if i < s.length && (__ld8(s, i) == 45 || __ld8(s, i) == 43)
+      eneg = __ld8(s, i) == 45
+      i = i + 1
+    end
+    e = 0
+    while i < s.length && __ld8(s, i) >= 48 && __ld8(s, i) <= 57
+      e = e * 10 + (__ld8(s, i) - 48)
+      i = i + 1
+    end
+    exp = eneg ? 0 - e : e
+  end
+  exp = exp - dec if dec > 0
+  exp = exp + over
+  v = mant.to_f
+  # one rounding when the power of ten is exact in a double (10^0..10^22, strtod's fast path)
+  if exp >= 0 && exp <= 22
+    v = v * __pow10f(exp)
+  elsif exp < 0 && exp >= -22
+    v = v / __pow10f(0 - exp)
+  elsif exp > 0
+    k = 0
+    while k < exp
+      v = v * 10.0
+      k = k + 1
+    end
+  else
+    k = 0
+    while k < 0 - exp
+      v = v / 10.0
+      k = k + 1
     end
   end
   neg ? 0.0 - v : v
+end
+
+# 10^k as a double for k in 0..22 (every one exact): built by repeated multiplication from
+# 1.0, which is exact in this range, so no table lands in the program's frame
+def __pow10f(k)
+  v = 1.0
+  i = 0
+  while i < k
+    v = v * 10.0
+    i = i + 1
+  end
+  v
 end
 
 def __str_hex(s)
