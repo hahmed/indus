@@ -1265,12 +1265,13 @@ def __str_rindex1(s, pat) = __str_rindex(s, pat)
 def __hash_delete1(h, k) = __hash_delete(h, k)
 
 # nested arrays flattened fully (elements of mixed depth are tagged values)
-def __arr_flatten(a)
+# flatten, chosen by element type (a runtime test here would type both arms: notes/52)
+def __arr_flatten(a) # tagged elements: an element that is an array is spliced in
   out = []
   i = 0
   while i < a.length
     e = a[i]
-    if __is_dyn(e) && __dyn_arr_p(e)
+    if __dyn_arr_p(e)
       inner = __arr_flatten(__dyn_arr(e))
       j = 0
       while j < inner.length
@@ -1279,6 +1280,21 @@ def __arr_flatten(a)
       end
     else
       out.push(e)
+    end
+    i = i + 1
+  end
+  out
+end
+
+def __arr_flatten_nested(a) # array elements: splice each one in
+  out = []
+  i = 0
+  while i < a.length
+    e = a[i]
+    j = 0
+    while j < e.length
+      out.push(e[j])
+      j = j + 1
     end
     i = i + 1
   end

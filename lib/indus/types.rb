@@ -232,6 +232,10 @@ module Indus
             # dyn itself); an integer-ish operand may yet become tagged, so it waits for the settled round
             # is_dyn folds to true as soon as the operand is :dyn (a type that never narrows); false only once
             # settled. A branch on the folded test is cut right away, so the dead arm's calls shape nothing.
+            if i.op == :is_arr && (t = of(f, i.args[0]))
+              i.op = :const; i.args = [arr(t) ? 1 : 0]; i.ty = :bool; changed = true
+              fold_branches_on(f, i); next
+            end
             if i.op == :is_dyn && ((t = of(f, i.args[0])) == :dyn || @settled)
               i.op = :const; i.args = [t == :dyn ? 1 : 0]; i.ty = :bool; changed = true
               fold_branches_on(f, i); next
@@ -334,6 +338,12 @@ module Indus
               dyn_print(f, i) if %i[puts_v p_v print_v inspect_v].include?(i.op) && of(f, i.args[0]) == :dyn
               # irreversible: a scalar may still widen to :dyn (a string element becoming tagged), so scalars wait for
               # the settled round; containers and objects go as soon as their type is known
+              if @settled && i.op == :call && i.args[0].name.to_s.start_with?("__arr_flatten") && !i.args[0].name.to_s.include?("nested") &&
+                 (at = of(f, i.args[1])) && arr(at) && at[1] && at[1] != :dyn # the elements are known: no tag test, no recursion
+                i.args[0] = fn(arr(at[1]) ? :__arr_flatten_nested : :__arr_dup); i.ty = nil; i.bound_to = nil
+                f.all.each { |u| u.ty = nil if (u.op == :phi ? u.args.map(&:last) : u.args).include?(i) } # what the old result shaped re-derives
+                changed = true
+              end
               inspect_v(f, i) if i.op == :inspect_v && (t = of(f, i.args[0])) && (@settled || ((classes_of(t) || t == :dyn) && t != :nil))
             end
             index(f, i) if i.op == :idx || i.op == :idx_set
@@ -1089,7 +1099,7 @@ module Indus
         end
       end
       if t == :int && name == :to_s && args.empty? then i.op = :itos; i.args = [recv]; return end
-      if t == :dyn && (cands = @classes.values.reject(&:closure).select { |k| k.find_method(name) || k.find_reader(name) || k.find_writer(name) }).any? && !%i[str arr hash num].any? { |fm| prelude_method(fm, name, args.size) }
+      if t == :dyn && (cands = @classes.values.select { |k| k.closure ? name == :call : (k.find_method(name) || k.find_reader(name) || k.find_writer(name)) }).any? && !%i[str arr hash num].any? { |fm| prelude_method(fm, name, args.size) }
         # a method of user classes on a tagged value: the object (tag 8, class id in word 0), dispatched over the classes defining it
         cs = cands.map(&:name).sort
         un = Inst.new(:unbox, [recv, cs.size == 1 ? cs[0] : [:poly, cs]]); un.ty = cs.size == 1 ? cs[0] : [:poly, cs]; un.block = i.block
@@ -1190,6 +1200,8 @@ module Indus
       elsif t == :str && !@settled && r.is_a?(Inst) && %i[aget hget apop idx phi cell_get].include?(r.op) then nil # an element read as a string may still turn out tagged: wait
       elsif t == :str && i.op == :idx_set then i.op = :call; i.args = [fn(:__str_set_at), *i.args]; i.ty = :str # s[i] = "c"
       elsif t == :str && i.op == :idx then i.assumed = [r, :str]; i.op = :ssub; i.args << (c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); c) if i.args.size == 2
+      elsif classes_of(t) # an object: its own [] / []= method
+        i.args = [i.op == :idx ? :[] : :[]=, *i.args]; i.op = :mcall; i.ty = nil; bind(f, i)
       elsif t == :nil && @settled # indexing nil: dead code behind a nil? guard, or a NoMethodError at run time: trap, and the value is a constant
         tr = Inst.new(:trap, []); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr)
         i.op = :const; i.args = [0]; i.ty = :nil
@@ -1251,7 +1263,7 @@ module Indus
       when :bufderef then :str
       when :apop then (t = of(f, a[0])) && arr(t) ? t[1] : nil
       when :nop then i.ty || of(f, a[0]) # the same value under another name
-      when :is_sym, :is_dyn then :bool
+      when :is_sym, :is_dyn, :is_arr then :bool
       when :hcap, :gcepoch, :hsave, :sys then :int
       when :cell_new then (t = of(f, a[0])) && [:cell, t]
       when :cell_get then (t = of(f, a[0])) && t.is_a?(Array) && t[0] == :cell ? t[1] : nil

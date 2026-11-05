@@ -344,7 +344,10 @@ module Indus
             case kind
             when :call
               xi = fi = 0
-              [recv, *args].each { |v| v.float? ? (@asm.fmov(fi, freg(v, fi)); fi += 1) : (@asm.mov(xi, reg(v, xi)); xi += 1) }
+              [recv, *args].each_with_index do |v, n|
+                if v.float? then @asm.fmov(fi, freg(v, fi)); fi += 1
+                else (n == 0 && recv.ty == :dyn ? @asm.mov(xi, rr) : @asm.mov(xi, reg(v, xi))); xi += 1 end
+              end
               @asm.bl(payload.name); i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
             when :fld_get
               off = @classes[recv.ty].base + payload * 8
@@ -359,7 +362,12 @@ module Indus
           @asm.label(done)
         when :pcall # dispatch on the class id in word 0; one arm per class, each a direct call or a field access
           arms, recv, *args = i.args
-          rr = reg(recv); @asm.ldr_off(16, rr, 0)
+          rr = reg(recv)
+          if recv.ty == :dyn # a tagged object: the handle is the word with the tag cleared
+            @asm.emit(0x927CEC00 | (rr << 5) | 17) # and x17, rr, #~15
+            rr = 17
+          end
+          @asm.ldr_off(16, rr, 0)
           done = @asm.uniq
           arms.each do |klass, kind, payload|
             nxt = @asm.uniq
@@ -367,7 +375,10 @@ module Indus
             case kind
             when :call
               xi = fi = 0
-              [recv, *args].each { |v| v.float? ? (@asm.fmov(fi, freg(v, fi)); fi += 1) : (@asm.mov(xi, reg(v, xi)); xi += 1) }
+              [recv, *args].each_with_index do |v, n|
+                if v.float? then @asm.fmov(fi, freg(v, fi)); fi += 1
+                else (n == 0 && recv.ty == :dyn ? @asm.mov(xi, rr) : @asm.mov(xi, reg(v, xi))); xi += 1 end
+              end
               @asm.bl(payload.name); i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
               @asm.ldr_off(16, rr, 0) if false
             when :fld_get

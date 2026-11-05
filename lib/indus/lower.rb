@@ -308,10 +308,12 @@ module Indus
 
     def append_root(n)
       r = n.receiver
+      r = r.body.body.last while r.is_a?(Prism::ParenthesesNode) && r.body&.body&.size == 1 # (expr) << v
       r = r.receiver while r.is_a?(Prism::CallNode) && r.name == :<<
       case r
       when Prism::LocalVariableReadNode then @int_locals&.include?(r.name) ? nil : r
       when Prism::InstanceVariableReadNode then r
+      when Prism::InstanceVariableOrWriteNode, Prism::InstanceVariableOperatorWriteNode then r # (@x ||= []) << v: the ivar is the home
       when Prism::CallNode
         return r if r.arguments.nil? && r.block.nil? && r.receiver # `obj.attr << v`: the slot becomes a cell (Types)
         return r if r.name == :[] && r.receiver && r.arguments&.arguments&.size == 1 && r.block.nil? # `h[k] << v`: the slot is written back
@@ -672,6 +674,9 @@ module Indus
       when Prism::InstanceVariableReadNode
         return emit(:gget, [:"#{@owner}#{n.name}"]) if @owner # a module's / class object's own ivar
         emit(:fld_get, [me_val, @klass.ivar(n.name)])
+      when Prism::InstanceVariableOrWriteNode # @x ||= v
+        cur = @owner ? emit(:gget, [:"#{@owner}#{n.name}"]) : emit(:fld_get, [me_val, @klass.ivar(n.name)])
+        cond_assign(cur, false, -> { expr(n.value) }, ->(v) { @owner ? emit(:gset, [:"#{@owner}#{n.name}", v]) : emit(:fld_set, [me_val, @klass.ivar(n.name), v]) })
       when Prism::InstanceVariableOperatorWriteNode # @x += v
         cur = @owner ? emit(:gget, [:"#{@owner}#{n.name}"]) : emit(:fld_get, [me_val, @klass.ivar(n.name)])
         v = emit(ARITH.fetch(n.binary_operator), [cur, expr(n.value)])
@@ -933,7 +938,8 @@ module Indus
         r = emit(:lshift_or_append, [a, v])
         case root # the chain's home is rebound to the result (a grown string/array may have moved)
         when Prism::LocalVariableReadNode then shared?(root.name) ? write_shared(root.name, r) : @locals[lname(root.name)] = r
-        when Prism::InstanceVariableReadNode then emit(:fld_set, [@locals.fetch(:self), @klass.ivar(root.name), r])
+        when Prism::InstanceVariableReadNode, Prism::InstanceVariableOrWriteNode, Prism::InstanceVariableOperatorWriteNode
+          @owner ? emit(:gset, [:"#{@owner}#{root.name}", r]) : emit(:fld_set, [me_val, @klass.ivar(root.name), r])
         when Prism::CallNode
           if root.name == :[] # h[k] << v / a[i] << v: the element slot takes the grown handle
             idx_set_value(root.receiver, root.arguments.arguments[0], r)
@@ -1223,6 +1229,10 @@ module Indus
         # a method call on an object: resolved by Types once the receiver's class is known
         rv = expr(n.receiver)
         emit(:mcall, [n.name, rv, *object_args(n, args, nil, rv)])
+      elsif n.name == :new && n.receiver.nil? && @owner && (ok = @classes[@owner]) # `new` inside def self.x: this class
+        obj = emit(:onew, [ok])
+        (init = ok.find_method(:initialize)) && emit(:call, [init, obj, *method_args(init, args)])
+        obj
       elsif @klass && n.receiver.nil? && @klass.find_method(n.name) # the class's own method shadows a top-level def of the same name
         me = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
         emit(:call, [@klass.find_method(n.name), me, *method_args(@klass.find_method(n.name), args, me)])
@@ -1292,6 +1302,7 @@ module Indus
       when :__byte_at then emit(:rawld8, [expr(args[0]), expr(args[1])])
       when :__st8 then (a = expr(args[0]); ix = expr(args[1]); v = expr(args[2]); emit(:rawst8, [a, ix, v]); v)
       when :__sdup then emit(:sdup, [expr(args[0])])
+      when :__is_arr then emit(:is_arr, [expr(args[0])]) # folded by Types from the operand's type
       when :__is_sym then emit(:is_sym, [expr(args[0])]) # true when the value's static type is Symbol (Types folds it)
       when :__is_dyn then emit(:is_dyn, [expr(args[0])])
       when :__hcount then emit(:hcap, [expr(args[0])])                      # entries in insertion order: count, key i, value i
