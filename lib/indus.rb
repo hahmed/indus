@@ -39,7 +39,27 @@ module Indus
   PRELUDE_GC = File.read(File.join(__dir__, "indus/rt/gc.rb"))
   PRELUDE_CORE = %w[grisu core big format enum libm].map { File.read(File.join(__dir__, "indus/rt/#{_1}.rb")) }.join("\n")
 
-  def self.compile(src, standalone: nil)
+  # require_relative "x" / require "./x" splice the file in, once, where the call is (a
+  # program is one compilation unit). require of a library name: a few are built in (set is
+  # a prelude class; json/time... are not), the rest refuse with the name.
+  BUILTIN_LIBS = %w[set].freeze
+  def self.expand_requires(src, dir, seen = {})
+    src.gsub(/^[ \t]*require(_relative)?[ (]\s*["']([^"']+)["']\)?[ \t]*$/) do
+      rel, name = $1, $2
+      if !rel && !name.start_with?(".", "/")
+        next "" if BUILTIN_LIBS.include?(name)
+        raise "require '#{name}': only files (require_relative) and #{BUILTIN_LIBS.join(', ')} are available; no load path"
+      end
+      path = File.expand_path(name.end_with?(".rb") ? name : "#{name}.rb", dir)
+      raise "#{rel ? 'require_relative' : 'require'} '#{name}': no such file #{path}" unless File.exist?(path)
+      next "" if seen[path]
+      seen[path] = true
+      "# -- #{path}\n" + expand_requires(File.read(path), File.dirname(path), seen) + "\n"
+    end
+  end
+
+  def self.compile(src, standalone: nil, file: nil)
+    src = expand_requires(src, file ? File.dirname(File.expand_path(file)) : Dir.pwd)
     src = PRELUDE_CORE + "\n" + src          # Float#to_s and friends, in Ruby
     src = PRELUDE_GC + "\n" + src if GC.enabled? # the collector rides along as Ruby
     Types.reset!

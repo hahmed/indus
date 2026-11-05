@@ -1284,3 +1284,91 @@ def __arr_flatten(a)
   end
   out
 end
+
+# ---- Set: a hash of element => true ----------------------------------------------------
+class Set
+  def initialize(items = nil)
+    @h = {}
+    unless items.nil?
+      i = 0
+      while i < items.length
+        @h[items[i]] = true
+        i = i + 1
+      end
+    end
+  end
+  def add(x)
+    @h[x] = true
+    self
+  end
+  def <<(x) = add(x)
+  def include?(x) = @h.key?(x)
+  def member?(x) = @h.key?(x)
+  def size = @h.size
+  def length = @h.size
+  def empty? = @h.size == 0
+  def delete(x)
+    @h.delete(x)
+    self
+  end
+  def to_a = @h.keys
+  def each(&blk) = @h.keys.each(&blk)
+  def add?(x)
+    return nil if @h.key?(x)
+    @h[x] = true
+    self
+  end
+end
+
+# sort with a comparator (a block value): merge sort calling cmp.call(a, b)
+def __arr_sort_cmp(a, cmp)
+  return a.dup if a.length < 2
+  mid = a.length / 2
+  left = __arr_sort_cmp(__arr_slice(a, 0, mid), cmp)
+  right = __arr_sort_cmp(__arr_slice(a, mid, a.length - mid), cmp)
+  out = []
+  i = 0
+  j = 0
+  while i < left.length && j < right.length
+    if cmp.call(left[i], right[j]) <= 0
+      out.push(left[i])
+      i = i + 1
+    else
+      out.push(right[j])
+      j = j + 1
+    end
+  end
+  while i < left.length
+    out.push(left[i])
+    i = i + 1
+  end
+  while j < right.length
+    out.push(right[j])
+    j = j + 1
+  end
+  out
+end
+
+def __hash_dup(h)
+  out = {}
+  i = 0
+  while i < __hcount(h)
+    out[__hkey_at(h, i)] = __hval_at(h, i)
+    i = i + 1
+  end
+  out
+end
+
+# ("a".."e"): each successor until past the end (or the lengths diverge, as Ruby stops)
+def __str_range(lo, hi, excl)
+  out = []
+  cur = lo
+  while cur.length <= hi.length
+    break if excl == 1 && cur == hi
+    out.push(cur)
+    break if cur == hi
+    cur = __str_succ(cur)
+  end
+  out
+end
+def __arr_to_a(a) = a

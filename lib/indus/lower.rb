@@ -458,6 +458,10 @@ module Indus
       @block_param = (d = @defs_by_func[f]) && d.parameters&.block ? (d.parameters.block.name || :__blk) : (f.name.to_s.end_with?("$blk") ? :__blk : nil)
       @shared = (stmts.is_a?(Array) ? shared_locals(stmts) : []) + shared_in
       captured&.each { |nm| @locals[nm] = emit(:fld_get, [@locals[:self], klass.ivar(:"@#{nm}")]) } # a lambda's captures: the value, or the shared cell
+      if klass&.closure && klass.outer # a lambda written inside a method: `self` and @ivars are the enclosing object's
+        @locals[:self] = emit(:fld_get, [@locals[:self], klass.ivar(:@__self)])
+        @klass = klass.outer
+      end
       if f.name == :main && @mod_ivars # `module M; @x = 1; end` runs before the program
         @mod_ivars.each { |owner, w| @owner = owner; expr(w); @owner = nil }
       end
@@ -854,7 +858,6 @@ module Indus
         if mk && (mf = mk.find_method(n.name)) && (d = @defs_by_func[mf]) && d.parameters&.block
           blk = n.block
           params = blk.parameters&.parameters&.requireds&.map(&:name) || []
-          raise "a block passed to #{n.name} cannot yet refer to self or @ivars" if @klass && refers_to_self?(blk.body)
           c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
           rv = n.receiver ? expr(n.receiver) : me_val
           return emit(:mcall, [n.name, rv, *method_args(mf, args, rv), c])
@@ -868,6 +871,10 @@ module Indus
         return block_arg_call(n, args, bv)
       end
       return block_call(n, args) if n.block.is_a?(Prism::BlockNode)
+      if n.name == :<< && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] && args.size == 1 # obj << v: the class's own method
+        rv = expr(n.receiver)
+        return emit(:mcall, [:<<, rv, expr(args[0])])
+      end
       if n.name == :<< && (root = append_root(n)) # `<<` is append on strings/arrays and shift on integers; Types fixes up a misguess
         a = expr(n.receiver); v = expr(args[0])
         r = emit(:lshift_or_append, [a, v])
@@ -909,6 +916,7 @@ module Indus
       end
       if (op = ARITH[n.name])
         l = expr(n.receiver); r = expr(args[0])
+        return emit(:mcall, [n.name, l, r]) if (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] # an operator the class defines
         emit(op, [l, r])
       elsif (c = CMP[n.name])
         l = expr(n.receiver); r = expr(args[0])
@@ -956,7 +964,7 @@ module Indus
       elsif n.name == :to_s && args.empty? && n.receiver.nil? then raise "to_s with no receiver outside a class defining it"
       elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
       elsif n.name == :+@ && args.empty? then expr(n.receiver) # +"" : literals are already fresh copies
-      elsif n.name == :clamp && args.size == 2 && n.receiver # x.clamp(lo, hi) returns lo or hi themselves (an Integer bound stays an Integer)
+      elsif n.name == :clamp && args.size == 2 && n.receiver && !((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd]) # x.clamp(lo, hi) returns lo or hi themselves (an Integer bound stays an Integer)
         x = expr(n.receiver); lo = expr(args[0]); hi = expr(args[1])
         below = emit(:cmp, [x, lo], :lt)
         tb, eb, mb = @f.new_block(:cl), @f.new_block(:ch), @f.new_block(:cm)
@@ -1063,6 +1071,8 @@ module Indus
         counted_loop(args.size == 2 ? const(0) : const(1), emit(:alen, [arr]), :lt, [], []) { |i, _ps, _pfx| @locals[accv] = emit(op, [@locals[accv], emit(:aget, [arr, i])]) }
         @locals.delete(accv)
       elsif n.name == :pop && args.empty? && n.receiver then emit(:apop, [expr(n.receiver)])
+      elsif n.name == :to_a && args.empty? && (r = n.receiver.is_a?(Prism::ParenthesesNode) ? n.receiver.body.body.last : n.receiver).is_a?(Prism::RangeNode) && str_range?(r)
+        range_array(r)
       elsif n.name == :to_a && args.empty? && (r = n.receiver.is_a?(Prism::ParenthesesNode) ? n.receiver.body.body.last : n.receiver).is_a?(Prism::RangeNode)
         lo = expr(r.left); hi = expr(r.right); hi = emit(:add, [hi, const(1)]) unless r.exclude_end?
         len = emit(:sub, [hi, lo]); arr = emit(:anew, [len, const(0)])
@@ -1099,7 +1109,7 @@ module Indus
         a = expr(n.receiver); i = expr(args[0]); v = expr(args[1])
         r = emit(:idx_set, [a, i, v])
         case n.receiver
-        when Prism::LocalVariableReadNode then @locals[lname(n.receiver.name)] = r
+        when Prism::LocalVariableReadNode then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
         when Prism::InstanceVariableReadNode then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
         when Prism::CallNode then nil # a[i][j] = v, obj.attr[i] = v: the element store is in place; growth would need the cell design
         else raise "[]= on #{n.receiver.class}"
@@ -1119,10 +1129,10 @@ module Indus
         # a method call on an object: resolved by Types once the receiver's class is known
         rv = expr(n.receiver)
         emit(:mcall, [n.name, rv, *object_args(n, args, nil, rv)])
-      elsif @klass && @klass.find_method(n.name) && !@funcs[n.name]
+      elsif @klass && n.receiver.nil? && @klass.find_method(n.name) # the class's own method shadows a top-level def of the same name
         me = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
         emit(:call, [@klass.find_method(n.name), me, *method_args(@klass.find_method(n.name), args, me)])
-      elsif @klass && args.empty? && n.receiver.nil? && (iv = @klass.find_reader(n.name)) && !@funcs[n.name]
+      elsif @klass && args.empty? && n.receiver.nil? && (iv = @klass.find_reader(n.name))
         emit(:fld_get, [me_val, @klass.ivar(iv)]) # a bare attr_reader call inside a method
       else
         f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
@@ -1226,12 +1236,15 @@ module Indus
       when :__same then emit(:ucmp, [expr(args[0]), expr(args[1])], :eq) # raw word identity, never rewritten
       when :__box_int then emit(:box, [expr(args[0]), :int])
       when :__box_str then emit(:box, [expr(args[0]), :str])
+      when :__box_arr then emit(:box, [expr(args[0]), [:arr, :dyn]])
+      when :__box_hash then emit(:box, [expr(args[0]), [:hash, :dyn, :dyn]])
       when :__box_float then emit(:box, [expr(args[0]), :float])
       when :__unbox_int then emit(:unbox, [expr(args[0]), :int])
       when :__unbox_str then emit(:unbox, [expr(args[0]), :str])
       when :__unbox_arr then emit(:unbox, [expr(args[0]), [:arr, :dyn]])
       when :__unbox_float then emit(:unbox, [expr(args[0]), :float])
       when :__unbox_bool then emit(:unbox, [expr(args[0]), :bool])
+      when :__sym_of_id then (c = emit(:nop, [expr(args[0])]); c.ty = :sym; c) # an integer id as a Symbol
       when :__unbox_obj_addr then emit(:xor, [emit(:handle, [expr(args[0])]), const(8)]) # an object's tag is 8: the raw word with the tag cleared
       when :__unbox_sym then emit(:unbox, [expr(args[0]), :sym])
       when :__unbox_hash then emit(:unbox, [expr(args[0]), [:hash, :dyn, :dyn]])
@@ -1306,12 +1319,19 @@ module Indus
           mask = iterate_array_value(n.copy(name: :map), args, pairs)
           return emit(:call, [demand(:"__arr_#{n.name}_mask"), arr, mask])
         when :to_h then return emit(:call, [demand(:__pairs_to_hash), mapped.()]) if kind_of(n.receiver) != :hash
-        when :sort then raise "sort with a comparator block: not supported yet (sort_by, or sort.reverse)"
-        when :with_index # xs.map.with_index { |x, i| }
+        when :sort # a comparator: the block as a closure value, the prelude merge sort calls it
+          params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+          c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
+          return emit(:call, [demand(:__arr_sort_cmp), @recv_value || expr(n.receiver), c])
+        when :with_index, :each_with_index # xs.map.with_index { |x, i| }, xs.each_char.with_index { }, xs.each.with_index { }
           r = n.receiver
-          if r.is_a?(Prism::CallNode) && r.name == :map && r.block.nil? && r.arguments.nil? && r.receiver
-            pairs = emit(:mcall, [:each_with_index_pairs, expr(r.receiver)])
-            return iterate_array_value(n.copy(name: :map), args, pairs)
+          if r.is_a?(Prism::CallNode) && %i[map each each_char each_byte select reject].include?(r.name) && r.block.nil? && r.arguments.nil? && r.receiver
+            base = case r.name
+                   when :each_char then emit(:mcall, [:chars, expr(r.receiver)])
+                   when :each_byte then emit(:mcall, [:bytes, expr(r.receiver)])
+                   else expr(r.receiver) end
+            pairs = emit(:mcall, [:each_with_index_pairs, base])
+            return iterate_array_value(n.copy(name: r.name == :map ? :map : r.name == :each || r.name == :each_char || r.name == :each_byte ? :each : r.name), args, pairs)
           end
         end
       end
@@ -1481,7 +1501,7 @@ module Indus
         @locals[accv] = const(0)
         r = recv.is_a?(Prism::ParenthesesNode) ? recv.body.body.last : recv
         iter = ->(i, ps, pfx) { @locals[:"#{pfx}#{ps[0]}"] = i if ps[0]; @sum_target = [accv, n.name] }
-        if r.is_a?(Prism::RangeNode)
+        if r.is_a?(Prism::RangeNode) && !str_range?(r)
           counted_loop(expr(r.left), expr(r.right), r.exclude_end? ? :lt : :le, params, body, &iter)
         else
           arr = recv_val(recv); len = emit(:alen, [arr])
@@ -1491,6 +1511,7 @@ module Indus
       when :each, :map, :each_with_index, :each_pair
         r = recv.is_a?(Prism::ParenthesesNode) ? recv.body.body.last : recv
         if @recv_value then return array_loop(@recv_value, n.name == :each_pair ? :each : n.name, params, body) end
+        return iterate_array_value(n, args, range_array(r)) if str_range?(r)
         if r.is_a?(Prism::RangeNode)
           lo = expr(r.left); hi = expr(r.right)
           if n.name == :map # a fresh array, filled by the body's value
@@ -1856,7 +1877,6 @@ module Indus
     def lambda_value(n)
       params = n.parameters&.parameters&.requireds&.map(&:name) || []
       captured = free_locals(n.body, params).select { |nm| @locals.key?(lname(nm)) }
-      raise "a lambda inside a method cannot yet refer to self or @ivars" if @klass && refers_to_self?(n.body)
       closure_value(params, captured, n.body&.body || [])
     end
 
@@ -1865,10 +1885,16 @@ module Indus
       k = @classes[:"__lambda#{@lambda_count}"] = Klass.new(:"__lambda#{@lambda_count}")
       k.id = @classes.size; k.closure = true
       captured.each { k.ivar(:"@#{_1}") }
+      outer_self = @klass && !@klass.closure ? @klass : (@klass&.closure ? @klass.outer : nil)
+      outer_self = nil if @owner # module singleton methods have no instance
+      if outer_self && @locals.key?(lname(:self)) && refers_to_self_plain?(stmts) # the enclosing object rides along as a capture
+        k.outer = outer_self; k.ivar(:@__self)
+      end
       f = Func.new(:"#{k.name}#call", 1 + params.size); f.cls = k; k.methods[:call] = f
       (@deferred_lambdas ||= []) << [k, f, params, captured, stmts, captured.select { shared?(_1) }]
       o = emit(:onew, [k])
       captured.each { |nm| emit(:fld_set, [o, k.ivar(:"@#{nm}"), @locals.fetch(lname(nm))]) } # a shared capture stores its cell
+      emit(:fld_set, [o, k.ivar(:@__self), me_val]) if k.outer
       o
     end
 
@@ -1918,7 +1944,12 @@ module Indus
     def times_enum?(r) = r.is_a?(Prism::CallNode) && r.name == :times && r.block.nil? && r.arguments.nil? && r.receiver
 
     # (lo..hi) or n.times as an Integer array
+    def str_range?(r) = r.is_a?(Prism::RangeNode) && (r.left.is_a?(Prism::StringNode) || kind_of(r.left) == :str)
+
     def range_array(r)
+      if str_range?(r) # ("a".."e"): successors up to the end
+        return emit(:call, [demand(:__str_range), expr(r.left), expr(r.right), const(r.exclude_end? ? 1 : 0)])
+      end
       if times_enum?(r) then lo = const(0); hi = expr(r.receiver); excl = true
       else lo = expr(r.left); hi = expr(r.right); excl = r.exclude_end? end
       hi = emit(:add, [hi, const(1)]) unless excl
@@ -2021,9 +2052,9 @@ module Indus
       return true if n.receiver.nil? && %i[lambda proc].include?(n.name)
       return true if n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Proc
       return true if n.receiver.nil? && (f = @funcs[n.name]) && (d = @defs_by_func[f]) && d.parameters&.block
-      # a method with &blk on self or on an object: any class defining the name that way (the receiver's class is known only later)
-      cands = n.receiver.nil? ? [@klass].compact : @classes.values
-      cands.any? { |k| (mf = k.find_method(n.name)) && (d = @defs_by_func[mf]) && d.parameters&.block }
+      # a method with &blk on self, or on an object whose class the pre-typing knows
+      k = n.receiver.nil? ? @klass : ((kd = kind_of(n.receiver)).is_a?(Symbol) ? @classes[kd] : nil)
+      k && (mf = k.find_method(n.name)) && (d = @defs_by_func[mf]) && d.parameters&.block ? true : false
     end
 
     def free_locals_plain(node, bound, out = [])
@@ -2059,6 +2090,15 @@ module Indus
       out << node.name if node.is_a?(Prism::LocalVariableWriteNode) || node.is_a?(Prism::LocalVariableOperatorWriteNode) || node.is_a?(Prism::LocalVariableOrWriteNode)
       node.compact_child_nodes.each { assigned_locals_plain(_1, out) }
       out
+    end
+
+    # self, an @ivar, or a bare method call (which may be the enclosing class's): needs the enclosing object
+    def refers_to_self_plain?(node)
+      return node.any? { refers_to_self_plain?(_1) } if node.is_a?(Array)
+      return false unless node.is_a?(Prism::Node)
+      return true if node.is_a?(Prism::SelfNode) || node.is_a?(Prism::InstanceVariableReadNode) || node.is_a?(Prism::InstanceVariableWriteNode) || node.is_a?(Prism::InstanceVariableOperatorWriteNode)
+      return true if node.is_a?(Prism::CallNode) && node.receiver.nil? && !node.name.to_s.start_with?("__") && !%i[puts p print raise lambda proc format sprintf printf rand require].include?(node.name) && !@funcs[node.name]
+      node.compact_child_nodes.any? { refers_to_self_plain?(_1) }
     end
 
     def refers_to_self?(node)
@@ -2170,8 +2210,11 @@ module Indus
 
     # a loop body: statements, or a Proc given the block prefix (a block passed as a value)
     def run_body(body, pfx)
+      saved, @recv_value = @recv_value, nil # the receiver value belongs to the iterator, not to calls inside its body
       return body.call(pfx) if body.is_a?(Proc)
       last = nil; body.each { last = expr(_1) }; last
+    ensure
+      @recv_value = saved
     end
 
     def assigned_ivars(node, out = [])

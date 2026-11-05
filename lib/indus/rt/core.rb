@@ -198,6 +198,9 @@ def __dyn_add(a, b)
   if __dyn_both_int(a, b)
     return __box_int(__unbox_int(a) + __unbox_int(b))
   end
+  if __tag(a) == 4 && __tag(b) == 4
+    return __box_arr(__arr_plus(__unbox_arr(a), __unbox_arr(b)))
+  end
   if __tag(a) == 2 && __tag(b) == 2
     return __box_str(__unbox_str(a) + __unbox_str(b))
   end
@@ -792,6 +795,11 @@ module Comparable
   def >=(other) = (self <=> other) >= 0
   def ==(other) = (self <=> other) == 0
   def between?(lo, hi) = self >= lo && self <= hi
+  def clamp(lo, hi)
+    return lo if (self <=> lo) < 0
+    return hi if (self <=> hi) > 0
+    self
+  end
 end
 
 def __num_even_p(n) = n % 2 == 0
@@ -1070,4 +1078,103 @@ def __dyn_class_name(v)
   return "Float" if t == 14
   return (__unbox_bool(v) ? "TrueClass" : "FalseClass") if t == 10
   __class_name(__ld(__unbox_obj_addr(v)))
+end
+
+# a String's Symbol: symbols are ids assigned at compile time, so only names the program
+# spells somewhere exist; anything else traps (a dynamic symbol the program never wrote)
+def __str_to_sym(s)
+  i = 1
+  while i < SYMBOL_NAMES.length
+    return __sym_of_id(i) if SYMBOL_NAMES[i] == s
+    i = i + 1
+  end
+  __trap
+  __sym_of_id(0)
+end
+
+# s[i] = str: bytes replaced in place when the lengths match (one byte for one byte);
+# a different length rebuilds the string's bytes (the handle is kept when it fits)
+# s[i] = v on a String (a tagged receiver or index goes through __dyn_idx_set first, which
+# unboxes: no representation is mixed inside here)
+def __str_set_at(s, i, v)
+  __str_set_bytes_i(s, i, v)
+  s
+end
+
+def __str_set_bytes_i(s, i, v)
+  i = s.length + i if i < 0
+  __trap if i < 0 || i >= s.length
+  if v.length == 1
+    __st8(s, i, v.ord)
+    return s
+  end
+  rest = s[i + 1, s.length - i - 1]
+  head = s[0, i]
+  rebuilt = head + v + rest
+  __str_replace_bytes(s, rebuilt)
+  s
+end
+
+# s takes rebuilt's bytes; traps when they do not fit s's capacity (no in-place growth of a
+# string whose handle others hold)
+def __str_replace_bytes(s, rebuilt)
+  __trap if rebuilt.length > __ld(__handle(s) - 16)
+  i = 0
+  while i < rebuilt.length
+    __st8(s, i, rebuilt[i].ord)
+    i = i + 1
+  end
+  __st(__handle(s) - 8, rebuilt.length)
+  s
+end
+
+# v[i] on a tagged value with an integer index: a string's character, an array's element
+def __dyn_idx(v, i)
+  t = __tag(v)
+  return __box_str(__unbox_str(v)[i]) if t == 2
+  return __unbox_arr(v)[i] if t == 4
+  return __unbox_hash(v)[__box_int(i)] if t == 6
+  __trap
+  v
+end
+
+# v[i] = x on a tagged value: the string's byte(s), or the array's slot. Returns the container
+# (the lowering rebinds the receiver's home to the result, as every []= does)
+def __dyn_idx_set(v, i, x)
+  t = __tag(v)
+  if t == 2
+    __str_set_at(__unbox_str(v), i, __dyn_str(x))
+    return v
+  end
+  if t == 4
+    a = __unbox_arr(v)
+    __trap if i >= a.length # growth through a tagged handle would not be seen by its holders
+    a[i] = x
+    return v
+  end
+  __trap
+  v
+end
+
+
+# dup of a tagged value: strings and arrays are copied, everything else is itself
+def __dyn_dup(v)
+  t = __tag(v)
+  return __box_str(__str_dup(__unbox_str(v))) if t == 2
+  return __box_arr(__arr_dup(__unbox_arr(v))) if t == 4
+  v
+end
+
+# v[k] with a tagged key: an integer key indexes a string or array, anything else looks up a hash
+def __dyn_idx_dyn(v, k)
+  return __dyn_idx(v, __unbox_int(k)) if __tag(k) & 1 == 1
+  __trap if __tag(v) != 6
+  __unbox_hash(v)[k]
+end
+def __dyn_idx_set_dyn(v, k, x)
+  return __dyn_idx_set(v, __unbox_int(k), x) if __tag(k) & 1 == 1
+  __trap if __tag(v) != 6
+  h = __unbox_hash(v)
+  h[k] = x
+  v
 end

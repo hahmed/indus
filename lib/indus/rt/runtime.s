@@ -515,6 +515,149 @@ rt_hashi_set:
         ldp     x29, x30, [sp], #64
         ret
 
+// rt_hashd_find(x0 h, x1 key): tagged keys (notes/29). A string (tag 2) hashes and compares
+// by content through its bare handle; everything else (fixnum, symbol, bool, nil, an object,
+// an array) by the word itself. Two equal strings boxed separately are the same key.
+rt_hashd_find:
+        stp     x29, x30, [sp, #-48]!
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        mov     x19, x0
+        mov     x20, x1
+        and     x2, x20, #15
+        cmp     x2, #2
+        b.ne    5f
+        and     x0, x20, #~15
+        bl      rt_str_hash
+        b       6f
+5:      movz    x3, #0x7c15
+        movk    x3, #0x58ed, lsl #16
+        movk    x3, #0xa3c8, lsl #32
+        movk    x3, #0x9e37, lsl #48
+        mul     x0, x20, x3
+        lsr     x0, x0, #20
+6:      ldur    x21, [x19, #-16]        // cap
+        sub     x21, x21, #1            // mask
+        and     x22, x0, x21            // index
+0:      add     x0, x19, x22, lsl #4    // entry
+        ldr     x1, [x0]
+        cbz     x1, 2f                  // empty -> return slot
+        cmp     x1, x20
+        b.eq    1f                      // same word
+        and     x2, x1, #15
+        cmp     x2, #2
+        b.ne    3f                      // not a string: no further test
+        and     x2, x20, #15
+        cmp     x2, #2
+        b.ne    3f
+        and     x0, x1, #~15
+        and     x1, x20, #~15
+        bl      rt_str_eq
+        cbnz    x0, 1f
+3:      add     x22, x22, #1
+        and     x22, x22, x21
+        b       0b
+1:      add     x0, x19, x22, lsl #4
+2:      ldp     x21, x22, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #48
+        ret
+rt_hashd_get:
+        stp     x29, x30, [sp, #-16]!
+        bl      rt_hashd_find
+        ldr     x1, [x0]
+        cbz     x1, 0f
+        ldr     x0, [x0, #8]
+        ldp     x29, x30, [sp], #16
+        ret
+0:      mov     x0, #0
+        ldp     x29, x30, [sp], #16
+        ret
+rt_hashd_geti:
+        stp     x29, x30, [sp, #-16]!
+        bl      rt_hashd_find
+        ldr     x1, [x0]
+        cbz     x1, 0f
+        ldr     x0, [x0, #8]
+        ldp     x29, x30, [sp], #16
+        ret
+0:      movz    x0, #0x8000, lsl #48
+        ldp     x29, x30, [sp], #16
+        ret
+rt_hashd_key:
+        stp     x29, x30, [sp, #-16]!
+        bl      rt_hashd_find
+        ldr     x0, [x0]
+        cmp     x0, #0
+        cset    x0, ne
+        ldp     x29, x30, [sp], #16
+        ret
+rt_hashd_set:
+        stp     x29, x30, [sp, #-64]!
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        stp     x23, x24, [sp, #48]
+        mov     x19, x0
+        mov     x20, x1
+        mov     x21, x2
+        ldur    x22, [x19, #-16]        // cap
+        ldur    x23, [x19, #-8]         // len
+        add     x0, x23, #1
+        lsl     x0, x0, #1
+        cmp     x0, x22
+        b.ls    1f
+        // grow: new table of 2*cap, reinsert
+        lsl     x0, x22, #1
+        bl      rt_hash_new
+        mov     x24, x0                 // new handle
+        mov     x22, #0                 // i over the old order list
+0:      cmp     x22, x23
+        b.hs    2f
+        ldur    x1, [x19, #-16]
+        add     x1, x19, x1, lsl #4     // old order list
+        ldr     x1, [x1, x22, lsl #3]   // old slot index
+        add     x1, x19, x1, lsl #4     // old entry
+        ldr     x2, [x1]
+        mov     x0, x24
+        mov     x1, x2
+        bl      rt_hashd_find
+        ldur    x1, [x19, #-16]
+        add     x1, x19, x1, lsl #4
+        ldr     x1, [x1, x22, lsl #3]
+        add     x1, x19, x1, lsl #4
+        ldr     x2, [x1]
+        ldr     x3, [x1, #8]
+        stp     x2, x3, [x0]
+        sub     x0, x0, x24             // new slot index, appended in the same order
+        lsr     x0, x0, #4
+        ldur    x1, [x24, #-16]
+        add     x1, x24, x1, lsl #4
+        str     x0, [x1, x22, lsl #3]
+        add     x22, x22, #1
+        b       0b
+2:      stur    x23, [x24, #-8]
+        mov     x19, x24
+1:      mov     x0, x19
+        mov     x1, x20
+        bl      rt_hashd_find
+        ldr     x1, [x0]
+        cbnz    x1, 4f
+        sub     x1, x0, x19             // a new key: record its slot in the order list
+        lsr     x1, x1, #4
+        ldur    x2, [x19, #-16]
+        add     x2, x19, x2, lsl #4
+        str     x1, [x2, x23, lsl #3]
+        add     x23, x23, #1
+        stur    x23, [x19, #-8]
+4:      stp     x20, x21, [x0]
+        mov     x0, x19
+        ldp     x23, x24, [sp, #48]
+        ldp     x21, x22, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #64
+        ret
+
+
 // rt_hash_keys(x0 h) -> array handle [cap][len][keys...]
 rt_hash_keys:
         stp     x29, x30, [sp, #-48]!

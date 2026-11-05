@@ -510,7 +510,7 @@ module Indus
         when :hnew then @asm.mov_imm(0, 8); @asm.bl(:rt_hash_new); @asm.mov(d, 0)
         when :hget, :hkey, :hset
           kt = i.args[0].ty&.[](1) or raise "hash #{i.args[0]} has no key type in #{@f.name}"
-          kind = kt == :str ? "s" : "i"
+          kind = kt == :str ? "s" : kt == :dyn ? "d" : "i" # strings by content, tagged keys by tag, the rest by word
           i.args[1..].each_with_index { |v, n| @asm.mov(n + 1, reg(v, n + 1)) }
           @asm.mov(0, reg(i.args[0], 0))
           op = i.op.to_s.sub("h", ""); op = "geti" if i.op == :hget && i.ty == :int? # int values: miss -> sentinel

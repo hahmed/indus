@@ -31,7 +31,7 @@ module Indus
     READERS = %i[scat sappend seq seq_char alen ssub puts_str phi].freeze # uses that do not alias the string
 
     def self.run(f)
-      static_literals(f)
+      static_literals(f) unless ENV["NOSTATIC"] || (ENV["NOSTATIC_FN"] && f.name.to_s =~ Regexp.new(ENV["NOSTATIC_FN"]))
       uses = Hash.new(0); users = Hash.new { |h, k| h[k] = [] }
       f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { next unless _1.is_a?(Inst); uses[_1] += 1; users[_1] << i } }
       live_out = liveness(f)

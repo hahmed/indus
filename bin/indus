@@ -12,7 +12,7 @@ src = File.read(file)
 
 if ARGV.include?("--check")
   begin
-    Indus.compile(src)
+    Indus.compile(src, file: file)
   rescue => e
     $stderr.puts "indus: #{e.message.lines.first.strip}"
     exit 1
@@ -21,11 +21,11 @@ if ARGV.include?("--check")
 end
 if out
   os = ARGV.include?("--linux") ? :linux : :darwin
-  unit = Indus.compile(src, standalone: os)
+  unit = Indus.compile(src, standalone: os, file: file)
   os == :linux ? Indus::ELF.write(out, unit.code) : Indus::MachO.write(out, unit.code)
   $stderr.puts "indus: #{out} (#{unit.code.bytesize} bytes of code, #{File.size(out)} bytes on disk)"
 else
-  unit = Indus.compile(src)
+  unit = Indus.compile(src, file: file)
   if ENV["HEX"] then unit.code.unpack("V*").each_with_index { |w, i| printf("%4d: %08x\n", i * 4, w) }; exit end
   t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
   Indus::Metal.run(unit)

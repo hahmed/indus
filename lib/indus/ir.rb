@@ -1,6 +1,9 @@
 # SSA IR: values, blocks, functions.
 module Indus
   class Inst
+    attr_accessor :bound_to # the generic instance a call last took its result type from
+    attr_accessor :assumed # [operand, type] an irreversible by-type rewrite relied on; checked after typing
+    attr_accessor :routed # the method name a call was routed from by the receiver's builtin family
     attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home, :uses
     attr_reader :id
     @@n = 0
@@ -32,7 +35,7 @@ module Indus
   # a user class: ivar layout (8 bytes each, no header), methods, attrs
   class Klass
     attr_reader :name, :ivars, :methods, :readers, :writers
-    attr_accessor :superclass, :tagged, :boxed, :id, :closure, :mixins, :enumerable # closure: a lambda literal's anonymous class; mixins: modules included/prepended here
+    attr_accessor :superclass, :tagged, :boxed, :id, :closure, :mixins, :enumerable, :outer # outer: the class a closure's self belongs to # closure: a lambda literal's anonymous class; mixins: modules included/prepended here
     def initialize(name, superclass = nil)
       @name, @methods, @readers, @writers = name, {}, {}, {}
       @superclass = superclass

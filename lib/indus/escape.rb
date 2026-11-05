@@ -171,7 +171,7 @@ module Indus
           when :call
             callee, *args = i.args
             return false if callee.stores_other
-            args.each_with_index { |a, k| return false if callee.stores_param[k] && !fresh[a] }
+            args.each_with_index { |a, k| return false if callee.stores_param[k] && !own[a] } # the callee stores into it: it must be ours this iteration (a load is not)
           when :pcall, :sendsw then return false
           when :hsave, :hrestore then return false # already a region at this level
           end
