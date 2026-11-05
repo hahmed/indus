@@ -630,3 +630,38 @@ def __arr_each_with_index_pairs(a)
 end
 
 def __arr_join0(a) = __arr_join(a, "")
+
+# a's contents become b's; a keeps its identity (the bang methods)
+def __arr_replace(a, b)
+  a.pop while a.length > b.length
+  i = 0
+  while i < b.length
+    if i < a.length then a[i] = b[i] else a.push(b[i]) end
+    i = i + 1
+  end
+  a
+end
+
+# a takes b's pairs; the same a comes back
+def __hash_merge_into(a, b)
+  i = 0
+  while i < __hcount(b)
+    a[__hkey_at(b, i)] = __hval_at(b, i)
+    i = i + 1
+  end
+  a
+end
+
+# Integer#to_s(base), 2..36
+def __num_to_s1(n, base)
+  return "0" if n == 0
+  neg = n < 0
+  n = 0 - n if neg
+  digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+  out = ""
+  while n > 0
+    out = digits[n % base] + out
+    n = n / base
+  end
+  neg ? "-" + out : out
+end

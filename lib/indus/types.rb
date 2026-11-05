@@ -632,6 +632,7 @@ module Indus
             back.(p).each do |v|
               next unless v.is_a?(Inst) && %i[add mul].include?(v.op)
               x, y = v.args
+              next unless [x, y].all? { |o| of(f, o) == :int || o.equal?(p) } # a tagged or unknown operand: no big arithmetic to promote into
               hits = ->(o) { deps.(o)[p] }
               trivial = ->(o) { o.is_a?(Inst) && o.op == :const && [0, 1].include?(o.args[0]) }
               geometric = v.op == :add ? (hits.(x) && hits.(y)) : ((hits.(x) || hits.(y)) && !trivial.(x) && !trivial.(y))
@@ -706,6 +707,9 @@ module Indus
         i.op = :call; i.args = [fn(t == :str ? :__str_spaceship : :__num_spaceship), recv, *args]; return
       end
       t = :int if t == :int? # a nullable int used as a receiver: nil would have raised
+      if name == :frozen? && args.empty? && !classes_of(t) # no frozen bit: scalars are, containers never are (no freeze yet)
+        i.op = :const; i.args = [%i[int float sym nil bool].include?(t) ? 1 : 0]; i.ty = :bool; return
+      end
       # builtin methods that are ops when the receiver's kind was known at lowering; here by type
       if args.empty?
         case [t, name]
