@@ -327,13 +327,20 @@ module Indus
     attr_reader :modules
 
     # `x << a << b`: the local or ivar at the root of the chain, nil when it is an integer local
+    # x[k] = v for a receiver that is a hash or an array (Types decides which store)
+    def idx_set_value(recv_node, key_node, v)
+      emit(:idx_set, [expr(recv_node), expr(key_node), v])
+    end
+
     def append_root(n)
       r = n.receiver
       r = r.receiver while r.is_a?(Prism::CallNode) && r.name == :<<
       case r
       when Prism::LocalVariableReadNode then @int_locals&.include?(r.name) ? nil : r
       when Prism::InstanceVariableReadNode then r
-      when Prism::CallNode then r if r.arguments.nil? && r.block.nil? && r.receiver # `obj.attr << v`: the slot becomes a cell (Types)
+      when Prism::CallNode
+        return r if r.arguments.nil? && r.block.nil? && r.receiver # `obj.attr << v`: the slot becomes a cell (Types)
+        return r if r.name == :[] && r.receiver && r.arguments&.arguments&.size == 1 && r.block.nil? # `h[k] << v`: the slot is written back
       end
     end
 
@@ -802,8 +809,12 @@ module Indus
         a = expr(n.receiver); v = expr(args[0])
         r = emit(:lshift_or_append, [a, v])
         case root # the chain's home is rebound to the result (a grown string/array may have moved)
-        when Prism::LocalVariableReadNode then @locals[root.name] = r
+        when Prism::LocalVariableReadNode then @locals[lname(root.name)] = r
         when Prism::InstanceVariableReadNode then emit(:fld_set, [@locals.fetch(:self), @klass.ivar(root.name), r])
+        when Prism::CallNode
+          if root.name == :[] # h[k] << v / a[i] << v: the element slot takes the grown handle
+            idx_set_value(root.receiver, root.arguments.arguments[0], r)
+          end
         end
         return r
       end

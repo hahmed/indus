@@ -131,8 +131,23 @@ module Indus
                 make_cell(f, v, i); changed = true
               end
             end
-            if i.op == :aset && arr(of(f, i.args[0])) && i.args[0].op == :param && i.args[1].op == :alen && i.args[1].args[0].equal?(i.args[0]) && !f.name.to_s.start_with?("__gc")
-              raise "#{f.name}: push onto parameter #{i.args[0]} would not be seen by the caller after growth; return the array instead (not supported yet)"
+            # growth of an array through a parameter (push, insert at the end) must be seen by the
+            # caller: the parameter becomes a cell holding the array (notes/53), the caller wraps
+            # its array in a cell at the origin, and both sides read and write through it
+            if (i.op == :aset && arr(of(f, i.args[0])) && i.args[1].op == :alen || i.op == :lshift_or_append && arr(of(f, i.args[0])) || i.op == :hset && hsh(of(f, i.args[0]))) && !f.name.to_s.start_with?("__") && (p = param_origin(f, i.args[0]))
+              arr_cell_param(f, p); changed = true # a hash store may rehash into a new handle: the same treatment
+            end
+            if i.op == :call && !generic?(i.args[0]) # an argument flowing into an array-cell parameter is made a cell at its origin
+              callee = i.args[0]
+              i.args[1..].each_with_index do |v, k|
+                next unless (pt = callee.ptypes[k]) && cell?(pt) && (arr(pt[1]) || hsh(pt[1]))
+                if arr(of(f, v)) || hsh(of(f, v)) then make_arr_cell(f, v, i); changed = true
+                elsif (vt = of(f, v)) && cell?(vt) && join(vt, pt) != vt # what the callee stores comes back to the caller's cell
+                  nt = join(vt, pt)
+                  v.op == :param ? f.ptypes[f.params.index(v)] = nt : v.ty = nt
+                  changed = true
+                end
+              end
             end
             if i.op == :lshift_or_append && arr(of(f, i.args[0])) # a << v on an array is push: aset at the length
               raise "#{f.name}: `<<` on parameter #{i.args[0]} would not be seen by the caller after growth; not supported yet" if i.args[0].op == :param
@@ -240,6 +255,14 @@ module Indus
                 i.block.insts.insert(i.block.insts.index(i), c); i.args[1] = c; changed = true
               end
               dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
+              if %i[aget aset alen apop idx].include?(i.op) && of(f, i.args[0]) == :dyn # a tagged value used as an array: unbox (trapping on another tag); a tagged hash likewise
+                c = Inst.new(:call, [fn(:__dyn_arr), i.args[0]]); c.ty = [:arr, :dyn]; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+                i.args[0] = c; changed = true
+              end
+              if %i[hget hset hkey hkeys hcap hkey_at hval_at].include?(i.op) && of(f, i.args[0]) == :dyn
+                c = Inst.new(:call, [fn(:__dyn_hash), i.args[0]]); c.ty = [:hash, :dyn, :dyn]; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+                i.args[0] = c; changed = true
+              end
               if %i[and or xor shl shr mod].include?(i.op) && i.args.any? { of(f, _1) == :dyn } # integer-only operators: a tagged operand is unboxed (trapping on a non-integer)
                 if i.op == :mod then dyn_op(f, i)
                 else
@@ -267,6 +290,7 @@ module Indus
               if generic?(callee) && clashes?(callee, i.args[1..].map { of(f, _1) }) # a call rewritten into a generic this very visit
                 callee = i.args[0] = instance_for(callee, i.args[1..].map { of(f, _1) }, funcs); changed = true
               end
+              i.args[1..].each_with_index { |a, k| (make_arr_cell(f, a, i); changed = true) if (pt = callee.ptypes[k]) && cell?(pt) && (arr(pt[1]) && arr(of(f, a)) || hsh(pt[1]) && hsh(of(f, a))) } # the callee grows this container: pass a cell
               unless generic?(callee) && deferred_generic?(callee, i.args[1..].map { of(f, _1) })
                 i.args[1..].each_with_index { |a, k| set.(callee.ptypes[k], of(f, a)) { callee.ptypes[k] = _1 } unless k == 0 && callee.cls } # self is the defining class, whatever subclass arrives
               end
@@ -276,6 +300,10 @@ module Indus
                 case kind
                 when :call
                   payload.ptypes[0] = klass.name
+                  args.each_with_index do |a, k| # a callee that grows this container wants a cell; the other arms then see the cell too
+                    (make_arr_cell(f, a, i); changed = true) if (pt = payload.ptypes[k + 1]) && cell?(pt) && (arr(pt[1]) && arr(of(f, a)) || hsh(pt[1]) && hsh(of(f, a)))
+                  end
+                  args = i.args[2..]
                   args.each_with_index { |a, k| set.(payload.ptypes[k + 1], of(f, a)) { payload.ptypes[k + 1] = _1 } }
                 when :fld_set then set.(@ivars[klass.name][payload], of(f, args[0])) { @ivars[klass.name][payload] = _1 }
                 end
@@ -295,6 +323,10 @@ module Indus
               if (vt = of(f, v)) && (ct = of(f, c)) && cell?(ct) && join(ct[1], vt) != ct[1]
                 nt = [:cell, join(ct[1], vt)]
                 (c.op == :param ? f.ptypes[f.params.index(c)] = nt : c.ty = nt); changed = true
+              end
+            when :cell_new # the allocation inside the cell is what the GC scans: it takes the cell's inner type
+              if (ct = i.ty) && cell?(ct) && ct[1].is_a?(Array) && (a = i.args[0]).op != :param && a.ty != ct[1] && (a.ty.nil? || join(a.ty, ct[1]) == ct[1])
+                a.ty = ct[1]; changed = true
               end
             when :aset
               a, _, v = i.args
@@ -595,6 +627,81 @@ module Indus
       o.block.insts.insert(at, mk)
       f.replace_uses(o, mk); mk.args = [o]
       bufferize(f, mk); mk
+    end
+
+    # ---- arrays grown through parameters: a cell holding the handle (the array analogue of :strbuf)
+
+    # the parameter p of f (an array) becomes [:cell, arr]: every use loads through the cell,
+    # every aset that may grow writes the new handle back
+    # the parameter an array handle descends from through aset chains and loop phis, if any
+    def self.param_origin(f, v, seen = {})
+      return nil if seen[v]; seen[v] = true
+      case v.op
+      when :param then v
+      when :aset, :hset then param_origin(f, v.args[0], seen)
+      when :phi then v.args.map { |(_, a)| param_origin(f, a, seen) }.compact.first
+      end
+    end
+
+    def self.arr_cell_param(f, p)
+      k = f.params.index(p)
+      at = f.ptypes[k]
+      f.ptypes[k] = [:cell, at]
+      cellify_uses(f, p)
+    end
+
+    # wrap the array v in a cell at its origin (the allocation, a load, a parameter), so the
+    # callee's growth is visible here: later uses load through the cell, later stores write back
+    def self.make_arr_cell(f, v, use)
+      if v.op == :cell_get # already a cell: hand the cell itself to this use
+        swap_operand(use, v, v.args[0]); return v.args[0]
+      end
+      o = v
+      loop do # the handle chain back to the allocation: through stores, and through loop phis to their entry value
+        if %i[aset hset].include?(o.op) && o.args[0].ty.is_a?(Array) then o = o.args[0]
+        elsif o.op == :phi && (entry = o.args.find { |(bb, a)| f.blocks.index(bb) < f.blocks.index(o.block) }) then o = entry[1]
+        else break end
+      end
+      if o.op == :param then arr_cell_param(f, o); return o end
+      if o.op == :cell_get then swap_operand(use, v, o.args[0]); return o.args[0] end # the chain already lives in a cell: pass that cell
+      c = Inst.new(:cell_new, [o]); c.ty = [:cell, of(f, o)]; c.block = o.block
+      at = o.op == :phi ? 0 : o.block.insts.index(o) + 1
+      o.block.insts.insert(at, c)
+      f.replace_uses(o, c); c.args = [o]
+      cellify_uses(f, c)
+      c
+    end
+
+    # c holds a cell with an array; its uses (other than cell consumers) get a load, and an
+    # aset on the loaded handle writes the (possibly new) handle back into the cell. Phis and
+    # calls into cell parameters pass the cell itself.
+    def self.cellify_uses(f, c)
+      f.all.dup.each do |u|
+        next unless u.args.any? { |a| a == c || (a.is_a?(Array) && a[1] == c) }
+        case u.op
+        when :cell_get, :cell_set, :cell_new then next
+        when :phi # a loop-carried handle becomes the cell on every edge (growth lives in the cell now): the phi is trivial
+          u.args = u.args.map { |(bb, _)| [bb, c] }; u.ty = of(f, c)
+          f.replace_uses(u, c); next
+        when :call then next if (pt = u.args[0].ptypes[u.args.index(c) - 1]) && cell?(pt)
+        end
+        # every use loads afresh right before it: a call or a store in between may have replaced the handle
+        g = Inst.new(:cell_get, [c]); g.ty = of(f, c)[1]; g.block = u.block
+        u.block.insts.insert(u.block.insts.index(u), g)
+        swap_operand(u, c, g)
+        if u.op == :lshift_or_append && u.args[0] == g
+          len = Inst.new(:alen, [g]); len.ty = :int; len.block = u.block
+          u.block.insts.insert(u.block.insts.index(u), len)
+          u.op = :aset; u.args = [g, len, u.args[1]]
+        end
+        if (u.op == :aset || u.op == :hset) && u.args[0] == g # a store may grow: the new handle goes back into the cell, and later code reads the cell
+          st = Inst.new(:cell_set, [c, u]); st.ty = :int; st.block = u.block
+          u.block.insts.insert(u.block.insts.index(u) + 1, st)
+          f.replace_uses(u, c); st.args = [c, u]
+          cellify_uses(f, c) # the uses just redirected to c need their own loads
+          return
+        end
+      end
     end
 
     STRBUF_CONSUMERS = %i[bufappend mkbuf bufderef].freeze
