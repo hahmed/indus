@@ -153,7 +153,7 @@ module Indus
 
       # block parameters get the element kind of what is iterated, then the body is walked
       if blk
-        params = blk.parameters.is_a?(Prism::BlockParametersNode) ? blk.parameters.parameters.requireds.map(&:name) : []
+        params = blk.parameters.is_a?(Prism::BlockParametersNode) ? blk.parameters.parameters.requireds.map { _1.respond_to?(:name) ? _1.name : nil } : [] # |(a, b)| destructures: no name for that slot
         benv = env # blocks share the enclosing locals
         case n.name
         when :times, :upto, :downto then benv[params[0]] = :int if params[0]

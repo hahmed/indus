@@ -1327,6 +1327,27 @@ module Indus
       if n.receiver && !@recv_value && n.name == :map && times_enum?(n.receiver)
         return iterate_array_value(n, args, range_array(n.receiver))
       end
+      if n.name == :loop && n.receiver.nil? && blk.is_a?(Prism::BlockNode) # loop { }: while true, ended by break (or a raise)
+        hb, bb, xb = @f.new_block(:head), @f.new_block(:body), @f.new_block(:exit)
+        xb.cold = true
+        assigned_locals_plain(blk.body&.body || []).uniq.each { |nm| @locals[lname(nm)] ||= nil_const }
+        pre = @cur; emit(:br, [hb])
+        phis = @locals.to_h { |nm, v| ph = hb.phi; ph.args << [pre, v]; [nm, ph] }
+        @locals = phis.dup; @cur = hb
+        one = const(1); one.ty = :bool
+        emit(:condbr, [one, bb, xb]) # `loop` runs until a break: the exit edge keeps the block reachable for layout
+        @cur = bb
+        outer, @loop = @loop, { exit: xb, breaks: [], head: hb, nexts: [] }
+        (blk.body&.body || []).each { expr(_1) }
+        bend = @cur
+        emit(:br, [hb]) unless @cur.term
+        phis.each { |nm, ph| ph.args << [bend, @locals[nm]] unless bend.term && bend.succs.empty? }
+        @loop[:nexts].each { |(b, l)| phis.each { |nm, ph| ph.args << [b, l.fetch(nm)] } }
+        breaks = @loop[:breaks]; @loop = outer
+        @cur = xb
+        @locals = breaks.empty? ? phis.dup : merge_locals(xb, breaks)
+        return nil_const
+      end
       # s.gsub(/re/) { |m| ... }: the block as a closure value, called per match
       if n.receiver && blk.is_a?(Prism::BlockNode) && n.name == :gsub && args.size == 1 && args[0].is_a?(Prism::RegularExpressionNode)
         params = blk.parameters&.parameters&.requireds&.map(&:name) || []
@@ -1394,11 +1415,13 @@ module Indus
       end
       # a hash with a |k, v| block: iterate its pairs as an array; what yields a selection of
       # pairs comes back as a hash, what yields a value stays a value
-      if n.receiver && !@recv_value && kind_of(n.receiver) == :hash && blk
+      if n.receiver && !@recv_value && (kind_of(n.receiver) == :hash || %i[each_key each_value each_pair transform_values transform_keys].include?(n.name)) && blk
         case n.name
         when :select, :filter, :reject
           r = n.copy(name: n.name == :reject ? :reject : :select)
           return emit(:call, [demand(:__pairs_to_hash), iterate_array_value(r, args, hash_pairs(expr(n.receiver)))])
+        when :each_key then return iterate_array_value(n.copy(name: :each), args, emit(:hkeys, [expr(n.receiver)]))
+        when :each_value then return iterate_array_value(n.copy(name: :each), args, emit(:call, [demand(:__hash_values), expr(n.receiver)]))
         when :sum, :count, :find, :detect, :any?, :all?, :none?, :group_by, :min_by, :max_by, :partition, :each_with_object, :flat_map, :each_with_index, :reduce, :inject, :filter_map
           return iterate_array_value(n, args, hash_pairs(expr(n.receiver)))
         when :to_h # h.to_h { |k, v| [k2, v2] }
@@ -1421,7 +1444,7 @@ module Indus
         params = case blk.parameters
                  when Prism::NumberedParametersNode then (1..blk.parameters.maximum).map { :"_#{_1}" }
                  when nil then []
-                 else blk.parameters.parameters.requireds.map(&:name)
+                 else blk.parameters.parameters.requireds.map { |r| r.respond_to?(:name) ? r.name : r.lefts.map(&:name) } # |(a, b)|: the nested names
                  end
         body = blk.body&.body || []
       end
@@ -1762,6 +1785,11 @@ module Indus
 
     # the block's element parameter(s): |x|, or |k, v| destructuring a pair
     def bind_elem(ps, pfx, el)
+      if ps.size == 1 && ps[0].is_a?(Array) # |(a, b)| over an array of pairs: destructure the element
+        ps[0].each_with_index { |pn, k| @locals[:"#{pfx}#{pn}"] = emit(:idx, [el, const(k)]) }
+        return
+      end
+      ps = ps.flatten.compact if ps.any? { _1.is_a?(Array) } # |(a, b), x| : the names in order
       return if ps.empty?
       if ps.size >= 2 then ps.each_with_index { |pn, k| @locals[:"#{pfx}#{pn}"] = emit(:idx, [el, const(k)]) }
       else @locals[:"#{pfx}#{ps[0]}"] = el end
@@ -1774,12 +1802,12 @@ module Indus
       @locals[outv] = out if out
       counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
         el = emit(:aget, [arr, i])
-        if ps.size >= 2 && kind != :each_with_index # |k, v| over pairs: destructure the element
-          ps.each_with_index { |pn, k| @locals[:"#{pfx}#{pn}"] = emit(:idx, [el, const(k)]) }
+        if kind == :each_with_index
+          bind_elem([ps[0]], pfx, el)
+          @locals[:"#{pfx}#{ps[1]}"] = i if ps[1]
         else
-          @locals[:"#{pfx}#{ps[0]}"] = el if ps[0]
+          bind_elem(ps, pfx, el)
         end
-        @locals[:"#{pfx}#{ps[1]}"] = i if kind == :each_with_index && ps[1]
         if kind == :map
           # the body's value is stored at the latch: wrap body so its last value is captured
           @map_target = [outv, i]
