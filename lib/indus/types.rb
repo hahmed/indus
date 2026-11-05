@@ -131,6 +131,9 @@ module Indus
                 make_cell(f, v, i); changed = true
               end
             end
+            if i.op == :aset && arr(of(f, i.args[0])) && i.args[0].op == :param && i.args[1].op == :alen && i.args[1].args[0].equal?(i.args[0]) && !f.name.to_s.start_with?("__gc")
+              raise "#{f.name}: push onto parameter #{i.args[0]} would not be seen by the caller after growth; return the array instead (not supported yet)"
+            end
             if i.op == :lshift_or_append && arr(of(f, i.args[0])) # a << v on an array is push: aset at the length
               raise "#{f.name}: `<<` on parameter #{i.args[0]} would not be seen by the caller after growth; not supported yet" if i.args[0].op == :param
               len = Inst.new(:alen, [i.args[0]]); len.ty = :int; len.block = i.block
@@ -189,8 +192,10 @@ module Indus
               fnm = { add: :__arr_plus, sub: :__arr_minus, and: :__arr_and, or: :__arr_or, mul: :__arr_times }.fetch(i.op)
               fn = fn(fnm); i.op = :call; i.args = [fn, *i.args]; i.ty = nil; changed = true
             end
-            if i.op == :is_sym && (t = of(f, i.args[0])) then i.op = :const; i.args = [t == :sym ? 1 : 0]; i.ty = :bool; changed = true end
-            if i.op == :is_dyn && (t = of(f, i.args[0])) then i.op = :const; i.args = [t == :dyn ? 1 : 0]; i.ty = :bool; changed = true end
+            if @settled && i.op == :is_sym && (t = of(f, i.args[0])) then i.op = :const; i.args = [t == :sym ? 1 : 0]; i.ty = :bool; changed = true end
+            # is_dyn folds early for kinds that cannot still widen into :dyn (strings, containers, objects,
+            # dyn itself); an integer-ish operand may yet become tagged, so it waits for the settled round
+            if i.op == :is_dyn && (t = of(f, i.args[0])) && (@settled || t == :dyn || t == :str || t.is_a?(Array) || classes_of(t)) then i.op = :const; i.args = [t == :dyn ? 1 : 0]; i.ty = :bool; changed = true end
             if i.op == :to_f && of(f, i.args[0]) == :str then i.op = :call; i.args = [fn(:__str_to_f), i.args[0]]; i.ty = :float; changed = true end # "3.5".to_f
             if i.op == :mul && of(f, i.args[0]) == :str # "ab" * n
               fn = fn(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
@@ -235,13 +240,20 @@ module Indus
                 i.block.insts.insert(i.block.insts.index(i), c); i.args[1] = c; changed = true
               end
               dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
+              if %i[and or xor shl shr mod].include?(i.op) && i.args.any? { of(f, _1) == :dyn } # integer-only operators: a tagged operand is unboxed (trapping on a non-integer)
+                if i.op == :mod then dyn_op(f, i)
+                else
+                  i.args = i.args.map { |a| of(f, a) == :dyn ? (c = Inst.new(:call, [fn(:__dyn_int), a]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); c) : a }
+                end
+                changed = true
+              end
               dyn_print(f, i) if %i[puts_v p_v print_v inspect_v].include?(i.op) && of(f, i.args[0]) == :dyn
               inspect_v(f, i) if i.op == :inspect_v && of(f, i.args[0])
             end
             index(f, i) if i.op == :idx || i.op == :idx_set
             if standalone && (i.op == :libm || i.op == :pow && i.args.any? { of(f, _1) == :float }) # no libc: the Ruby libm
               name = i.op == :libm ? :"__libm_#{i.args[0]}" : :__libm_pow
-              args = i.op == :libm ? [i.args[1]] : i.args
+              args = i.op == :libm ? i.args[1..] : i.args
               args = args.map { |v| coerce(f, i.block, i, v, :float) }
               i.op = :call; i.args = [fn(name), *args]; changed = true
             end
@@ -327,6 +339,7 @@ module Indus
       funcs.each { |f| f.all.each { tag.(_1.ty) }; f.ptypes.each { tag.(_1) }; tag.(f.rtype) }
       @ivars.each_value { |h| h.each_value { tag.(_1) } }
       funcs.each { convert(_1) }
+      funcs.each { |f| f.all.each { |i| i.op = :hset if i.op == :hset_raw } }
       # a user object boxed into a :dyn carries its class id in word 0 and is listed in the DYN
       # descriptor: decided after convert, which is where the boxes are inserted
       funcs.each do |f|
@@ -486,12 +499,16 @@ module Indus
 
     # prelude generics: top-level functions named __arr_* / __merge_*; one instance per
     # distinct container type they are called with
-    def self.generic?(f) = f.name.to_s.start_with?("__arr_", "__merge_", "__hash_", "__fd_lines_of") && !f.cls
+    def self.generic?(f) = f.name.to_s.start_with?("__arr_", "__merge_", "__hash_", "__fd_lines_of", "__num_") && !f.cls
     def self.clashes?(f, ts)
       # containers: one instance per exact element type (a narrower array passed where a wider one
       # was seen would need its elements re-represented, not just a wider parameter)
-      f.ptypes.zip(ts).any? { |cur, t| cur && t && cur != t && ((arr(cur) || arr(t) || hsh(cur) || hsh(t)) && !(arr(cur) && arr(t) && cur[1].nil?) && !(arr(cur) && arr(t) && t[1].nil?) || join(cur, t) == :dyn) }
+      f.ptypes.zip(ts).any? { |cur, t| cur && t && cur != t && ((arr(cur) || arr(t) || hsh(cur) || hsh(t)) && !(arr(cur) && arr(t) && cur[1].nil?) && !(arr(cur) && arr(t) && t[1].nil?) || join(cur, t) == :dyn || int_float?(cur, t)) }
     end
+    # an Integer and a Float caller of the same prelude function get separate instances: joining
+    # to Float would turn 10.clamp(1, 5) into 5.0
+    def self.int_float?(a, b) = (%i[int int?].include?(a) && b == :float) || (a == :float && %i[int int?].include?(b))
+
     # a generic already shaped by another caller, called with a container whose elements are
     # not known yet: neither join nor instance -- wait for the elements
     def self.deferred_generic?(f, ts)
@@ -521,7 +538,9 @@ module Indus
       when :fld_set then yield i.args[2], ivar_type(of(f, i.args[0]), i.args[1])
       when :cell_set then (t = of(f, i.args[0])) && cell?(t) && (yield i.args[1], t[1])
       when :gset then yield i.args[1], @consts[i.args[0]]
-      when :call then i.args[1..].each_with_index { |v, k| yield v, i.args[0].ptypes[k] }
+      when :call # a generic prelude function takes an instance per container type: no widening of the argument towards another caller's shape
+        gen = generic?(i.args[0])
+        i.args[1..].each_with_index { |v, k| d = i.args[0].ptypes[k]; yield v, (gen && d.is_a?(Array) && (t = of(f, v)).is_a?(Array) && t != d ? nil : d) }
       when :ret then yield i.args[0], f.rtype unless f.result_unused
       when :phi then i.args.each { |(_, v)| yield v, i.ty } unless f.result_unused && f.all.all? { |u| !(u.op == :phi ? u.args.map(&:last) : u.args).include?(i) || u.op == :ret }
       end
@@ -675,7 +694,7 @@ module Indus
     # an operator on a tagged scalar: the prelude dispatches on the tags.
     # cmp.eq/ne give a bool; the ordering compares and arithmetic give a :dyn
     # (Integer + Integer may be Float + ..., String + String is a String).
-    DYN_OPS = { add: :__dyn_add, sub: :__dyn_sub, mul: :__dyn_mul, div: :__dyn_div,
+    DYN_OPS = { add: :__dyn_add, sub: :__dyn_sub, mul: :__dyn_mul, div: :__dyn_div, mod: :__dyn_mod,
                 eq: :__dyn_eq, ne: :__dyn_ne, lt: :__dyn_lt, le: :__dyn_le, gt: :__dyn_gt, ge: :__dyn_ge }.freeze
     def self.dyn_op(f, i)
       name = i.op == :cmp ? DYN_OPS.fetch(i.cond) : DYN_OPS.fetch(i.op)
@@ -749,6 +768,8 @@ module Indus
         case [t, name]
         in [:str | [:arr, *], :length | :size | :bytesize] then i.op = :alen; i.args = [recv]; return
         in [:int, :to_i] then i.op = :nop; i.args = [recv]; i.ty = :int; return
+        in [:sym, :to_s] then i.op = :call; i.args = [fn(:__sym_name), recv]; i.ty = :str; return
+        in [:sym, :inspect] then i.op = :call; i.args = [fn(:__sym_inspect), recv]; i.ty = :str; return
         in [:int, :to_f] then i.op = :itof; i.args = [recv]; i.ty = :float; return
         in [:float, :to_i] then i.op = :to_i; i.args = [recv]; i.ty = :int; return
         in [:float, :to_f] then i.op = :nop; i.args = [recv]; i.ty = :float; return
@@ -927,7 +948,7 @@ module Indus
         l, r = of(f, a[0]), of(f, a[1])
         l && r ? join(narrow(l), narrow(r)) : nil # both sides known, or no guess: a str * n is not an int
       when :and, :or then (of(f, a[0]) == :bool && of(f, a[1]) == :bool) ? :bool : :int
-      when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub then :int
+      when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub, :handle then :int
       when :cmp, :ucmp, :isa, :isa_dyn then :bool
       when :box then :dyn
       when :unbox then a[1]
@@ -942,13 +963,18 @@ module Indus
       when :anew then (t = of(f, a[1])) && t != :nil ? [:arr, t] : [:arr, nil] # partial until a store
       when :hnew then [:hash, nil, nil]
       when :hget then (t = of(f, a[0])) && hsh(t) ? nullable(t[2]) : nil
-      when :hset then of(f, a[0])
+      when :hset, :hset_raw then of(f, a[0])
       when :hkey then :bool
       when :hkeys then (t = of(f, a[0])) && hsh(t) ? [:arr, t[1]] : nil
       when :ssub then :str
       when :aget then (t = of(f, a[0])) && arr(t) ? nullable(t[1]) : nil
       when :aset then of(f, a[0])
-      when :phi then a.map { of(f, _2) }.reduce(nil) { join(_1, _2) }
+      when :phi
+        # an Integer meeting a Float at a branch merge keeps its identity (cond ? 1 : 2.0 prints 1, not 1.0);
+        # at a loop header it becomes a Float (x = 0; loop { x += 0.5 }): the arithmetic is the same and
+        # the loop stays untagged
+        header = i.block.name.to_s.start_with?("head", "retry")
+        a.map { of(f, _2) }.reduce(nil) { header ? join(_1, _2) : join_elem(_1, _2) }
       when :call
         # a generic prelude function may still be swapped for an instance once the argument
         # types are known: commit to no result type before then
@@ -991,7 +1017,7 @@ module Indus
               i.cond = :"f#{i.cond}" if i.op == :cmp
             end
           when :fsqrt then i.args[0] = coerce(f, b, i, i.args[0], :float)
-          when :libm then i.args[1] = coerce(f, b, i, i.args[1], :float)
+          when :libm then i.args[1..].each_with_index { |v, k| i.args[k + 1] = coerce(f, b, i, v, :float) }
           when :pow
             if i.ty == :float then i.args.map! { |v| coerce(f, b, i, v, :float) }; i.op = :fpow
             else i.op = :ipow end
@@ -1009,7 +1035,7 @@ module Indus
       case i.op
       when :aset
         t = of(f, i.args[0]); yield i.args[2], t[1], ->(w) { i.args[2] = w } if arr(t)
-      when :hset
+      when :hset, :hset_raw
         t = of(f, i.args[0])
         if hsh(t) then yield i.args[1], t[1], ->(w) { i.args[1] = w }; yield i.args[2], t[2], ->(w) { i.args[2] = w } end
       when :hget, :hkey # a lookup key takes the hash's key representation too
@@ -1022,6 +1048,16 @@ module Indus
       end
     end
 
+    def self.unbox_fn(dest)
+      case dest
+      when :int, :int? then :__dyn_int
+      when :str then :__dyn_str
+      when :sym then :__dyn_sym
+      when :float then :__dyn_float
+      else arr(dest) ? :__dyn_arr : hsh(dest) ? :__dyn_hash : nil
+      end
+    end
+
     # the value v as the slot type dest, or v itself when no change of representation is needed
     def self.coerce(f, blk, before, v, dest)
       t = of(f, v)
@@ -1029,6 +1065,7 @@ module Indus
       c = case
           when dest == :float && (t == :int || t == :int?) then Inst.new(:itof, [v]).tap { _1.ty = :float } # a nil here would have raised already
           when dest == :dyn && t != :dyn then Inst.new(:box, [v, t]).tap { _1.ty = :dyn }
+          when t == :dyn && (un = unbox_fn(dest)) then Inst.new(:call, [fn(un), v]).tap { _1.ty = dest } # a tagged value into a typed slot: unbox, trapping on the wrong tag
           when big?(dest) && %i[int int?].include?(t) then Inst.new(:call, [fn(:__big_from_int), v]).tap { _1.ty = BIG }
           else return v
           end

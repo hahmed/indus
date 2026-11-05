@@ -235,6 +235,7 @@ module Indus
         when :zcheck # divisor nonzero, or raise (the raiser never returns here)
           ok = @asm.uniq
           @asm.cbnz(reg(i.args[1]), ok); @asm.bl(i.args[0].name); @asm.label(ok)
+        when :handle then @asm.mov(d, reg(i.args[0]))
         when :class_id then @asm.ldr_off(d, reg(i.args[0]), 0) # word 0 of an object: its class id
         when :isa_tag then @asm.ldr_off(16, reg(i.args[0]), 0); @asm.cmpi(16, i.args[1]); @asm.cset(d, :eq)
         when :isa_tags # class id in word 0 is one of several (a rescue matching a class and its descendants)

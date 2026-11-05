@@ -43,3 +43,8 @@ worst.each { |k, v| puts "#{k}: #{v} ulp" }
 bad = worst.select { |k, v| v > (k == :pow ? 128 : k == :pow_int ? 16 : k.to_s.end_with?("large") ? 2 : 1) } # pow is exp(y log x): the log error times y; ~1e-14 relative
 abort "too inaccurate: #{bad.inspect}" unless bad.empty?
 puts "ok"
+w2 = w10 = 0
+5000.times { x = rng.rand * 10.0 ** rng.rand(-5..8); w2 = [w2, ulps(__libm_log2(x), Math.log2(x))].max; w10 = [w10, ulps(__libm_log10(x), Math.log10(x))].max }
+[1.0, 2.0, 8.0, 1024.0, 10.0, 100.0, 1000.0, 1.0e6].each { |x| w2 = [w2, ulps(__libm_log2(x), Math.log2(x))].max; w10 = [w10, ulps(__libm_log10(x), Math.log10(x))].max }
+puts "log2: #{w2} ulp, log10: #{w10} ulp"
+abort "log2/log10 inaccurate" if w2 > 2 || w10 > 1 # log2: k + l/ln2 rounds twice

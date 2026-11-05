@@ -285,3 +285,87 @@ def __libm_pow(x, y)
   return 0.0 / 0.0 if x < 0.0 # a non-integer power of a negative number
   __libm_exp(y * __libm_log(x))
 end
+
+# the rest of Math, on top of exp/log/sin/cos
+# log2 / log10 as fdlibm does them: split the exponent out exactly, scale the rest with a
+# two-part constant (1/ln2, 1/ln10 as hi + lo), so exact powers come out exact
+def __libm_log2(x)
+  return x if x != x
+  return -1.0e308 * 10.0 if x == 0.0
+  return 0.0 / 0.0 if x < 0.0
+  bits = __fbits(x)
+  k = ((bits >> 52) & 0x7ff) - 1023
+  m = __ffrom((bits & 0x800fffffffffffff) | (1023 << 52)) # x = m * 2^k, m in [1, 2)
+  if m > 1.4142135623730951
+    m = m * 0.5
+    k = k + 1
+  end
+  f = m - 1.0
+  l = __libm_log1p_small(f)
+  k.to_f + l * 1.4426950407214463 + l * 1.6751713164886512e-10
+end
+
+def __libm_log10(x)
+  return -1.0e308 * 10.0 if x == 0.0
+  return 0.0 / 0.0 if x < 0.0
+  bits = __fbits(x)
+  k = ((bits >> 52) & 0x7ff) - 1023
+  m = __ffrom((bits & 0x800fffffffffffff) | (1023 << 52))
+  if m > 1.4142135623730951
+    m = m * 0.5
+    k = k + 1
+  end
+  f = m - 1.0
+  l = __libm_log1p_small(f)
+  kf = k.to_f
+  # log10(x) = k * log10(2) + log(m) / ln10, with the constants in two parts
+  hi = kf * 3.01029995663611771306e-01
+  lo = kf * 3.69423907715893078616e-13
+  hi + (l * 4.34294481903251816668e-01 + (l * 1.96596497470473636125e-17 + lo))
+end
+
+# log(1 + f) for f in [sqrt(2)/2 - 1, sqrt(2) - 1], fdlibm's series
+def __libm_log1p_small(f)
+  return 0.0 if f == 0.0
+  s = f / (2.0 + f)
+  z = s * s
+  w = z * z
+  t1 = w * (3.999999999940941908e-01 + w * (2.222219843214978396e-01 + w * 1.531383769920937332e-01))
+  t2 = z * (6.666666666666735130e-01 + w * (2.857142874366239149e-01 + w * (1.818357216161805012e-01 + w * 1.479819860511658591e-01)))
+  hfsq = 0.5 * f * f
+  f - (hfsq - s * (hfsq + t1 + t2))
+end
+def __libm_cbrt(x)
+  return x if x == 0.0 || x != x
+  neg = x < 0.0
+  x = -x if neg
+  y = __libm_exp(__libm_log(x) / 3.0)
+  y = y - (y * y * y - x) / (3.0 * y * y) # one Newton step
+  y = y - (y * y * y - x) / (3.0 * y * y)
+  neg ? -y : y
+end
+def __libm_hypot(a, b) = Math.sqrt(a * a + b * b)
+def __libm_tan(x) = __libm_sin(x) / __libm_cos(x)
+# atan on [0, 1] by the series after argument halving; the rest by identities
+def __libm_atan(x)
+  return x if x != x
+  neg = x < 0.0
+  x = -x if neg
+  inv = x > 1.0
+  x = 1.0 / x if inv
+  # halve twice: atan(x) = 2 atan(x / (1 + sqrt(1 + x^2)))
+  x = x / (1.0 + Math.sqrt(1.0 + x * x))
+  x = x / (1.0 + Math.sqrt(1.0 + x * x))
+  z = x * x
+  r = x * (1.0 - z * (1.0 / 3.0 - z * (1.0 / 5.0 - z * (1.0 / 7.0 - z * (1.0 / 9.0 - z * (1.0 / 11.0 - z * (1.0 / 13.0 - z * (1.0 / 15.0 - z / 17.0))))))))
+  r = r * 4.0
+  r = 1.5707963267948966 - r if inv
+  neg ? -r : r
+end
+def __libm_atan2(y, x)
+  if x > 0.0 then __libm_atan(y / x)
+  elsif x < 0.0 then y >= 0.0 ? __libm_atan(y / x) + 3.141592653589793 : __libm_atan(y / x) - 3.141592653589793
+  else y > 0.0 ? 1.5707963267948966 : (y < 0.0 ? -1.5707963267948966 : 0.0) end
+end
+def __libm_asin(x) = __libm_atan2(x, Math.sqrt(1.0 - x * x))
+def __libm_acos(x) = __libm_atan2(Math.sqrt(1.0 - x * x), x)

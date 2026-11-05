@@ -218,6 +218,13 @@ def __dyn_mul(a, b)
   __box_float(__dyn_num(a) * __dyn_num(b))
 end
 
+def __dyn_mod(a, b)
+  if __dyn_both_int(a, b)
+    return __box_int(__unbox_int(a) % __unbox_int(b))
+  end
+  __box_float(__dyn_num(a) % __dyn_num(b))
+end
+
 def __dyn_div(a, b)
   if __dyn_both_int(a, b)
     return __box_int(__unbox_int(a) / __unbox_int(b))
@@ -850,7 +857,9 @@ def __arr_join(a, sep)
   i = 0
   while i < a.length
     out = out + sep if i > 0
-    out = out + a[i].to_s
+    e = a[i]
+    if __is_dyn(e) && __dyn_arr_p(e) then out = out + __arr_join(__dyn_arr(e), sep) # nested arrays join recursively
+    else out = out + e.to_s end
     i = i + 1
   end
   out
@@ -1017,4 +1026,20 @@ def __class_name(id) = CLASS_NAMES[id]
 
 def __raise_zero_div
   raise ZeroDivisionError, "divided by 0"
+end
+
+def __dyn_arr_p(v) = __tag(v) == 4
+
+def __dyn_float(v)
+  __trap if __tag(v) != 14
+  __unbox_float(v)
+end
+def __dyn_hash(v)
+  __trap if __tag(v) != 6
+  __unbox_hash(v)
+end
+
+def __dyn_sym(v)
+  __trap if __tag(v) != 12
+  __unbox_sym(v)
 end

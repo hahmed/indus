@@ -491,6 +491,7 @@ module Indus
       end
     end
 
+    def nil_const = (c = const(0); c.ty = :nil; c)
     def me_val = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
     # append to the *current* block after the arguments have been evaluated
     # (lowering an argument may move @cur: loops, inlining)
@@ -881,7 +882,36 @@ module Indus
       elsif n.name == :to_s && args.empty? && n.receiver.nil? then raise "to_s with no receiver outside a class defining it"
       elsif n.name == :to_s && args.empty? then to_s(expr(n.receiver))
       elsif n.name == :+@ && args.empty? then expr(n.receiver) # +"" : literals are already fresh copies
+      elsif n.name == :clamp && args.size == 2 && n.receiver # x.clamp(lo, hi) returns lo or hi themselves (an Integer bound stays an Integer)
+        x = expr(n.receiver); lo = expr(args[0]); hi = expr(args[1])
+        below = emit(:cmp, [x, lo], :lt)
+        tb, eb, mb = @f.new_block(:cl), @f.new_block(:ch), @f.new_block(:cm)
+        emit(:condbr, [below, tb, eb])
+        @cur = tb; emit(:br, [mb])
+        @cur = eb
+        above = emit(:cmp, [x, hi], :gt)
+        tb2, eb2, mb2 = @f.new_block(:cl2), @f.new_block(:ch2), @f.new_block(:cm2)
+        emit(:condbr, [above, tb2, eb2])
+        @cur = tb2; emit(:br, [mb2]); @cur = eb2; emit(:br, [mb2])
+        @cur = mb2; inner = mb2.phi; inner.args = [[tb2, hi], [eb2, x]]; emit(:br, [mb])
+        @cur = mb; p = mb.phi; p.args = [[tb, lo], [mb2, inner]]; p
       elsif n.name == :~ && args.empty? && n.receiver then emit(:xor, [expr(n.receiver), const(-1)]) # bitwise not
+      elsif n.name == :first && args.size == 1 && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :cycle && n.receiver.arguments.nil? && n.receiver.receiver
+        emit(:call, [demand(:__arr_cycle_first), expr(n.receiver.receiver), expr(args[0])]) # xs.cycle.first(n): the only finite view of a cycle
+      elsif n.name == :step && args.size == 1 && n.receiver.is_a?(Prism::ParenthesesNode) && n.receiver.body.body.last.is_a?(Prism::RangeNode) # (a..b).step(n)
+        rg = n.receiver.body.body.last
+        hi = rg.exclude_end? ? emit(:sub, [expr(rg.right), const(1)]) : expr(rg.right)
+        emit(:call, [demand(:__num_step_to), expr(rg.left), hi, expr(args[0])])
+      elsif n.name == :step && args.size == 2 && n.receiver # a.step(b, by)
+        emit(:call, [demand(:__num_step_to), expr(n.receiver), expr(args[0]), expr(args[1])])
+      elsif n.name == :sqrt && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Integer
+        emit(:call, [demand(:__num_isqrt), expr(args[0])])
+      elsif %i[cbrt hypot log2 log10 log exp atan2 atan tan asin acos].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
+        emit(:libm, [n.name, *args.map { expr(_1) }]) # libm in-process; the Ruby libm (rt/libm.rb) standalone
+      elsif n.name == :rand && n.receiver.nil? && args.size <= 1
+        if args.empty? then emit(:call, [demand(:__rand_float)])
+        elsif args[0].is_a?(Prism::RangeNode) then emit(:call, [demand(:__rand_range), expr(args[0].left), expr(args[0].right)])
+        else emit(:call, [demand(:__rand_int), expr(args[0])]) end
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array
         len = args[0] ? expr(args[0]) : const(0); fill = args[1] ? expr(args[1]) : (c = const(0); c.ty = :nil; c)
         emit(:anew, [len, fill])
@@ -922,7 +952,9 @@ module Indus
       elsif n.name == :clock_gettime && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Process
         emit(:clock, [])                 # Process.clock_gettime(any clock): monotonic seconds as a Float
       elsif n.name == :round && args.size == 1 && n.receiver
-        if args[0].is_a?(Prism::IntegerNode) && args[0].value <= 0 # x.round(0) is an Integer in Ruby
+        if kind_of(n.receiver) == :int || n.receiver.is_a?(Prism::IntegerNode) || n.receiver.is_a?(Prism::ParenthesesNode) && n.receiver.body.body.last.is_a?(Prism::IntegerNode)
+          emit(:call, [demand(:__num_round_int), expr(n.receiver), expr(args[0])]) # Integer#round(-n): tens, hundreds
+        elsif args[0].is_a?(Prism::IntegerNode) && args[0].value <= 0 # x.round(0) is an Integer in Ruby
           emit(:call, [demand(:__float_round0), expr(n.receiver)])
         else
           emit(:call, [demand(:__float_round), expr(n.receiver), expr(args[0])])
@@ -961,6 +993,11 @@ module Indus
         outv = :"toa#{@f.blocks.size}:out"; @locals[outv] = arr
         counted_loop(const(0), len, :lt, [], []) { |i, _ps, _pfx| @locals[outv] = emit(:aset, [@locals[outv], i, emit(:add, [lo, i])]) }
         @locals.delete(outv)
+      elsif n.name == :insert && args.size == 2 && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode) || n.receiver.is_a?(Prism::ArrayNode))
+        r = emit(:call, [demand(:__arr_insert), expr(n.receiver), expr(args[0]), expr(args[1])]) # grows: rebind the home, as push does
+        if n.receiver.is_a?(Prism::LocalVariableReadNode) then @locals[lname(n.receiver.name)] = r
+        elsif n.receiver.is_a?(Prism::InstanceVariableReadNode) then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
+        r
       elsif n.name == :push && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode)) && !((k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k])
         a = expr(n.receiver); v = expr(args[0]); len = emit(:alen, [a])
         r = emit(:aset, [a, len, v]) # may grow: rebind the home
@@ -1068,6 +1105,7 @@ module Indus
     # raw memory / addresses for the collector (lib/indus/rt/gc.rb)
     def intrinsic(name, args)
       case name
+      when :__handle then emit(:handle, [expr(args[0])]) # a container's address as an integer (raw memory below)
       when :__ld then emit(:rawld, [expr(args[0])])
       when :__ld32 then emit(:rawld32, [expr(args[0])])
       when :__ld8 then emit(:rawld8, [expr(args[0]), expr(args[1])])          # byte i of string s
@@ -1079,6 +1117,7 @@ module Indus
       when :__hkey_at then emit(:hkey_at, [expr(args[0]), expr(args[1])])
       when :__hval_at then emit(:hval_at, [expr(args[0]), expr(args[1])])
       when :__hkey_p then emit(:hkey, [expr(args[0]), expr(args[1])])
+      when :__hset_raw then emit(:hset_raw, [expr(args[0]), expr(args[1]), expr(args[2])]) # store into a hash in its own representation (tagged key/value unboxed), no widening
       # the five file primitives, libc in-process (a standalone binary needs the syscalls; refused until then)
       when :__sys_open then emit(:sys, [:open, expr(args[0]), expr(args[1])])   # open(path, O_RDONLY): no mode (libc open is variadic; Apple arm64 passes variadic args on the stack)
       when :__sys_creat then emit(:sys, [:creat, expr(args[0]), expr(args[1])]) # creat(path, mode) = open(path, O_WRONLY|O_CREAT|O_TRUNC, mode), not variadic
@@ -1118,6 +1157,7 @@ module Indus
       when :__unbox_float then emit(:unbox, [expr(args[0]), :float])
       when :__unbox_bool then emit(:unbox, [expr(args[0]), :bool])
       when :__unbox_sym then emit(:unbox, [expr(args[0]), :sym])
+      when :__unbox_hash then emit(:unbox, [expr(args[0]), [:hash, :dyn, :dyn]])
       when :__gset_int then (v = expr(args[1]); emit(:gset, [args[0].unescaped.to_sym, v]); v)
       when :__gget_int then emit(:gget, [args[0].unescaped.to_sym])
       else raise "unknown intrinsic #{name}"
@@ -1145,6 +1185,56 @@ module Indus
       end
       if n.receiver && !@recv_value && n.name == :map && times_enum?(n.receiver)
         return iterate_array_value(n, args, range_array(n.receiver))
+      end
+      # block methods defined by a map over the receiver plus a prelude pass on the results
+      # (a mask of truths, or the mapped values): one lowering each, no new loop kinds
+      if n.receiver && blk.is_a?(Prism::BlockNode) && !%i[each map].include?(n.name)
+        mapped = ->(recv_node = n.receiver) { iterate_array_value(n.copy(name: :map), args, @recv_value || expr(recv_node)) }
+        case n.name
+        when :filter_map then return emit(:call, [demand(:__arr_compact), mapped.()])
+        when :take_while, :drop_while, :index, :find_index, :one?
+          arr = @recv_value || expr(n.receiver)
+          mask = iterate_array_value(n.copy(name: :map), args, arr)
+          return emit(:call, [demand(:"__arr_#{n.name.to_s.delete('?')}_mask"), arr, mask])
+        when :delete_if
+          arr = @recv_value || expr(n.receiver)
+          kept = iterate_array_value(n.copy(name: :reject), args, arr)
+          return emit(:call, [demand(:__arr_replace), arr, kept])
+        when :chunk_while, :slice_when
+          arr = @recv_value || expr(n.receiver)
+          pairs = emit(:call, [demand(:__arr_each_cons1), arr, const(2)])
+          mask = iterate_array_value(n.copy(name: :map), args, pairs)
+          return emit(:call, [demand(:"__arr_#{n.name}_mask"), arr, mask])
+        when :to_h then return emit(:call, [demand(:__pairs_to_hash), mapped.()]) if kind_of(n.receiver) != :hash
+        when :sort then raise "sort with a comparator block: not supported yet (sort_by, or sort.reverse)"
+        when :with_index # xs.map.with_index { |x, i| }
+          r = n.receiver
+          if r.is_a?(Prism::CallNode) && r.name == :map && r.block.nil? && r.arguments.nil? && r.receiver
+            pairs = emit(:mcall, [:each_with_index_pairs, expr(r.receiver)])
+            return iterate_array_value(n.copy(name: :map), args, pairs)
+          end
+        end
+      end
+      # a hash with a |k, v| block: iterate its pairs as an array; what yields a selection of
+      # pairs comes back as a hash, what yields a value stays a value
+      if n.receiver && !@recv_value && kind_of(n.receiver) == :hash && blk
+        case n.name
+        when :select, :filter, :reject
+          r = n.copy(name: n.name == :reject ? :reject : :select)
+          return emit(:call, [demand(:__pairs_to_hash), iterate_array_value(r, args, hash_pairs(expr(n.receiver)))])
+        when :sum, :count, :find, :detect, :any?, :all?, :none?, :group_by, :min_by, :max_by, :partition, :each_with_object, :flat_map, :each_with_index, :reduce, :inject, :filter_map
+          return iterate_array_value(n, args, hash_pairs(expr(n.receiver)))
+        when :to_h # h.to_h { |k, v| [k2, v2] }
+          return emit(:call, [demand(:__pairs_to_hash), iterate_array_value(n.copy(name: :map), args, hash_pairs(expr(n.receiver)))])
+        when :transform_values
+          h = expr(n.receiver)
+          vals = iterate_array_value(n.copy(name: :map), args, emit(:call, [demand(:__hash_values), h]))
+          return emit(:call, [demand(:__hash_rekey), emit(:hkeys, [h]), vals])
+        when :transform_keys
+          h = expr(n.receiver)
+          keys = iterate_array_value(n.copy(name: :map), args, emit(:hkeys, [h]))
+          return emit(:call, [demand(:__hash_rekey), keys, emit(:call, [demand(:__hash_values), h])])
+        end
       end
       if blk.is_a?(Prism::BlockArgumentNode) # m(&:sym) is m { |e| e.sym }
         sym = blk.expression.unescaped.to_sym
@@ -1229,7 +1319,7 @@ module Indus
         @locals[resv] = case n.name when :all? then const(1) when :any?, :none? then const(0) when :find, :detect then (c = const(0); c.ty = :nil; c) else const(-1) end
         len = emit(:alen, [arr])
         counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
-          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          bind_elem(ps, pfx, emit(:aget, [arr, i]))
           @pred_target = [resv, n.name, emit(:aget, [arr, i]), i]
         end
         r = @locals.delete(resv)
@@ -1241,7 +1331,7 @@ module Indus
         @locals[hv] = emit(:hnew, [])
         len = emit(:alen, [arr])
         counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
-          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          bind_elem(ps, pfx, emit(:aget, [arr, i]))
           @group_target = [hv, emit(:aget, [arr, i])]
         end
         return @locals.delete(hv)
@@ -1251,7 +1341,7 @@ module Indus
         @locals[yes] = emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)]); @locals[no] = emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)])
         len = emit(:alen, [arr])
         counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
-          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          bind_elem(ps, pfx, emit(:aget, [arr, i]))
           @partition_target = [yes, no, emit(:aget, [arr, i])]
         end
         pair = emit(:anew, [const(2), (c = const(0); c.ty = :nil; c)])
@@ -1261,7 +1351,7 @@ module Indus
         mv = :"ewo#{@f.blocks.size}:m"; @locals[mv] = memo
         len = emit(:alen, [arr])
         counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
-          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          bind_elem(ps, pfx, emit(:aget, [arr, i]))
           @locals[:"#{pfx}#{ps[1]}"] = @locals[mv] if ps[1]
           @memo_target = [mv, :"#{pfx}#{ps[1]}"] if ps[1] # the block may grow the memo: take its view back
         end
@@ -1272,7 +1362,7 @@ module Indus
         @locals[outv] = emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)])
         len = emit(:alen, [arr])
         counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
-          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          bind_elem(ps, pfx, emit(:aget, [arr, i]))
           @flat_target = outv
         end
         return @locals.delete(outv)
@@ -1282,7 +1372,7 @@ module Indus
         @locals[outv] = emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)])
         len = emit(:alen, [arr])
         counted_loop(const(0), len, :lt, params, body) do |i, ps, pfx|
-          @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]
+          bind_elem(ps, pfx, emit(:aget, [arr, i]))
           @select_target = [outv, emit(:aget, [arr, i]), n.name == :reject]
         end
         return @locals.delete(outv)
@@ -1294,8 +1384,8 @@ module Indus
         if r.is_a?(Prism::RangeNode)
           counted_loop(expr(r.left), expr(r.right), r.exclude_end? ? :lt : :le, params, body, &iter)
         else
-          arr = expr(recv); len = emit(:alen, [arr])
-          counted_loop(const(0), len, :lt, params, body) { |i, ps, pfx| @locals[:"#{pfx}#{ps[0]}"] = emit(:aget, [arr, i]) if ps[0]; @sum_target = [accv, n.name] }
+          arr = recv_val(recv); len = emit(:alen, [arr])
+          counted_loop(const(0), len, :lt, params, body) { |i, ps, pfx| bind_elem(ps, pfx, emit(:aget, [arr, i])); @sum_target = [accv, n.name] }
         end
         return @locals.delete(accv)
       when :each, :map, :each_with_index, :each_pair
@@ -1492,6 +1582,13 @@ module Indus
       const(0)
     end
 
+    # the block's element parameter(s): |x|, or |k, v| destructuring a pair
+    def bind_elem(ps, pfx, el)
+      return if ps.empty?
+      if ps.size >= 2 then ps.each_with_index { |pn, k| @locals[:"#{pfx}#{pn}"] = emit(:idx, [el, const(k)]) }
+      else @locals[:"#{pfx}#{ps[0]}"] = el end
+    end
+
     def array_loop(arr, kind, params, body)
       len = emit(:alen, [arr])
       out = (emit(:anew, [len, (c = const(0); c.ty = :nil; c)])) if kind == :map
@@ -1577,7 +1674,7 @@ module Indus
       tfacts, efacts = facts(n.predicate, !negate), facts(n.predicate, negate)
 
       @cur = tb; narrow(tfacts)
-      tv = (n.statements&.body || []).map { expr(_1) }.last || const(0)
+      tv = (n.statements&.body || []).map { expr(_1) }.last || nil_const # an empty arm is nil
       unnarrow(tfacts, before)
       tend, tlocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
 
@@ -1586,7 +1683,7 @@ module Indus
       ev = case sub
            when Prism::IfNode then if_expr(sub)
            when Prism::ElseNode then sub.statements&.body&.map { expr(_1) }&.last
-           end || const(0)
+           end || nil_const # no else: the if is nil when the condition fails
       unnarrow(efacts, before)
       eend, elocals = @cur, @locals; emit(:br, [mb]) unless @cur.term
 

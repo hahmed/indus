@@ -633,10 +633,11 @@ def __arr_join0(a) = __arr_join(a, "")
 
 # a's contents become b's; a keeps its identity (the bang methods)
 def __arr_replace(a, b)
+  __trap if b.length > a.length # growth through a parameter is not visible to the caller (no in-place growth yet)
   a.pop while a.length > b.length
   i = 0
   while i < b.length
-    if i < a.length then a[i] = b[i] else a.push(b[i]) end
+    a[i] = b[i]
     i = i + 1
   end
   a
@@ -664,4 +665,622 @@ def __num_to_s1(n, base)
     n = n / base
   end
   neg ? "-" + out : out
+end
+
+# [[k, v], ...] back into a hash (what a hash's select/reject/to_h yield)
+def __pairs_to_hash(pairs)
+  h = {}
+  i = 0
+  while i < pairs.length
+    h[pairs[i][0]] = pairs[i][1]
+    i = i + 1
+  end
+  h
+end
+
+# keys and values, parallel arrays, as a hash (transform_keys / transform_values)
+def __hash_rekey(keys, vals)
+  h = {}
+  i = 0
+  while i < keys.length
+    h[keys[i]] = vals[i]
+    i = i + 1
+  end
+  h
+end
+
+# ---- breadth batch 3 ----------------------------------------------------------------
+
+def __arr_transpose(a)
+  return [] if a.length == 0
+  w = a[0].length
+  out = []
+  j = 0
+  while j < w
+    row = []
+    i = 0
+    while i < a.length
+      __trap if a[i].length != w # ragged rows: IndexError in Ruby
+      row.push(a[i][j])
+      i = i + 1
+    end
+    out.push(row)
+    j = j + 1
+  end
+  out
+end
+
+# the first n of the cycle (an endless cycle has no array form)
+def __arr_cycle_first(a, n)
+  out = []
+  return out if a.length == 0
+  i = 0
+  while i < n
+    out.push(a[i % a.length])
+    i = i + 1
+  end
+  out
+end
+
+# combinations by index counting (no recursion: arrays do not grow through parameters)
+def __arr_combination(a, k)
+  out = []
+  return out if k > a.length || k < 0
+  idx = []
+  i = 0
+  while i < k
+    idx.push(i)
+    i = i + 1
+  end
+  loop_on = true
+  while loop_on
+    row = []
+    i = 0
+    while i < k
+      row.push(a[idx[i]])
+      i = i + 1
+    end
+    out.push(row)
+    # advance: the rightmost index that can still move
+    j = k - 1
+    j = j - 1 while j >= 0 && idx[j] == a.length - k + j
+    if j < 0
+      loop_on = false
+    else
+      idx[j] = idx[j] + 1
+      t = j + 1
+      while t < k
+        idx[t] = idx[t - 1] + 1
+        t = t + 1
+      end
+    end
+  end
+  out
+end
+
+# k-permutations: every combination, each in every order (Heap's algorithm, iterative)
+def __arr_permutation(a, k)
+  out = []
+  combos = __arr_combination(a, k)
+  c = 0
+  while c < combos.length
+    perms = __arr_all_orders(combos[c])
+    i = 0
+    while i < perms.length
+      out.push(perms[i])
+      i = i + 1
+    end
+    c = c + 1
+  end
+  __arr_sort_by(out, __arr_perm_keys(out, a)) # Ruby yields in index order of the first element, then the next...
+end
+
+def __arr_permutation0(a) = __arr_permutation(a, a.length)
+
+# a sort key per permutation: positions of its elements in the source, as one integer
+def __arr_perm_keys(perms, a)
+  keys = []
+  p = 0
+  while p < perms.length
+    key = 0
+    i = 0
+    while i < perms[p].length
+      key = key * (a.length + 1) + __arr_index_of(a, perms[p][i])
+      i = i + 1
+    end
+    keys.push(key)
+    p = p + 1
+  end
+  keys
+end
+
+def __arr_index_of(a, v)
+  i = 0
+  while i < a.length
+    return i if a[i] == v
+    i = i + 1
+  end
+  -1
+end
+
+def __arr_all_orders(items)
+  n = items.length
+  out = [items.dup]
+  c = []
+  i = 0
+  while i < n
+    c.push(0)
+    i = i + 1
+  end
+  cur = items.dup
+  i = 0
+  while i < n
+    if c[i] < i
+      if i % 2 == 0
+        t = cur[0]; cur[0] = cur[i]; cur[i] = t
+      else
+        t = cur[c[i]]; cur[c[i]] = cur[i]; cur[i] = t
+      end
+      out.push(cur.dup)
+      c[i] = c[i] + 1
+      i = 0
+    else
+      c[i] = 0
+      i = i + 1
+    end
+  end
+  out
+end
+
+# lo.step(hi, by): the values, as an array
+def __num_step_to(lo, hi, by)
+  out = []
+  v = lo
+  if by > 0
+    while v <= hi
+      out.push(v)
+      v = v + by
+    end
+  else
+    while v >= hi
+      out.push(v)
+      v = v + by
+    end
+  end
+  out
+end
+
+def __arr_values_at(a, idxs)
+  out = []
+  i = 0
+  while i < idxs.length
+    out.push(a[idxs[i]])
+    i = i + 1
+  end
+  out
+end
+
+def __hash_values_at(h, keys)
+  out = []
+  i = 0
+  while i < keys.length
+    out.push(h[keys[i]])
+    i = i + 1
+  end
+  out
+end
+
+# insert returns the grown array; the lowering rebinds the receiver local to it
+def __arr_insert(a, at, v)
+  at = a.length + at + 1 if at < 0
+  out = []
+  i = 0
+  while i < at
+    out.push(a[i])
+    i = i + 1
+  end
+  out.push(v)
+  while i < a.length
+    out.push(a[i])
+    i = i + 1
+  end
+  out
+end
+
+def __arr_delete_at(a, at)
+  at = a.length + at if at < 0
+  return nil if at < 0 || at >= a.length
+  v = a[at]
+  i = at
+  while i < a.length - 1
+    a[i] = a[i + 1]
+    i = i + 1
+  end
+  a.pop
+  v
+end
+
+def __arr_assoc(a, key)
+  i = 0
+  while i < a.length
+    return a[i] if a[i][0] == key
+    i = i + 1
+  end
+  nil
+end
+
+def __arr_reverse_each_pairs(a) = __arr_reverse(a) # reverse_each without a block: the reversed array
+
+def __hash_value_p(h, v)
+  i = 0
+  while i < __hcount(h)
+    return true if __hval_at(h, i) == v
+    i = i + 1
+  end
+  false
+end
+
+def __hash_fetch2(h, k, default) = __hkey_p(h, k) ? h[k] : default
+
+def __hash_sort(h)
+  pairs = __hash_to_a(h)
+  keys = __arr_map_first(pairs)
+  if keys.length > 0 && __is_dyn(keys[0]) && __dyn_sym_p(keys[0]) # symbols order by name
+    keys = __arr_sym_names(keys)
+  end
+  __arr_sort_by(pairs, keys)
+end
+
+def __arr_sym_names(a)
+  out = []
+  i = 0
+  while i < a.length
+    out.push(__dyn_to_s(a[i])) # pairs from a hash carry tagged keys
+    i = i + 1
+  end
+  out
+end
+
+def __arr_map_first(pairs)
+  out = []
+  i = 0
+  while i < pairs.length
+    out.push(pairs[i][0])
+    i = i + 1
+  end
+  out
+end
+
+def __hash_to_a(h)
+  out = []
+  i = 0
+  while i < __hcount(h)
+    out.push([__hkey_at(h, i), __hval_at(h, i)])
+    i = i + 1
+  end
+  out
+end
+
+# Open addressing has no cheap delete: keep every other pair, clear the table in place
+# (the handle stays valid for everyone holding it), reinsert. Layout: [-16] cap, [-8] count,
+# cap * 16 bytes of [key, val] slots, then cap words of insertion order.
+def __hash_delete(h, k)
+  return nil unless __hkey_p(h, k)
+  v = h[k]
+  pairs = __hash_to_a(h)
+  base = __handle(h)
+  cap = __ld(base - 16)
+  i = 0
+  while i < cap * 2
+    __st(base + i * 8, 0)
+    i = i + 1
+  end
+  __st(base - 8, 0)
+  i = 0
+  while i < pairs.length
+    __hset_raw(h, pairs[i][0], pairs[i][1]) unless pairs[i][0] == k
+    i = i + 1
+  end
+  v
+end
+
+def __str_rindex(s, pat)
+  i = s.length - pat.length
+  while i >= 0
+    return i if s[i, pat.length] == pat
+    i = i - 1
+  end
+  nil
+end
+
+# "az".succ == "ba": the rightmost alphanumeric run carries
+def __str_succ(s)
+  return "" if s.length == 0
+  chars = s.chars
+  i = chars.length - 1
+  while i >= 0
+    c = chars[i]
+    if c == "z" then chars[i] = "a"
+    elsif c == "Z" then chars[i] = "A"
+    elsif c == "9" then chars[i] = "0"
+    elsif (c >= "a" && c < "z") || (c >= "A" && c < "Z") || (c >= "0" && c < "9")
+      chars[i] = (c.ord + 1).chr
+      return chars.join("")
+    else
+      return chars.join("") # not alphanumeric: Ruby carries past it only when there is something alnum to the left; close enough here
+    end
+    i = i - 1
+  end
+  # carried off the left end: prepend
+  first = s[0]
+  lead = first == "z" || first == "Z" ? (first == "z" ? "a" : "A") : "1"
+  lead + chars.join("")
+end
+
+# parse an integer in a base, stopping at the first bad digit (Ruby's lenient to_i)
+def __str_to_i_base(s, base)
+  i = 0
+  neg = false
+  if s.length > 0 && (s[0] == "-" || s[0] == "+")
+    neg = s[0] == "-"
+    i = 1
+  end
+  # 0x / 0b / 0o prefixes matching the base are allowed
+  if s.length > i + 1 && s[i] == "0"
+    p = s[i + 1]
+    if (base == 16 && (p == "x" || p == "X")) || (base == 2 && (p == "b" || p == "B")) || (base == 8 && (p == "o" || p == "O"))
+      i = i + 2
+    end
+  end
+  n = 0
+  while i < s.length
+    c = s[i]
+    d = -1
+    d = c.ord - 48 if c >= "0" && c <= "9"
+    d = c.ord - 87 if c >= "a" && c <= "z"
+    d = c.ord - 55 if c >= "A" && c <= "Z"
+    break if c == "_"
+    break if d < 0 || d >= base
+    n = n * base + d
+    i = i + 1
+  end
+  neg ? 0 - n : n
+end
+
+def __str_hex(s) = __str_to_i_base(s, 16)
+def __str_oct(s)
+  # 0x/0b prefixes switch the base; otherwise octal
+  return __str_to_i_base(s, 16) if s.length > 1 && s[0] == "0" && (s[1] == "x" || s[1] == "X")
+  return __str_to_i_base(s, 2) if s.length > 1 && s[0] == "0" && (s[1] == "b" || s[1] == "B")
+  __str_to_i_base(s, 8)
+end
+
+# Float#round(n) with a digit count; Integer#round(-n) to tens/hundreds
+def __num_round_int(n, digits)
+  return n if digits >= 0
+  m = 1
+  k = 0
+  while k < 0 - digits
+    m = m * 10
+    k = k + 1
+  end
+  neg = n < 0
+  n = 0 - n if neg
+  q = n / m
+  r = n - q * m
+  q = q + 1 if r * 2 >= m # half away from zero, as Integer#round does
+  neg ? 0 - q * m : q * m
+end
+
+def __arr_max_n(a, n)
+  s = __arr_sort(a)
+  out = []
+  i = s.length - 1
+  while i >= 0 && out.length < n
+    out.push(s[i])
+    i = i - 1
+  end
+  out
+end
+
+def __arr_min_n(a, n)
+  s = __arr_sort(a)
+  out = []
+  i = 0
+  while i < s.length && i < n
+    out.push(s[i])
+    i = i + 1
+  end
+  out
+end
+
+def __arr_sum_str(a, init)
+  out = init
+  i = 0
+  while i < a.length
+    out = out + a[i]
+    i = i + 1
+  end
+  out
+end
+
+def __arr_sample(a) = a[__rand_int(a.length)]
+
+def __arr_shuffle(a)
+  out = a.dup
+  i = out.length - 1
+  while i > 0
+    j = __rand_int(i + 1)
+    t = out[i]
+    out[i] = out[j]
+    out[j] = t
+    i = i - 1
+  end
+  out
+end
+
+# xorshift64*, seeded once per run
+def __rand_int(n)
+  x = $__rand_state
+  x = x ^ (x << 13)
+  x = x ^ __lsr(x, 7)
+  x = x ^ (x << 17)
+  $__rand_state = x
+  r = __lsr(x, 1) % n
+  r
+end
+$__rand_state = 88172645463325252
+
+def __rand_float
+  __lsr($__rand_state = ($__rand_state ^ ($__rand_state << 13)) ^ __lsr($__rand_state, 7), 11).to_f * (2.0 ** -53)
+end
+
+def __num_isqrt(n)
+  return 0 if n <= 0
+  x = n
+  y = (x + 1) / 2
+  while y < x
+    x = y
+    y = (x + n / x) / 2
+  end
+  x
+end
+
+def __num_digits(n)
+  out = []
+  n = 0 - n if n < 0
+  return [0] if n == 0
+  while n > 0
+    out.push(n % 10)
+    n = n / 10
+  end
+  out
+end
+
+def __num_bit_length(n)
+  n = ~n if n < 0
+  c = 0
+  while n > 0
+    n = n >> 1
+    c = c + 1
+  end
+  c
+end
+
+# block methods as a map plus a pass over the mask of truths
+def __arr_take_while_mask(a, mask)
+  out = []
+  i = 0
+  while i < a.length && mask[i]
+    out.push(a[i])
+    i = i + 1
+  end
+  out
+end
+
+def __arr_drop_while_mask(a, mask)
+  i = 0
+  i = i + 1 while i < a.length && mask[i]
+  __arr_slice(a, i, a.length - i)
+end
+
+def __arr_index_mask(a, mask)
+  i = 0
+  while i < mask.length
+    return i if mask[i]
+    i = i + 1
+  end
+  nil
+end
+def __arr_find_index_mask(a, mask) = __arr_index_mask(a, mask)
+
+def __arr_one_mask(a, mask)
+  c = 0
+  i = 0
+  while i < mask.length
+    c = c + 1 if mask[i]
+    i = i + 1
+  end
+  c == 1
+end
+
+# chunk_while: mask[i] says a[i] and a[i+1] belong together
+def __arr_chunk_while_mask(a, mask)
+  out = []
+  return out if a.length == 0
+  cur = [a[0]]
+  i = 1
+  while i < a.length
+    if mask[i - 1]
+      cur.push(a[i])
+    else
+      out.push(cur)
+      cur = [a[i]]
+    end
+    i = i + 1
+  end
+  out.push(cur)
+  out
+end
+
+# slice_when: mask[i] says a slice ends between a[i] and a[i+1]
+def __arr_slice_when_mask(a, mask)
+  out = []
+  return out if a.length == 0
+  cur = [a[0]]
+  i = 1
+  while i < a.length
+    if mask[i - 1]
+      out.push(cur)
+      cur = [a[i]]
+    else
+      cur.push(a[i])
+    end
+    i = i + 1
+  end
+  out.push(cur)
+  out
+end
+
+def __rand_range(lo, hi) = lo + __rand_int(hi - lo + 1)
+def __str_next(s) = __str_succ(s)
+def __str_to_i1(s, base) = __str_to_i_base(s, base)
+def __num_step2(lo, hi, by) = __num_step_to(lo, hi, by)
+def __arr_max1(a, n) = __arr_max_n(a, n)
+def __arr_min1(a, n) = __arr_min_n(a, n)
+def __arr_sum1(a, init) = __arr_sum_str(a, init)
+def __arr_combination1(a, k) = __arr_combination(a, k)
+def __arr_permutation1(a, k) = __arr_permutation(a, k)
+def __arr_reverse_each(a) = __arr_reverse(a)
+def __arr_to_h(pairs) = __pairs_to_hash(pairs)
+def __arr_values_at1(a, i) = __arr_values_at(a, [i])
+def __arr_insert2(a, at, v) = __arr_insert(a, at, v)
+def __arr_delete_at1(a, at) = __arr_delete_at(a, at)
+def __arr_assoc1(a, k) = __arr_assoc(a, k)
+def __hash_value_p1(h, v) = __hash_value_p(h, v)
+def __hash_values_at1(h, k) = __hash_values_at(h, [k])
+def __hash_values_at2(h, a, b) = __hash_values_at(h, [a, b])
+def __arr_values_at2(a, i, j) = __arr_values_at(a, [i, j])
+def __str_rindex1(s, pat) = __str_rindex(s, pat)
+def __hash_delete1(h, k) = __hash_delete(h, k)
+
+# nested arrays flattened fully (elements of mixed depth are tagged values)
+def __arr_flatten(a)
+  out = []
+  i = 0
+  while i < a.length
+    e = a[i]
+    if __is_dyn(e) && __dyn_arr_p(e)
+      inner = __arr_flatten(__dyn_arr(e))
+      j = 0
+      while j < inner.length
+        out.push(inner[j])
+        j = j + 1
+      end
+    else
+      out.push(e)
+    end
+    i = i + 1
+  end
+  out
 end
