@@ -161,7 +161,7 @@ def __gc_run(fp)
     __trap if cap >= 1073741824
     # (the old from-space is abandoned; the bitmap must cover the new from-space
     # at the collection after next, so size it for the bigger space now)
-    ncap = cap * 2
+    ncap = cap * 4 # a live set this big is growing: four times fewer collections of it
     nto = __mmap(ncap)
     __st(g + 32, nto)
     __st(g + 40, nto + ncap)
