@@ -10,9 +10,28 @@
 module Indus
   module Peephole
     FRESH = %i[sconst scat sappend ssub itos sdup salloc chr].freeze
+
+    # a string literal only ever read -- the right side of an append or concat, compared, printed,
+    # a hash key looked up, measured -- needs no fresh copy: it is the literal in the data section
+    # (its [cap][len] header is there too; nothing writes through it, and the collector ignores
+    # pointers outside the heap)
+    READ_ONLY_USE = {
+      sappend: [1], bufappend: [1], scat: [0, 1], seq: [0, 1], sne: [0, 1], scmp: [0, 1], seq_char: [0],
+      puts_str: [0], print_str: [0], eputs_str: [0], p_str: [0], hget: [1], hkey: [1], alen: [0],
+    }.freeze
+    def self.static_literals(f)
+      uses = Hash.new { |h, k| h[k] = [] }
+      f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each_with_index { |a, k| uses[a] << [i, k] if a.is_a?(Inst) } }
+      f.all.each do |i|
+        next unless i.op == :sconst && !uses[i].empty?
+        next unless uses[i].all? { |(u, k)| (ro = READ_ONLY_USE[u.op]) && ro.include?(k) }
+        i.op = :sconst_ro
+      end
+    end
     READERS = %i[scat sappend seq seq_char alen ssub puts_str phi].freeze # uses that do not alias the string
 
     def self.run(f)
+      static_literals(f)
       uses = Hash.new(0); users = Hash.new { |h, k| h[k] = [] }
       f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { next unless _1.is_a?(Inst); uses[_1] += 1; users[_1] << i } }
       live_out = liveness(f)

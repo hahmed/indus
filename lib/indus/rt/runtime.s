@@ -9,11 +9,18 @@
 
 // rt_memcpy(x0 dst, x1 src, x2 len). Clobbers x3. Returns x0 = dst + len.
 rt_memcpy:
-        cbz     x2, 1f
-0:      ldrb    w3, [x1], #1
+        cmp     x2, #16
+        b.lo    2f
+0:      ldp     x3, x4, [x1], #16       // 16 bytes a step while at least 16 remain
+        stp     x3, x4, [x0], #16
+        sub     x2, x2, #16
+        cmp     x2, #16
+        b.hs    0b
+2:      cbz     x2, 1f
+3:      ldrb    w3, [x1], #1            // the tail, bytewise
         strb    w3, [x0], #1
         subs    x2, x2, #1
-        b.ne    0b
+        b.ne    3b
 1:      ret
 
 // rt_alloc(x0 bytes) -> x0 handle; 16-byte header before it, 16-aligned bump.

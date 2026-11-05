@@ -22,8 +22,9 @@ module Indus
     def self.run(unit)
       mem = place(unit.code)
       $stderr.puts "indus: code at 0x#{mem.to_i.to_s(16)}" if ENV["INDUS_DEBUG"]
-      heap = MMAP.call(nil, 1 << 28, 3, 0x1002, -1, 0)
-      heap[unit.globals.fetch(:__gc_from_end), 8] = [heap.to_i + (1 << 28)].pack("Q") # rt_alloc's bound, GC or not
+      heap_bytes = [1 << 28, (GC.enabled? ? GC.semispace_bytes : 0) + 4096].max # the globals page and the first from-space
+      heap = MMAP.call(nil, heap_bytes, 3, 0x1002, -1, 0)
+      heap[unit.globals.fetch(:__gc_from_end), 8] = [heap.to_i + heap_bytes].pack("Q") # rt_alloc's bound, GC or not
       if GC.enabled?
         size = GC.semispace_bytes
         from = heap.to_i + 4096

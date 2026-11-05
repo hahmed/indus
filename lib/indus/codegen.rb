@@ -466,6 +466,9 @@ module Indus
         when :puts_i
           @asm.mov(0, reg(i.args[0], 0))
           @asm.bl(:__puts_i)
+        when :sconst_ro # a literal only read: its handle in the data section (header at the label, bytes 16 past it)
+          name = :"str#{i.id}"; @asm.str_data(name, i.args[0])
+          @asm.adr(d, name) # the data label is the bytes; the header sits in the 16 bytes before it
         when :sconst # a literal evaluates to a fresh mutable copy (as in Ruby)
           name = :"str#{i.id}"; @asm.str_data(name, i.args[0])
           @asm.adr(0, name); @asm.mov_imm(1, i.args[0].bytesize); @asm.bl(:rt_str_new); @asm.mov(d, 0)
