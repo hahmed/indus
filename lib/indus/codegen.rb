@@ -310,25 +310,35 @@ module Indus
         when :adrlbl then @asm.adr(d, i.args[0])
         when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer
         when :gcepoch then @asm.ldr_off(d, Asm::GBASE, @asm.global(:__gc_count)) # ...and the collection count it is valid for
-        when :hrestore # ...and drop the iteration's garbage
+        when :aslot then @asm.emit(0x8B000C00 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d) # add d, base, k, lsl #3: the element's address
+        when :hrestore # ...and drop the iteration's garbage; d = the mark for the next iteration
           if GC.enabled? # unless a collection ran since the save (semispaces swap, so a range test would be fooled)
-            skip = @asm.uniq; r = reg(i.args[0]); e = reg(i.args[1], 9)
+            skip = @asm.uniq; done = @asm.uniq; r = reg(i.args[0]); e = reg(i.args[1], 9)
             @asm.ldr_off(16, Asm::GBASE, @asm.global(:__gc_count)); @asm.cmp(e, 16); @asm.bcond(:ne, skip)
-            @asm.mov(Asm::HEAP, r)
+            grown = i.args[2, i.ngrown || 0]; slots = i.args[(2 + (i.ngrown || 0))..]
+            grown.each { |g| @asm.cmp(reg(g, 9), r); @asm.bcond(:hs, skip) } # the container moved into the region: keep this iteration
+            if slots.empty? then @asm.mov(Asm::HEAP, r)
+            else # move each kept value down to the mark, then bump from where the copies end: that is the next mark
+              @asm.mov(1, r)
+              slots.each { |sl| @asm.mov(0, reg(sl, 0)); @asm.bl(sl.kind == :strbuf ? :rt_keep_cell : :rt_keep_str) }
+              @asm.mov(Asm::HEAP, 1); @asm.mov(9, 1)
+            end
             # frame maps are per function, so a dead slot may still hold a pointer into the memory
             # just handed back; the next allocation would turn it into an interior pointer. Clear
             # every pointer slot the body wrote.
             header = b.succs.find { |sb| sb != b }
             Escape.loop_body(@f, header, [b]).each_key do |bb|
               (bb.phis + bb.insts).each do |v|
-                next unless GC.pointer?(v.ty)
+                next unless GC.pointer?(v.ty) && !grown.include?(v) # a grown container's handle is live into the next iteration
                 @asm.str(31, slot_off(v)) if v.slot
                 @asm.str(31, @spill_base + 8 * v.home) if v.home
               end
             end
-            @asm.label(skip)
+            slots.empty? ? @asm.mov(d, reg(i.args[0])) : @asm.mov(d, 9); @asm.b(done)
+            @asm.label(skip); @asm.mov(d, Asm::HEAP) # no reset: the next region starts here
+            @asm.label(done)
           else
-            @asm.mov(Asm::HEAP, reg(i.args[0]))
+            @asm.mov(Asm::HEAP, reg(i.args[0])); @asm.mov(d, reg(i.args[0]))
           end
         when :mod # Ruby modulo: floor division remainder
           l, r = i.args

@@ -252,6 +252,63 @@ rt_str_hash:
 1:      mov     x0, x1
         ret
 
+// Loop regions with survivors (notes/65). At a region's back edge the iteration's
+// allocations are dropped by resetting the bump pointer; a value that escaped into
+// pre-existing memory is first moved down to the cursor and its slot patched.
+//   rt_keep_str(x0 slot, x1 cursor) -> x1 new cursor   slot holds a string handle
+//   rt_keep_cell(x0 slot, x1 cursor) -> x1              slot holds a one-word cell whose word is a string handle
+// A handle is 16 past its header ([-16] cap, [-8] len). The copy keeps cap = len (trimmed).
+rt_keep_str:
+        stp     x29, x30, [sp, #-48]!
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        mov     x19, x0                 // slot
+        mov     x20, x1                 // cursor (16-aligned)
+        ldr     x21, [x19]              // old handle
+        cbz     x21, 1f
+        ldur    x22, [x21, #-8]         // len
+        add     x1, x20, #16            // new handle
+        str     x22, [x20]              // cap = len
+        str     x22, [x20, #8]          // len
+        mov     x0, x1
+        mov     x2, x22
+        mov     x1, x21
+        stp     x0, x22, [sp, #-16]!
+        bl      rt_memcpy
+        ldp     x0, x22, [sp], #16
+        str     x0, [x19]               // patch the slot
+        add     x1, x0, x22
+        add     x1, x1, #15
+        and     x1, x1, #0xfffffffffffffff0
+        b       2f
+1:      mov     x1, x20
+2:      ldp     x21, x22, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #48
+        ret
+rt_keep_cell:
+        stp     x29, x30, [sp, #-48]!
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        mov     x19, x0                 // slot holding the cell
+        mov     x20, x1
+        ldr     x21, [x19]              // the cell
+        cbz     x21, 1f
+        mov     x0, x21                 // keep the string the cell points at, patching the cell's word
+        mov     x1, x20
+        bl      rt_keep_str
+        mov     x20, x1
+        ldr     x22, [x21]              // the (new) string handle
+        str     x22, [x20]              // the new cell: one word
+        str     x20, [x19]              // patch the slot
+        add     x1, x20, #16
+        b       2f
+1:      mov     x1, x20
+2:      ldp     x21, x22, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #48
+        ret
+
 // rt_hash_new(x0 cap) -> handle. Layout: [key,val] slots * cap (open
 // addressing, zeroed), then cap words of slot indices in insertion order,
 // so iteration follows Ruby's order. Header: [-16] cap, [-8] count.

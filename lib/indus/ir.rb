@@ -3,6 +3,7 @@ module Indus
   class Inst
     attr_accessor :bound_to # the generic instance a call last took its result type from
     attr_accessor :assumed # [operand, type] an irreversible by-type rewrite relied on; checked after typing
+    attr_accessor :kind, :ngrown # aslot: type of the kept value; hrestore: how many grown handles precede the slots
     attr_accessor :routed # the method name a call was routed from by the receiver's builtin family
     attr_accessor :nocheck # an add/sub/mul whose range analysis proves it cannot overflow
     attr_accessor :nonneg # a div/mod whose operands are provably non-negative: no floor fix-up
@@ -11,7 +12,7 @@ module Indus
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
     def term? = %i[br condbr ret].include?(op)
-    def call? = %i[zcheck call mcall pcall dsend sendsw puts_i puts_s puts_str eputs_str clock sys try_push raise puts_bool puts_opt puts_nil puts_nil_word p_str print_i print_str putc anew aset onew ipow seam sconst scat sappend seq sne scmp itos stoi bool_to_s chr box sdup salloc cell_new mkbuf bufappend libm fpow hnew hget hset hkey hkeys ssub rawmmap].include?(op)
+    def call? = %i[zcheck call mcall pcall dsend sendsw puts_i puts_s puts_str eputs_str clock sys try_push raise puts_bool puts_opt puts_nil puts_nil_word p_str print_i print_str putc anew aset onew ipow seam sconst scat sappend seq sne scmp itos stoi bool_to_s chr box sdup salloc cell_new mkbuf bufappend libm fpow hnew hget hset hkey hkeys ssub rawmmap].include?(op) || (op == :hrestore && args.size > 2 + (ngrown || 0)) # a restore with kept values calls rt_keep_*
     def float? = ty == :float
     def to_s = "v#{id}"
   end
@@ -53,7 +54,7 @@ module Indus
   end
 
   class Func
-    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :rest, :allocates, :result_unused,
+    attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :returns_fresh, :rest, :allocates, :result_unused,
                   :shadowed # the definition this one overrides in the same class's chain (a mixin's, or the one a prepend covers): super's target
     def initialize(name, nparams)
       @name, @params, @blocks = name, Array.new(nparams) { Inst.new(:param) }, [Block.new(:entry)]
