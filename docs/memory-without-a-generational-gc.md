@@ -24,7 +24,7 @@ Indus: 3 where provable, 2 for the rest.
 - Stack objects: an object that never escapes its function lives in the frame.
 - Loop regions: if nothing allocated in an iteration survives the back edge, the bump
   pointer resets there. `server` benchmark runs in 4 MB; Spinel 67 MB.
-- Cells for containers grown through a parameter (notes/32, notes/53).
+- Cells for containers grown through a parameter ([notes/32](https://github.com/hahmed/indus/blob/main/docs/notes/32_stable_handles.md), [notes/53](https://github.com/hahmed/indus/blob/main/docs/notes/53_array_cells.md)).
 
 ## The measurement
 
@@ -64,7 +64,7 @@ Fixed from the same measurement:
 - Memory not returned to OS on shrink. RSS tracks high-water mark. Fixable (munmap).
 - Semispaces: 2× address space for the live set. Address space, not RSS.
 - Typed slots need whole-program types. Runtime class-layout change = world-age problem
-  (notes/37), parked.
+  ([notes/37](https://github.com/hahmed/indus/blob/main/docs/notes/37_prior_art_cruby.md)), parked.
 - No finalizers, ObjectSpace, WeakRef. No headers → cannot enumerate objects.
 - No `frozen?` bit, no `object_id`, no singleton methods.
 
@@ -112,4 +112,4 @@ with full Ruby?
 - How much of a Rails request's allocation is provably request-local? If most, regions
   beat a better collector.
 
-*Numbers: indus notes/64, bench/REPORT.md.*
+*Numbers: indus [notes/64](https://github.com/hahmed/indus/blob/main/docs/notes/64_generational_gc_not_needed.md), bench/REPORT.md.*
