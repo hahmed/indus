@@ -190,6 +190,8 @@ module Indus
           @asm.emit(0x8B000000 | (16 << 16) | (4 << 10) | (rh << 5) | 16)   # add x16, h, slot, lsl #4
           off = i.op == :hkey_at ? 0 : 8
           i.float? ? @asm.fldr_off(d, 16, off) : @asm.ldr_off(d, 16, off)
+          kt = i.args[0].ty&.[](1)
+          (@asm.emit(0xD2F00010); @asm.emit(0xCA100000 | (d << 5) | d)) if i.op == :hkey_at && kt != :str && kt != :dyn && !i.float? # unflip a word key
         when :chr then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_chr); @asm.mov(d, 0)
         when :onew
           k = i.args[0]
@@ -352,7 +354,11 @@ module Indus
           end
         when :mod # Ruby modulo: floor division remainder
           l, r = i.args
-          if r.op == :const && r.args[0] >= 2 then @asm.divmod_const(d, reg(l), r.args[0], :mod, !!i.nonneg)
+          if i.float? # a - b * floor(a / b); d is the temp (a literal operand materialises into d30/d31, so neither is free)
+            @asm.emit(0x1E601800 | (freg(r, FTMP2) << 16) | (freg(l) << 5) | d)       # fdiv d, l, r
+            @asm.emit(0x1E654000 | (d << 5) | d)                                       # frintm d, d
+            @asm.emit(0x1F408000 | (freg(r, FTMP2) << 16) | (freg(l) << 10) | (d << 5) | d) # fmsub d, d, r, l  = l - d*r
+          elsif r.op == :const && r.args[0] >= 2 then @asm.divmod_const(d, reg(l), r.args[0], :mod, !!i.nonneg)
           else @asm.sdiv_floor(16, reg(l), reg(r, 9)); @asm.emit(0x9B008000 | (reg(r, 9) << 16) | (reg(l) << 10) | (16 << 5) | d) end # msub d, x16, r, l
         when :sendsw # send(name): compare the symbol id against each candidate, direct call
           arms, name_v, recv, *args = i.args
@@ -551,6 +557,7 @@ module Indus
           kt = i.args[0].ty&.[](1) or raise "hash #{i.args[0]} has no key type in #{@f.name}"
           kind = kt == :str ? "s" : kt == :dyn ? "d" : "i" # strings by content, tagged keys by tag, the rest by word
           i.args[1..].each_with_index { |v, n| @asm.mov(n + 1, reg(v, n + 1)) }
+          @asm.emit(0xD2F00010); @asm.emit(0xCA100021) if kind == "i" # mov x16, #1<<63; eor x1, x1, x16: a word key is stored with its sign bit flipped, so 0 (false, 0.0, the int 0) is never the empty-slot marker
           @asm.mov(0, reg(i.args[0], 0))
           op = i.op.to_s.sub("h", ""); op = "geti" if i.op == :hget && i.ty == :int? # int values: miss -> sentinel
           @asm.bl(:"rt_hash#{kind}_#{op}"); @asm.mov(d, 0)
@@ -559,13 +566,15 @@ module Indus
         when :p_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_p_str)
         when :print_str then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_print_str)
         when :print_i then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_print_i)
-        when :puts_opt # nullable int: blank line for nil
-          @asm.str_data(:__nl, "")
+        when :puts_opt, :p_opt # nullable int: puts prints a blank line for nil, p prints "nil"
+          @asm.str_data(:__nl, ""); @asm.str_data(:__nil_word, "nil")
           nl = @asm.uniq; dn = @asm.uniq
           r = reg(i.args[0]); @asm.emit(0xD2F00000 | 16); @asm.cmp(r, 16); @asm.bcond(:eq, nl)
           @asm.mov(0, r); @asm.bl(:__puts_i); @asm.b(dn)
-          @asm.label(nl); @asm.adr(0, :__nl); @asm.bl(:rt_puts_str); @asm.label(dn)
-        when :hkeys then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_hash_keys); @asm.mov(d, 0)
+          @asm.label(nl); @asm.adr(0, i.op == :p_opt ? :__nil_word : :__nl); @asm.bl(:rt_puts_str); @asm.label(dn)
+        when :hkeys
+          kt = i.args[0].ty&.[](1)
+          @asm.mov(0, reg(i.args[0], 0)); @asm.bl(kt == :str || kt == :dyn ? :rt_hash_keys : :rt_hash_keys_w); @asm.mov(d, 0)
         when :ssub
           @asm.mov(1, reg(i.args[1], 1)); @asm.mov(2, reg(i.args[2], 2)); @asm.mov(0, reg(i.args[0], 0))
           @asm.bl(:rt_str_sub); @asm.mov(d, 0)

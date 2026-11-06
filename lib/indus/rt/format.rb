@@ -12,13 +12,14 @@ def __format(fmt, args)
       i = i + 1
     else
       i = i + 1
-      left = false; zero = false; plus = false; space = false
-      while i < n && (__ld8(fmt, i) == 45 || __ld8(fmt, i) == 48 || __ld8(fmt, i) == 43 || __ld8(fmt, i) == 32)
+      left = false; zero = false; plus = false; space = false; alt = false
+      while i < n && (__ld8(fmt, i) == 45 || __ld8(fmt, i) == 48 || __ld8(fmt, i) == 43 || __ld8(fmt, i) == 32 || __ld8(fmt, i) == 35)
         f = __ld8(fmt, i)
         left = true if f == 45
         zero = true if f == 48
         plus = true if f == 43
         space = true if f == 32
+        alt = true if f == 35 # '#': 0x / 0b / 0 prefixes
         i = i + 1
       end
       width = 0
@@ -47,10 +48,30 @@ def __format(fmt, args)
           body = __fmt_int(__dyn_to_int(arg), 10, plus, space)
         elsif conv == 120 # x
           body = __fmt_int(__dyn_to_int(arg), 16, plus, space)
+          body = "0x" + body if alt
+        elsif conv == 88 # X
+          body = __str_upcase(__fmt_int(__dyn_to_int(arg), 16, plus, space))
+          body = "0X" + body if alt
         elsif conv == 111 # o
           body = __fmt_int(__dyn_to_int(arg), 8, plus, space)
+          body = "0" + body if alt
         elsif conv == 98 # b
           body = __fmt_int(__dyn_to_int(arg), 2, plus, space)
+          body = "0b" + body if alt
+        elsif conv == 112 # p: inspect
+          body = __dyn_inspect(arg)
+        elsif conv == 103 # g: %e when the exponent is < -4 or >= precision, else %f without trailing zeros
+          fv = __dyn_to_f(arg)
+          pr = prec < 0 ? 6 : prec
+          pr = 1 if pr == 0
+          ex = fv == 0.0 ? 0 : __num_floor(__log10_abs(fv))
+          if ex < -4 || ex >= pr
+            body = __fmt_exp(fv, pr - 1)
+            body = __strip_exp_zeros(body)
+          else
+            body = __fmt_float(fv, pr - 1 - ex, plus, space)
+            body = __strip_trailing_zeros(body)
+          end
         elsif conv == 102 # f
           body = __fmt_float(__dyn_to_f(arg), prec < 0 ? 6 : prec, plus, space)
         elsif conv == 101 # e
@@ -58,8 +79,8 @@ def __format(fmt, args)
         elsif conv == 115 # s
           body = __dyn_to_s(arg)
           body = body[0, prec] if prec >= 0 && prec < body.length
-        elsif conv == 99 # c
-          body = __dyn_to_int(arg).chr
+        elsif conv == 99 # c: a codepoint, or the first character of a string
+          body = __tag(arg) == 2 ? __dyn_to_s(arg)[0, 1] : __dyn_to_int(arg).chr
         else
           __trap
         end
@@ -168,4 +189,34 @@ def __dyn_to_f(v)
   return __unbox_float(v) if t == 14
   __trap
   0.0
+end
+
+def __log10_abs(f)
+  a = f < 0.0 ? 0.0 - f : f
+  e = 0
+  while a >= 10.0
+    a = a / 10.0
+    e = e + 1
+  end
+  while a < 1.0
+    a = a * 10.0
+    e = e - 1
+  end
+  e.to_f
+end
+# "1.230000" -> "1.23", "2.000" -> "2"
+def __strip_trailing_zeros(s)
+  return s unless __str_include_p(s, ".")
+  n = s.length
+  while n > 0 && __ld8(s, n - 1) == 48
+    n = n - 1
+  end
+  n = n - 1 if n > 0 && __ld8(s, n - 1) == 46
+  s[0, n]
+end
+# "1.230000e-04" -> "1.23e-04"
+def __strip_exp_zeros(s)
+  at = __str_index_from(s, "e", 0)
+  return s if at < 0
+  __strip_trailing_zeros(s[0, at]) + s[at, s.length - at]
 end

@@ -203,11 +203,14 @@ module Indus
         if recv == :str # a String method of the same name: the pieces are an array, the rest is a String
           %i[chars split lines bytes to_a].include?(n.name) ? [:array, n.name == :bytes ? :int : :str] : :str
         elsif %i[min_by max_by first].include?(n.name) && (n.name != :first || akinds.empty?) then (recv.is_a?(Array) && recv[0] == :array ? recv[1] : nil)
-        elsif recv.is_a?(Array) && recv[0] == :hash then (%i[select reject].include?(n.name) ? recv : [:array, nil])
+        elsif recv.is_a?(Array) && recv[0] == :hash then (%i[select reject compact filter find_all slice except merge_blk sort_by_h].include?(n.name) ? recv : [:array, nil])
         elsif %i[select reject sort reverse uniq compact first take drop shuffle].include?(n.name) && recv.is_a?(Array) then recv
         else [:array, nil] end
-      when :group_by, :tally, :to_h, :transform_values, :transform_keys, :merge, :invert, :each_with_object
-        n.name == :each_with_object ? (akinds[0].is_a?(Array) ? akinds[0] : nil) : [:hash, nil, nil]
+      when :group_by, :tally, :to_h, :transform_values, :transform_keys, :merge, :invert, :each_with_object, :slice, :except, :filter_map_h, :keep_if, :delete_if, :clear, :store
+        if n.name == :each_with_object then (akinds[0].is_a?(Array) ? akinds[0] : nil)
+        elsif %i[slice except keep_if delete_if clear].include?(n.name) then (recv.is_a?(Array) && recv[0] == :hash ? recv : (n.name == :slice ? recv : [:array, nil]))
+        elsif n.name == :store then akinds[1]
+        else [:hash, nil, nil] end
       when :dup, :clone, :freeze, :itself then recv
       when :send, :public_send then nil
       when :sqrt, :sin, :cos then :float

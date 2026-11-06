@@ -110,6 +110,27 @@ end
 def __arr_unshift(a, x) = __arr_insert(a, 0, x)
 
 def __arr_count(a) = a.length
+def __arr_count1(a, x)
+  n = 0
+  i = 0
+  while i < a.length
+    n = n + 1 if a[i] == x
+    i = i + 1
+  end
+  n
+end
+def __arr_rotate1(a, k)
+  out = []
+  return out if a.length == 0
+  k = k % a.length
+  i = 0
+  while i < a.length
+    out.push(a[(i + k) % a.length])
+    i = i + 1
+  end
+  out
+end
+def __str_slice1(s, i) = s[i]
 
 def __arr_minmax(a) = [__arr_min(a), __arr_max(a)]
 
@@ -372,6 +393,8 @@ def __str_chomp(s)
   return s[0, s.length - 1] if s.length >= 1 && __ld8(s, s.length - 1) == 10
   __sdup(s)
 end
+def __str_chomp1(s, suffix) = __str_end_with_p(s, suffix) ? s[0, s.length - suffix.length] : __sdup(s)
+def __str_chars_utf8(s) = __str_chars(s)
 
 # "0.75".to_f: the digits as one integer mantissa, scaled once (digit-by-digit scaling
 # accumulates error: 0.75 came out 0.7500000000000001). An exponent is applied by powers
@@ -475,7 +498,9 @@ def __str_prepend(s, t) = t + s
 
 def __str_insert(s, i, t)
   i = s.length + i + 1 if i < 0
-  s[0, i] + t + s[i, s.length - i]
+  head = i > 0 ? s[0, i] : ""
+  tail = i < s.length ? s[i, s.length - i] : ""
+  head + t + tail
 end
 
 def __str_each_byte(s) = __str_bytes(s)
@@ -646,7 +671,7 @@ def __str_slice_range(s, lo, hi, excl)
   lo = lo + n if lo < 0
   hi = hi + n if hi < 0
   hi = hi - 1 if excl == 1
-  return "" if lo > n || lo < 0
+  return __nil_str_value if lo > n || lo < 0 # s[7..] on a 5-char string is nil; s[5..] is ""
   hi = n - 1 if hi >= n
   len = hi - lo + 1
   len = 0 if len < 0
@@ -1469,3 +1494,187 @@ def __box_elems_hash(h)
   end
   out
 end
+
+# ---- probe batch (2026-11-07): hash and string odds and ends
+def __hash_has_value_p(h, v) = __hash_value_p(h, v)
+def __hash_key(h, v)
+  keys = __hash_keys(h)
+  i = 0
+  while i < keys.length
+    return keys[i] if h[keys[i]] == v
+    i = i + 1
+  end
+  nil
+end
+def __hash_first(h)
+  return nil if __hcount(h) == 0
+  [__hkey_at(h, 0), __hval_at(h, 0)]
+end
+def __hash_first1(h, n)
+  out = []
+  i = 0
+  while i < n && i < __hcount(h)
+    out.push([__hkey_at(h, i), __hval_at(h, i)])
+    i = i + 1
+  end
+  out
+end
+def __hash_slice(h, keys)
+  out = {}
+  i = 0
+  while i < keys.length
+    out[keys[i]] = h[keys[i]] if __hkey_p(h, keys[i])
+    i = i + 1
+  end
+  out
+end
+def __hash_slice1(h, a) = __hash_slice(h, [a])
+def __hash_slice2(h, a, b) = __hash_slice(h, [a, b])
+def __hash_slice3(h, a, b, c) = __hash_slice(h, [a, b, c])
+def __hash_except(h, keys)
+  out = {}
+  i = 0
+  while i < __hcount(h)
+    k = __hkey_at(h, i)
+    out[k] = __hval_at(h, i) unless __arr_include_p(keys, k)
+    i = i + 1
+  end
+  out
+end
+def __hash_except1(h, a) = __hash_except(h, [a])
+def __hash_except2(h, a, b) = __hash_except(h, [a, b])
+def __hash_store(h, k, v) = (h[k] = v)
+def __hash_flatten(h)
+  out = []
+  i = 0
+  while i < __hcount(h)
+    out.push(__hkey_at(h, i))
+    out.push(__hval_at(h, i))
+    i = i + 1
+  end
+  out
+end
+def __hash_each_key(h) = __hash_keys(h)
+def __hash_each_value(h) = __hash_values(h)
+def __hash_each_pair(h) = __hash_to_a(h)
+def __hash_each(h) = __hash_to_a(h)
+
+def __str_rpartition(s, sep)
+  at = __str_rindex(s, sep)
+  return ["", "", __sdup(s)] if at < 0
+  [s[0, at], __sdup(sep), s[at + sep.length, s.length - at - sep.length]]
+end
+def __str_eql_p(a, b) = a == b
+def __str_equal_p(a, b) = __same(a, b)
+def __str_between_p(s, lo, hi) = __str_spaceship(s, lo) >= 0 && __str_spaceship(s, hi) <= 0
+def __str_casecmp(a, b) = __str_spaceship(__str_downcase(a), __str_downcase(b))
+def __str_delete_prefix(s, p) = __str_start_with_p(s, p) ? s[p.length, s.length - p.length] : __sdup(s)
+def __str_delete_suffix(s, p) = __str_end_with_p(s, p) ? s[0, s.length - p.length] : __sdup(s)
+def __str_start_with_p2(s, a, b) = __str_start_with_p(s, a) || __str_start_with_p(s, b)
+def __str_start_with_p3(s, a, b, c) = __str_start_with_p(s, a) || __str_start_with_p(s, b) || __str_start_with_p(s, c)
+def __str_end_with_p2(s, a, b) = __str_end_with_p(s, a) || __str_end_with_p(s, b)
+def __str_hash(s)
+  h = 5381
+  i = 0
+  while i < s.length
+    h = __wadd(__wmul(h, 33), __ld8(s, i))
+    i = i + 1
+  end
+  h & 4611686018427387903
+end
+def __str_each_char(s) = __str_chars(s)
+def __arr_each_entry(a) = a
+def __arr_each(a) = a
+def __hash_merge_blk(a, b, blk)
+  out = __hash_dup(a)
+  i = 0
+  while i < __hcount(b)
+    k = __hkey_at(b, i)
+    v = __hval_at(b, i)
+    out[k] = __hkey_p(out, k) ? blk.call(k, out[k], v) : v
+    i = i + 1
+  end
+  out
+end
+def __hash_fetch_blk(h, k, blk) = __hkey_p(h, k) ? h[k] : blk.call(k)
+# rebuild h's slots from `from` (same key/value types): the in-place variants
+def __hash_replace(h, from)
+  pairs = __hash_to_a(from)
+  base = __handle(h)
+  cap = __ld(base - 16)
+  i = 0
+  while i < cap * 2
+    __st(base + i * 8, 0)
+    i = i + 1
+  end
+  __st(base - 8, 0)
+  i = 0
+  while i < pairs.length
+    __hset_raw(h, pairs[i][0], pairs[i][1])
+    i = i + 1
+  end
+  h
+end
+def __hash_clear(h) = __hash_replace(h, {})
+def __hash_compact(h)
+  out = {}
+  i = 0
+  while i < __hcount(h)
+    v = __hval_at(h, i)
+    out[__hkey_at(h, i)] = v unless v.nil?
+    i = i + 1
+  end
+  out
+end
+def __arr_each_with_index_pairs_from(a, from)
+  out = []
+  i = 0
+  while i < a.length
+    out.push([a[i], i + from])
+    i = i + 1
+  end
+  out
+end
+def __num_upto_a(a, b)
+  out = []
+  while a <= b
+    out.push(a)
+    a = a + 1
+  end
+  out
+end
+def __num_downto_a(a, b)
+  out = []
+  while a >= b
+    out.push(a)
+    a = a - 1
+  end
+  out
+end
+def __str_squeeze1(s, set)
+  out = ""
+  i = 0
+  while i < s.length
+    c = __ld8(s, i)
+    out = out + s[i, 1] unless i > 0 && c == __ld8(s, i - 1) && __str_include_p(set, s[i, 1])
+    i = i + 1
+  end
+  out
+end
+def __num_remainder(a, b) = a - b * (a.abs / b.abs) * (a < 0 ? -1 : 1) * (b < 0 ? -1 : 1)
+def __num_modulo(a, b) = a % b
+def __num_digits1(n, base)
+  out = []
+  return [0] if n == 0
+  while n > 0
+    out.push(n % base)
+    n = n / base
+  end
+  out
+end
+def __num_integer_p(n) = true
+def __num_ord(n) = n
+def __num_size(n) = 8
+def __arr_sort_sym(a) = __arr_sort_by(a, __arr_sym_names(a))
+def __arr_min_sym(a) = __arr_min_by(a, __arr_sym_names(a))
+def __arr_max_sym(a) = __arr_max_by(a, __arr_sym_names(a))

@@ -234,7 +234,9 @@ rt_eputs_str:
         b       0f
 rt_puts_str:
         mov     x4, #1
-0:      stp     x29, x30, [sp, #-48]!
+0:      cbnz    x0, 1f
+        adr     x0, rt_empty_str        // puts nil-string: a blank line
+1:      stp     x29, x30, [sp, #-48]!
         stp     x19, x20, [sp, #16]
         mov     x19, x0
         mov     x20, x4
@@ -755,10 +757,16 @@ rt_hashd_set:
 
 
 // rt_hash_keys(x0 h) -> array handle [cap][len][keys...]
+rt_hash_keys_w:                         // word keys: stored sign-flipped (see codegen hget/hset)
+        mov     x4, #1
+        b       rt_hash_keys_0
 rt_hash_keys:
-        stp     x29, x30, [sp, #-48]!
+        mov     x4, #0
+rt_hash_keys_0:
+        stp     x29, x30, [sp, #-64]!
         stp     x19, x20, [sp, #16]
         stp     x21, x22, [sp, #32]
+        str     x4, [sp, #48]           // the flag, beyond the saved registers
         mov     x19, x0
         ldur    x20, [x19, #-8]         // len
         lsl     x0, x20, #3
@@ -774,13 +782,16 @@ rt_hash_keys:
         ldr     x1, [x3, x22, lsl #3]
         add     x1, x19, x1, lsl #4
         ldr     x2, [x1]
-        str     x2, [x0], #8
+        ldr     x4, [sp, #48]
+        cbz     x4, 2f
+        eor     x2, x2, #0x8000000000000000
+2:      str     x2, [x0], #8
         add     x22, x22, #1
         b       0b
 1:      mov     x0, x21
         ldp     x21, x22, [sp, #32]
         ldp     x19, x20, [sp, #16]
-        ldp     x29, x30, [sp], #48
+        ldp     x29, x30, [sp], #64
         ret
 
 // rt_str_sub(x0 s, x1 start, x2 len) -> new string, or 0 if start is out of range
@@ -937,14 +948,18 @@ __onew:
         ret
 
 // __ipow(x0 base, x1 exp) -> base ** exp
-__ipow:
+__ipow:                                 // x0 ** x1 (x1 >= 0), trapping on overflow like + and *
         mov     x2, x0
         mov     x0, #1
 0:      cbz     x1, 1f
+        smulh   x3, x0, x2
         mul     x0, x0, x2
+        cmp     x3, x0, asr #63
+        b.ne    2f
         sub     x1, x1, #1
         b       0b
 1:      ret
+2:      brk     #0                      // integer overflow in **: a Bignum result is not supported here
 
 // ---------------------------------------------------------------- the collector
 // The collector itself is Ruby (lib/indus/rt/gc.rb), compiled by Indus
@@ -1031,6 +1046,11 @@ rt_mmap:
         blr     x16
         ldp     x29, x30, [sp], #16
         ret
+
+        .p2align 4
+        .quad   0, 0                    // [cap][len] of the empty string
+rt_empty_str:
+        .quad   0
 
 // rt_munmap(x0 addr, x1 bytes): give a semispace back to the OS
 rt_munmap:

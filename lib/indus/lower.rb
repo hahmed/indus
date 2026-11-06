@@ -5,9 +5,18 @@ module Indus
   # merge. Trivial phis are removed afterwards.
   class Lower
     CMP = { :== => :eq, :!= => :ne, :< => :lt, :<= => :le, :> => :gt, :>= => :ge }
+    BUILTIN_CLASS_NODE = { int: [Prism::IntegerNode], float: [Prism::FloatNode], str: [Prism::StringNode, Prism::InterpolatedStringNode], array: [Prism::ArrayNode], hash: [Prism::HashNode],
+                           range: [Prism::RangeNode], sym: [Prism::SymbolNode], bool: [Prism::TrueNode, Prism::FalseNode], nil: [Prism::NilNode] }.freeze
     ARITH = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :% => :mod, :& => :and, :| => :or, :^ => :xor, :<< => :shl, :>> => :shr }
 
     attr_reader :classes, :syms, :funcs
+    # a prelude function's trailing optional parameters: their literal default values (Integer / nil),
+    # so a routed call with fewer arguments can be completed at the type level
+    def optional_defaults(f)
+      d = @defs_by_func[f] or return []
+      (d.parameters&.optionals || []).map { |o| o.value.is_a?(Prism::IntegerNode) ? o.value.value : o.value.is_a?(Prism::NilNode) ? nil : :unsupported }
+    end
+    def required_count(f) = (d = @defs_by_func[f]) ? (d.parameters&.requireds&.size || 0) : f.params.size
     # symbols are small integers, interned at compile time
     def sym_id(name) = (@syms ||= {})[name.to_sym] ||= @syms.size + 1
 
@@ -1013,6 +1022,15 @@ module Indus
         emit(:print_v, [expr(args[0])])   # no newline
       elsif n.name == :Integer && n.receiver.nil? && args.size == 1
         emit(:to_i, [expr(args[0])])      # Integer(x): the parse, no exception on junk (yet)
+      elsif n.name == :Integer && n.receiver.nil? && args.size == 2 then expr(n.copy(name: :to_i, receiver: args[0], arguments: n.arguments.copy(arguments: [args[1]]))) # Integer("1f", 16)
+      elsif n.name == :Float && n.receiver.nil? && args.size == 1 then emit(:to_f, [expr(args[0])])
+      elsif n.name == :String && n.receiver.nil? && args.size == 1 then to_s(expr(args[0]))
+      elsif n.name == :Array && n.receiver.nil? && args.size == 1 # Array(x): nil -> [], an array itself, a range its elements, a scalar wrapped
+        a = args[0]
+        if a.is_a?(Prism::NilNode) then emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)])
+        elsif a.is_a?(Prism::RangeNode) || a.is_a?(Prism::ParenthesesNode) && a.body.body.last.is_a?(Prism::RangeNode) then range_array(a.is_a?(Prism::ParenthesesNode) ? a.body.body.last : a)
+        elsif a.is_a?(Prism::ArrayNode) || kind_of(a).is_a?(Array) && kind_of(a)[0] == :array then expr(a)
+        else expr(Prism::ArrayNode.new(a.send(:source), 0, a.location, 0, [a], nil, nil)) end
       elsif n.name == :respond_to? && args.size == 1 && (args[0].is_a?(Prism::SymbolNode) || args[0].is_a?(Prism::StringNode) || args[0].is_a?(Prism::InterpolatedStringNode))
         # the class is known at compile time, so is the answer; an interpolated name must be a literal-with-constants
         nm = case args[0]
@@ -1042,8 +1060,10 @@ module Indus
         expr(n.receiver) # obj.class.name: the class is already its name (no class objects)
       elsif n.name == :ancestors && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) then raise "ancestors: no class objects at run time"
       elsif n.name == :extend && args.size == 1 && n.receiver then raise "extend on an instance: singleton methods are not supported (every object of a class shares its methods)"
-      elsif n.name == :is_a? && args.size == 1 && n.receiver && args[0].is_a?(Prism::ConstantReadNode)
+      elsif %i[is_a? kind_of? instance_of?].include?(n.name) && args.size == 1 && n.receiver && args[0].is_a?(Prism::ConstantReadNode)
         emit(:isa, [expr(n.receiver), args[0].name])
+      elsif n.name == :class && args.empty? && n.receiver && (bk = builtin_kind(n.receiver))
+        emit(:sconst, [{ int: "Integer", float: "Float", str: "String", array: "Array", hash: "Hash", range: "Range", sym: "Symbol", bool: n.receiver.is_a?(Prism::TrueNode) ? "TrueClass" : "FalseClass", nil: "NilClass" }[bk]]) # a builtin's class: its name (no class objects at run time)
       elsif n.name == :nil? && args.empty? && n.receiver
         v = expr(n.receiver); emit(:cmp, [v, (c = const(0); c.ty = :nil; c)], :eq)
       elsif n.name == :to_s && args.empty? && n.receiver.nil? && @klass && @klass.find_method(:to_s) # bare to_s: self's
@@ -1139,11 +1159,19 @@ module Indus
         emit(:call, [demand(:__file_delete), expr(args[0])])
       elsif n.name == :clock_gettime && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Process
         emit(:clock, [])                 # Process.clock_gettime(any clock): monotonic seconds as a Float
+      elsif n.name == :round && args.empty? && n.receiver && (kind_of(n.receiver) == :float || n.receiver.is_a?(Prism::FloatNode) || n.receiver.is_a?(Prism::ParenthesesNode) && kind_of(n.receiver.body.body.last) == :float)
+        emit(:call, [demand(:__float_round0), expr(n.receiver)])
+      elsif %i[floor ceil].include?(n.name) && args.size == 1 && n.receiver && (kind_of(n.receiver) == :float || n.receiver.is_a?(Prism::FloatNode))
+        emit(:call, [demand(n.name == :floor ? :__float_floor1 : :__float_ceil1), expr(n.receiver), expr(args[0])])
+      elsif n.name == :divmod && args.size == 1 && n.receiver && (kind_of(n.receiver) == :float || n.receiver.is_a?(Prism::FloatNode) || kind_of(args[0]) == :float)
+        emit(:call, [demand(:__float_divmod), expr(n.receiver), expr(args[0])])
       elsif n.name == :round && args.size == 1 && n.receiver
         if kind_of(n.receiver) == :int || n.receiver.is_a?(Prism::IntegerNode) || n.receiver.is_a?(Prism::ParenthesesNode) && n.receiver.body.body.last.is_a?(Prism::IntegerNode)
           emit(:call, [demand(:__num_round_int), expr(n.receiver), expr(args[0])]) # Integer#round(-n): tens, hundreds
-        elsif args[0].is_a?(Prism::IntegerNode) && args[0].value <= 0 # x.round(0) is an Integer in Ruby
+        elsif args[0].is_a?(Prism::IntegerNode) && args[0].value == 0 # x.round(0) is an Integer in Ruby
           emit(:call, [demand(:__float_round0), expr(n.receiver)])
+        elsif args[0].is_a?(Prism::IntegerNode) && args[0].value < 0 # x.round(-1): tens, an Integer
+          emit(:call, [demand(:__float_round_neg), expr(n.receiver), expr(args[0])])
         else
           emit(:call, [demand(:__float_round), expr(n.receiver), expr(args[0])])
         end
@@ -1165,8 +1193,18 @@ module Indus
       elsif %i[sort! reverse! uniq! shuffle! compact! flatten!].include?(n.name) && args.empty? && n.receiver && !n.block # in place: compute, then write back into the same handle
         r = expr(n.receiver)
         emit(:call, [demand(:__arr_replace), r, emit(:mcall, [n.name.to_s.chomp("!").to_sym, r])])
-      elsif n.name == :each_with_index && args.empty? && n.receiver && !n.block then emit(:mcall, [:each_with_index_pairs, expr(n.receiver)]) # arr.each_with_index.map { |x, i| }
+      elsif n.name == :each_with_index && args.empty? && n.receiver && !n.block # arr.each_with_index.map { |x, i| }; a hash: its pairs, indexed
+        base = kind_of(n.receiver) == :hash ? hash_pairs(expr(n.receiver)) : expr(n.receiver)
+        emit(:mcall, [:each_with_index_pairs, base])
+      elsif n.name == :with_index && args.size <= 1 && !n.block && n.receiver.is_a?(Prism::CallNode) && %i[each_char each map each_byte chars].include?(n.receiver.name) && n.receiver.block.nil? && n.receiver.receiver
+        r = n.receiver # s.each_char.with_index.map { |c, i| }: the pairs
+        base = case r.name when :each_char, :chars then emit(:mcall, [:chars, expr(r.receiver)]) when :each_byte then emit(:mcall, [:bytes, expr(r.receiver)]) else expr(r.receiver) end
+        args[0] ? emit(:call, [demand(:__arr_each_with_index_pairs_from), base, expr(args[0])]) : emit(:mcall, [:each_with_index_pairs, base])
       elsif n.name == :times && args.empty? && n.receiver && !n.block then range_array(n)                 # 3.times.to_a
+      elsif %i[upto downto].include?(n.name) && args.size == 1 && n.receiver && !n.block # 1.upto(3).to_a, 10.downto(7).to_a
+        emit(:call, [demand(n.name == :upto ? :__num_upto_a : :__num_downto_a), expr(n.receiver), expr(args[0])])
+      elsif n.name == :=== && args.size == 1 && (r = n.receiver.is_a?(Prism::ParenthesesNode) ? n.receiver.body.body.last : n.receiver).is_a?(Prism::RangeNode)
+        expr(n.copy(name: :cover?)) # (1..10) === x
       elsif n.name == :each_char && args.empty? && n.receiver && !n.block then emit(:mcall, [:chars, expr(n.receiver)]) # "ab".each_char.to_a
       elsif n.name == :to_a && args.empty? && n.receiver && (k = kind_of(n.receiver)) == :array then expr(n.receiver)
       elsif %i[reduce inject].include?(n.name) && n.receiver && !n.block && args.size >= 1 && args.last.is_a?(Prism::SymbolNode)
@@ -1348,6 +1386,11 @@ module Indus
       when :__ule then emit(:ucmp, [expr(args[0]), expr(args[1])], :ls)
       when :__tag then emit(:dyn_tag, [expr(args[0])])                      # low 4 bits
       when :__same then emit(:ucmp, [expr(args[0]), expr(args[1])], :eq) # raw word identity, never rewritten
+      when :__intern # append a name to the global symbol table, returning its id (the table may move on growth: write it back)
+        names = emit(:gget, [:SYMBOL_NAMES]); n = emit(:alen, [names])
+        grown = emit(:aset, [names, n, expr(args[0])]); emit(:gset, [:SYMBOL_NAMES, grown]); n
+      when :__nil_str_value then (c = emit(:const, [0]); c.ty = :str; c) # the nil word, typed String
+      when :__nil_str then emit(:ucmp, [expr(args[0]), (c = emit(:const, [0]); c.ty = :int; c)], :eq) # a String handle that is the nil word
       when :__box_int then emit(:box, [expr(args[0]), :int])
       when :__box_str then emit(:box, [expr(args[0]), :str])
       when :__box_arr then emit(:box, [expr(args[0]), [:arr, :dyn]])
@@ -1423,7 +1466,7 @@ module Indus
         return iterate_array_value(n.copy(name: :each), args, emit(:mcall, [pieces, expr(n.receiver)]))
       end
       # h.fetch(k) { default }: the block runs only on a miss
-      if n.receiver && blk.is_a?(Prism::BlockNode) && n.name == :fetch && args.size == 1
+      if n.receiver && blk.is_a?(Prism::BlockNode) && n.name == :fetch && args.size == 1 && blk.parameters.nil?
         h = expr(n.receiver); k = expr(args[0])
         has = emit(:mcall, [:key?, h, k])
         tb, eb, mb = @f.new_block(:fhit), @f.new_block(:fmiss), @f.new_block(:fmerge)
@@ -1442,7 +1485,7 @@ module Indus
       end
       # block methods defined by a map over the receiver plus a prelude pass on the results
       # (a mask of truths, or the mapped values): one lowering each, no new loop kinds
-      if n.receiver && blk.is_a?(Prism::BlockNode) && !%i[each map].include?(n.name)
+      if n.receiver && blk.is_a?(Prism::BlockNode) && !%i[each map].include?(n.name) && !(kind_of(n.receiver) == :hash && !@recv_value) # hashes: the pair-iteration block below
         mapped = ->(recv_node = n.receiver) { iterate_array_value(n.copy(name: :map), args, @recv_value || expr(recv_node)) }
         case n.name
         when :filter_map then return emit(:call, [demand(:__arr_compact), mapped.()])
@@ -1471,8 +1514,8 @@ module Indus
                    when :each_char then emit(:mcall, [:chars, expr(r.receiver)])
                    when :each_byte then emit(:mcall, [:bytes, expr(r.receiver)])
                    else expr(r.receiver) end
-            pairs = emit(:mcall, [:each_with_index_pairs, base])
-            return iterate_array_value(n.copy(name: r.name == :map ? :map : r.name == :each || r.name == :each_char || r.name == :each_byte ? :each : r.name), args, pairs)
+            pairs = args[0] ? emit(:call, [demand(:__arr_each_with_index_pairs_from), base, expr(args[0])]) : emit(:mcall, [:each_with_index_pairs, base]) # with_index(1)
+            return iterate_array_value(n.copy(name: r.name == :map ? :map : r.name == :each || r.name == :each_char || r.name == :each_byte ? :each : r.name), [], pairs)
           end
         end
       end
@@ -1480,9 +1523,20 @@ module Indus
       # pairs comes back as a hash, what yields a value stays a value
       if n.receiver && !@recv_value && (kind_of(n.receiver) == :hash || %i[each_key each_value each_pair transform_values transform_keys].include?(n.name)) && blk
         case n.name
-        when :select, :filter, :reject
-          r = n.copy(name: n.name == :reject ? :reject : :select)
-          return emit(:call, [demand(:__pairs_to_hash), iterate_array_value(r, args, hash_pairs(expr(n.receiver)))])
+        when :select, :filter, :reject, :find_all, :filter!, :select!, :reject!, :keep_if, :delete_if
+          r = n.copy(name: %i[reject reject! delete_if].include?(n.name) ? :reject : :select)
+          res = emit(:call, [demand(:__pairs_to_hash), iterate_array_value(r, args, hash_pairs(expr(n.receiver)))])
+          return res unless n.name.to_s.end_with?("!") || %i[keep_if delete_if].include?(n.name)
+          return emit(:call, [demand(:__hash_replace), expr(n.receiver), res]) # in place: rebuild the receiver's slots from the result
+        when :merge # h.merge(o) { |key, old, new| }: the block decides on a clash
+          o = expr(args[0])
+          params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+          c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
+          return emit(:call, [demand(:__hash_merge_blk), expr(n.receiver), o, c])
+        when :fetch # h.fetch(k) { |k| default }
+          params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+          c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
+          return emit(:call, [demand(:__hash_fetch_blk), expr(n.receiver), expr(args[0]), c])
         when :each_key then return iterate_array_value(n.copy(name: :each), args, emit(:hkeys, [expr(n.receiver)]))
         when :each_value then return iterate_array_value(n.copy(name: :each), args, emit(:call, [demand(:__hash_values), expr(n.receiver)]))
         when :sum, :count, :find, :detect, :any?, :all?, :none?, :group_by, :min_by, :max_by, :partition, :each_with_object, :flat_map, :each_with_index, :reduce, :inject, :filter_map
@@ -1572,7 +1626,8 @@ module Indus
         len = emit(:alen, [arr])
         counted_loop(first, len, :lt, params, body) do |i, ps, pfx|
           @locals[:"#{pfx}#{ps[0]}"] = @locals[accv] if ps[0]
-          @locals[:"#{pfx}#{ps[1]}"] = emit(:aget, [arr, i]) if ps[1]
+          if ps[1].is_a?(Array) then el = emit(:aget, [arr, i]); ps[1].each_with_index { |pn, k| @locals[:"#{pfx}#{pn}"] = emit(:idx, [el, const(k)]) } # |m, (k, v)|
+          elsif ps[1] then @locals[:"#{pfx}#{ps[1]}"] = emit(:aget, [arr, i]) end
           @fold_target = accv
         end
         return @locals.delete(accv)
@@ -1738,7 +1793,7 @@ module Indus
         when :any?, :none? then @locals[resv] = emit(:or, [@locals[resv], truthy])
         when :find, :detect, :find_index # first hit wins: keep the earlier value once set
           tb, eb, mb = @f.new_block(:fthen), @f.new_block(:felse), @f.new_block(:fmerge)
-          found = kind == :find_index ? emit(:cmp, [@locals[resv], const(-1)], :ne) : emit(:cmp, [@locals[resv], const(0)], :ne)
+          found = kind == :find_index ? emit(:cmp, [@locals[resv], const(-1)], :ne) : emit(:cmp, [@locals[resv], (c = const(0); c.ty = :nil; c)], :ne) # nil typed: the sentinel of whatever the result becomes
           take = emit(:and, [truthy, emit(:cmp, [found, const(0)], :eq)])
           before = @locals.dup
           emit(:condbr, [take, tb, eb])
@@ -1851,14 +1906,23 @@ module Indus
     end
 
     # the block's element parameter(s): |x|, or |k, v| destructuring a pair
+    # the builtin a node certainly is: by literal shape, or by the pre-typing's kind
+    def builtin_kind(node) # by literal shape only: a variable's kind is a guess here, Types decides it
+      BUILTIN_CLASS_NODE.each { |k, nodes| return k if nodes.any? { node.is_a?(_1) } }
+      nil
+    end
+
     def bind_elem(ps, pfx, el)
       if ps.size == 1 && ps[0].is_a?(Array) # |(a, b)| over an array of pairs: destructure the element
         ps[0].each_with_index { |pn, k| @locals[:"#{pfx}#{pn}"] = emit(:idx, [el, const(k)]) }
         return
       end
-      ps = ps.flatten.compact if ps.any? { _1.is_a?(Array) } # |(a, b), x| : the names in order
       return if ps.empty?
-      if ps.size >= 2 then ps.each_with_index { |pn, k| @locals[:"#{pfx}#{pn}"] = emit(:idx, [el, const(k)]) }
+      if ps.size >= 2 # |(a, b), x| : the k-th parameter takes el[k]; a nested list destructures that element
+        ps.each_with_index do |pn, k|
+          if pn.is_a?(Array) then sub = emit(:idx, [el, const(k)]); pn.each_with_index { |nm, j| @locals[:"#{pfx}#{nm}"] = emit(:idx, [sub, const(j)]) }
+          else @locals[:"#{pfx}#{pn}"] = emit(:idx, [el, const(k)]) end
+        end
       else @locals[:"#{pfx}#{ps[0]}"] = el end
     end
 
@@ -2313,9 +2377,15 @@ module Indus
     end
 
     MATH_CONSTS = { PI: Math::PI, E: Math::E }.freeze
+    FLOAT_CONSTS = { INFINITY: Float::INFINITY, NAN: Float::NAN, MAX: Float::MAX, MIN: Float::MIN, EPSILON: Float::EPSILON }.freeze
+    FLOAT_INT_CONSTS = { DIG: Float::DIG, MAX_EXP: Float::MAX_EXP, MIN_EXP: Float::MIN_EXP, MANT_DIG: Float::MANT_DIG }.freeze
     def expr_const_path(n)
       # Mod::NAME -> the constant; Mod::Klass handled by callers (Klass.new)
       return fconst(MATH_CONSTS.fetch(n.name)) if n.parent.is_a?(Prism::ConstantReadNode) && n.parent.name == :Math
+      if n.parent.is_a?(Prism::ConstantReadNode) && n.parent.name == :Float
+        return fconst(FLOAT_CONSTS[n.name]) if FLOAT_CONSTS.key?(n.name)
+        return const(FLOAT_INT_CONSTS[n.name]) if FLOAT_INT_CONSTS.key?(n.name)
+      end
       emit(:gget, [n.name])
     end
 
@@ -2333,6 +2403,7 @@ module Indus
     # p of one value: arrays are inspected element by element, everything else by type
     def p_one(a)
       if kind_of(a) == :array then emit(:puts_str, [inspect_str(a)])
+      elsif a.is_a?(Prism::CallNode) && a.name == :class && a.arguments.nil? && a.receiver then emit(:puts_v, [expr(a)]) # p x.class: the class name, unquoted (classes are names at run time)
       else emit(:p_v, [expr(a)]) end       # inspect form: strings quoted, nil as "nil"
     end
 

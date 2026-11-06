@@ -1,0 +1,39 @@
+#!/usr/bin/env ruby
+# tools/probe file.rb : run each top-level line of a probe file as its own program (with the file's
+# preamble lines -- assignments -- prepended), compare with CRuby, print a histogram of failures.
+#   lines that are assignments (x = ...) form the preamble; every other line is one probe.
+require "open3"
+file = ARGV[0] or abort "tools/probe file.rb"
+lines = File.readlines(file, chomp: true).reject { _1.strip.empty? || _1.start_with?("#") }
+pre, probes = lines.partition { _1 =~ /\A[a-z_][a-z_0-9]*\d? = [^;]*\z/ } # one plain assignment per preamble line
+pre_src = pre.join("\n") + "\n"
+# `p a, b, c` -> three probes (split at depth-0 commas), so the histogram counts methods, not lines
+def split_top(s)
+  parts = []; depth = 0; cur = +""; q = nil
+  s.each_char do |c|
+    if q then cur << c; q = nil if c == q; next end
+    case c
+    when '"', "'" then q = c
+    when "(", "[", "{" then depth += 1
+    when ")", "]", "}" then depth -= 1
+    when "," then (parts << cur; cur = +""; next) if depth == 0
+    end
+    cur << c
+  end
+  parts << cur
+end
+probes = probes.flat_map { |ln| ln =~ /\Ap (.*)\z/ && !ln.include?(" rescue ") ? split_top($1).map { "p #{_1.strip}" } : [ln] }
+pass = 0; fails = []
+probes.each do |ln|
+  src = pre_src + ln + "\n"
+  want, _ = Open3.capture2e("ruby", "--disable-gems", "-e", src)
+  got, _ = Open3.capture2e("timeout", "-k", "1", "20", "env", "INDUS_HEAP_MB=64", "bin/indus", "-e", src) rescue nil
+  got = got.to_s.lines.reject { _1.start_with?("indus:") || _1.start_with?("\tfrom") }.join
+  if want == got then pass += 1
+  else
+    msg = got.lines.first.to_s.scrub.sub(/\A.*?: /, "")[0, 90].strip
+    fails << [ln[0, 70], msg.empty? ? "(wrong output)" : msg]
+  end
+end
+puts "#{pass}/#{probes.size} pass"
+fails.group_by(&:last).sort_by { -_2.size }.each { |m, ls| puts "\n#{ls.size}x #{m}"; ls.each { puts "    #{_1[0]}" } }

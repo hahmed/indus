@@ -55,7 +55,7 @@ def __float_to_s(f)
     return "NaN"
   end
   if f == 0.0
-    return "0.0"
+    return __fbits(f) < 0 ? "-0.0" : "0.0" # the sign bit survives the compare
   end
   neg = f < 0.0
   a = neg ? 0.0 - f : f
@@ -107,6 +107,7 @@ end
 
 # String#inspect: quotes, with \n \t \" \\ escaped
 def __quote(s)
+  return "nil" if __nil_str(s) # a String slot holding nil: s[100], h["missing"], a[9]
   out = "\""
   i = 0
   while i < s.length
@@ -393,6 +394,7 @@ end
 # split(" ") is awk-style: runs of whitespace, leading/trailing ignored.
 def __str_split(s, sep)
   out = []
+  return __str_chars(s) if sep.length == 0
   if sep == " "
     i = 0
     while i < s.length
@@ -937,9 +939,17 @@ end
 def __str_reverse(s)
   out = __salloc(s.length)
   i = 0
+  w = s.length
   while i < s.length
-    __st8(out, i, __ld8(s, s.length - 1 - i))
-    i = i + 1
+    n = __utf8_len(__ld8(s, i)) # a multibyte character keeps its byte order
+    n = s.length - i if i + n > s.length
+    w = w - n
+    k = 0
+    while k < n
+      __st8(out, w + k, __ld8(s, i + k))
+      k = k + 1
+    end
+    i = i + n
   end
   out
 end
@@ -993,12 +1003,16 @@ def __str_tr(s, from, to)
   out
 end
 
+# one element per UTF-8 character: the lead byte says how many bytes follow
+def __utf8_len(b) = b < 128 ? 1 : (b >= 240 ? 4 : (b >= 224 ? 3 : (b >= 192 ? 2 : 1)))
 def __str_chars(s)
   out = []
   i = 0
   while i < s.length
-    out.push(s[i, 1])
-    i = i + 1
+    n = __utf8_len(__ld8(s, i))
+    n = s.length - i if i + n > s.length
+    out.push(s[i, n])
+    i = i + n
   end
   out
 end
@@ -1135,8 +1149,8 @@ def __str_to_sym(s)
     return __sym_of_id(i) if SYMBOL_NAMES[i] == s
     i = i + 1
   end
-  __trap
-  __sym_of_id(0)
+  # a name the program never spelled as a literal: intern it now (the table is a global array)
+  __sym_of_id(__intern(__sdup(s)))
 end
 
 # s[i] = str: bytes replaced in place when the lengths match (one byte for one byte);
@@ -1252,4 +1266,82 @@ def __str_to_sym_q(s)
     i = i + 1
   end
   __sym_of_id(0)
+end
+
+# split(sep, limit): a negative limit keeps trailing empty fields; a positive one caps the pieces
+def __str_split2(s, sep, limit)
+  return __str_split(s, sep) if limit == 0
+  out = []
+  if sep == " " # awk-style with a limit: fields on whitespace runs, the last piece is the untouched remainder
+    i = 0
+    while i < s.length
+      while i < s.length && __str_space(__ld8(s, i))
+        i = i + 1
+      end
+      return out if i >= s.length
+      if limit > 0 && out.length == limit - 1
+        out.push(s[i, s.length - i])
+        return out
+      end
+      start = i
+      while i < s.length && !__str_space(__ld8(s, i))
+        i = i + 1
+      end
+      out.push(s[start, i - start])
+    end
+    return out
+  end
+  start = 0
+  i = 0
+  while i <= s.length - sep.length && sep.length > 0
+    if limit > 0 && out.length == limit - 1
+      i = s.length
+    elsif __str_match_at(s, sep, i)
+      out.push(s[start, i - start])
+      i = i + sep.length
+      start = i
+    else
+      i = i + 1
+    end
+  end
+  out.push(s[start, s.length - start])
+  out
+end
+
+# Float#%: floored modulo, the sign of the divisor (3.7 % 1 = 0.7, -3.7 % 1 = 0.3)
+def __float_mod(a, b)
+  fl = __num_floor(a / b)
+  a - b * fl.to_f
+end
+def __float_divmod(a, b)
+  q = __num_floor(a / b)
+  [q, a - b * q.to_f]
+end
+def __float_floor1(f, digits)
+  m = 1.0
+  i = 0
+  while i < digits
+    m = m * 10.0
+    i = i + 1
+  end
+  __num_floor(f * m).to_f / m
+end
+def __float_ceil1(f, digits)
+  m = 1.0
+  i = 0
+  while i < digits
+    m = m * 10.0
+    i = i + 1
+  end
+  __num_ceil(f * m).to_f / m
+end
+# round(-n) on a Float: an Integer, to tens / hundreds
+def __float_round_neg(f, digits)
+  m = 1
+  i = 0
+  while i < 0 - digits
+    m = m * 10
+    i = i + 1
+  end
+  __float_round0(f / m.to_f) * m
 end

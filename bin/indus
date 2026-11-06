@@ -6,9 +6,10 @@ require_relative "../lib/indus"
 require_relative "../lib/indus/macho"
 require_relative "../lib/indus/elf"
 
-file = ARGV[0] or abort "usage: indus file.rb [-o out]"
+file = ARGV[0] or abort "usage: indus file.rb [-o out] | indus -e 'code'"
+if file == "-e" then src_inline = ARGV[1] or abort "indus -e needs code"; file = "-e" end
 out = ARGV[ARGV.index("-o") + 1] if ARGV.include?("-o")
-src = File.read(file)
+src = src_inline || File.read(file)
 
 if ARGV.include?("--check")
   begin

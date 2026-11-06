@@ -57,7 +57,7 @@ module Indus
     def self.hsh(t) = t.is_a?(Array) && t[0] == :hash
     def self.cell?(t) = t.is_a?(Array) && t[0] == :cell # a shared local: one word on the heap
 
-    def self.reset! = (@ivars = nil; @consts = nil; @instances = nil)
+    def self.reset! = (@ivars = nil; @consts = nil; @instances = nil; @instancings = nil)
     # a prelude function by name: lowered on first use, typed in the current fixpoint
     def self.fn(name)
       f = @lower.demand(name)
@@ -391,6 +391,9 @@ module Indus
                 i.op = :idx_set; i.args = i.args[1..]; i.ty = nil; i.bound_to = nil; changed = true
                 forget_params(callee, funcs); next
               end
+              if !@settled && i.routed && %i[sort min max].include?(i.routed) && callee.name.to_s =~ /\A__arr_(sort|min|max)(\$\d+)?\z/ && (rt = of(f, i.args[1])) && arr(rt) && rt[1] == :sym
+                i.args[0] = fn(:"__arr_#{i.routed}_sym"); i.ty = nil; i.bound_to = nil; changed = true; next # symbols order by name, bound while the element type was unknown
+              end
               if !@settled && i.routed && (fm = callee.name.to_s[/\A__(str|arr|hash|num)_/, 1]) && (rt = of(f, i.args[1])) && !f.name.to_s.start_with?("__")
                 kind_now = rt == :str ? "str" : arr(rt) ? "arr" : hsh(rt) ? "hash" : %i[int int? float].include?(rt) ? "num" : nil
                 if kind_now != fm && (rt == :dyn || kind_now)
@@ -537,7 +540,10 @@ module Indus
       f.all.each do |i| # is_a?: decided here; a poly receiver needs its tag at run time
         next unless i.op == :isa
         v, cname = i.args; t = of(f, v)
-        want = { Integer: :int, Float: :float, String: :str, Array: :arr, Hash: :hash }[cname]
+        want = { Integer: :int, Float: :float, String: :str, Array: :arr, Hash: :hash, Symbol: :sym, NilClass: :nil, TrueClass: :bool, FalseClass: :bool }[cname]
+        if cname == :Numeric && !t.nil? && t != :dyn && !poly?(t) then i.op = :const; i.args = [%i[int int? float].include?(t) ? 1 : 0]; i.ty = :bool; next end
+        if cname == :Comparable && !t.nil? && t != :dyn && !poly?(t) then i.op = :const; i.args = [%i[int int? float str].include?(t) || (t.is_a?(Symbol) && @classes[t] && @classes[t].mixins.include?(:Comparable)) ? 1 : 0]; i.ty = :bool; next end
+        if cname == :Object && !t.nil? && t != :dyn then i.op = :const; i.args = [1]; i.ty = :bool; next end
         if t == :dyn
           i.op = :isa_dyn; i.args = [v, cname] # tag test, or class id for user classes
         elsif poly?(t) && (@classes[cname] || @lower.modules.include?(cname))
@@ -572,20 +578,34 @@ module Indus
             end
           end
           if of(f, l) == :int? && of(f, r) == :nil then r.args[0] = INT_NIL; r.ty = :int
-          elsif of(f, r) == :int? && of(f, l) == :nil then l.args[0] = INT_NIL; l.ty = :int end
+          elsif of(f, r) == :int? && of(f, l) == :nil then l.args[0] = INT_NIL; l.ty = :int
+          elsif %i[eq ne].include?(i.cond) && [of(f, l), of(f, r)].map(&:to_s).sort == %w[bool nil] && [l, r].any? { |v| v.op == :const && v.ty == :nil }
+            # nil == false: both are the word 0, but they are different objects. A literal nil against a bool is never equal.
+            i.op = :const; i.args = [i.cond == :eq ? 0 : 1]; i.ty = :bool; i.cond = nil
+          end
         when :to_s # (by type, resolved in the fixpoint's settled round; anything left is an int)
           t = of(f, i.args[0])
           if t == :int? then i.op = :call; i.args = [fn(:__opt_to_s), i.args[0]]
+          elsif t == :nil && (i.args[0].op == :const || i.args[0].op == :phi && i.args[0].args.all? { |(_, v)| v.op == :const && v.ty == :nil }) then i.op = :sconst; i.args = [""] # nil.to_s: "" (a literal nil only; a joined nil may still widen)
+          elsif t == :bool then i.op = :bool_to_s
+          elsif t == :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]
           elsif (cs = classes_of(t)) # an object in a string: its to_s, or #<Klass>
             if cs.any? { @classes[_1].find_method(:to_s) } then i.op = :mcall; i.args = [:to_s, i.args[0]]; bind(f, i); i.ty = :str; changed = true
             else i.op = :sconst; i.args = ["#<#{cs.first}>"] end
           else i.op = :itos end
-        when :to_i then i.op = :stoi if of(f, i.args[0]) == :str
+        when :to_i
+          if of(f, i.args[0]) == :str then i.op = :stoi
+          elsif of(f, i.args[0]) == :nil && i.args[0].op == :const then i.op = :const; i.args = [0]; i.ty = :int end # nil.to_i
+        when :to_f then (i.op = :nop; i.ty = :float) if of(f, i.args[0]) == :float # already a Float
+        when :alen
+          if of(f, i.args[0]) == :int then i.op = :const; i.args = [8]; i.ty = :int # Integer#size: 8 bytes (the lowering guessed an array)
+          elsif of(f, i.args[0]) == :sym then nm = Inst.new(:call, [fn(:__sym_name), i.args[0]]); nm.ty = :str; nm.block = i.block; i.block.insts.insert(i.block.insts.index(i), nm); i.args = [nm] end
+
         when :puts_v, :p_v, :print_v
           t = of(f, i.args[0])
           i.op = case i.op
                  when :puts_v then { str: :puts_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil }.fetch(t, :puts_i)
-                 when :p_v then { str: :p_str, bool: :puts_bool, int?: :puts_opt, nil: :puts_nil_word }.fetch(t, :puts_i)
+                 when :p_v then { str: :p_str, bool: :puts_bool, int?: :p_opt, nil: :puts_nil_word }.fetch(t, :puts_i)
                  else { str: :print_str }.fetch(t, :print_i)
                  end
         when :lshift_or_append
@@ -753,6 +773,10 @@ module Indus
     def self.instance_for(f, ts, funcs)
       base = f.name.to_s.sub(/\$\d+$/, "")
       @instances ||= {}
+      # a call that keeps asking for a new instance of the same generic is a type that never settles
+      # (a hash where the helper wants an array): refuse rather than loop
+      @instancings ||= Hash.new(0)
+      raise "#{base}: instancing does not converge for argument types #{ts.inspect}" if (@instancings[[base, f.object_id]] += 1) > 200
       key = [base, ts.map { arr(_1) || hsh(_1) ? _1 : :_ }]
       @instances[key] ||= begin
         g = @lower.instantiate(f)
@@ -1057,6 +1081,10 @@ module Indus
       name, recv, *args = i.args
       t = of(f, recv)
       if name == :class && args.empty? && t == :dyn then i.op = :call; i.args = [fn(:__dyn_class_name), recv]; i.ty = :str; return end
+      if name == :class && args.empty? && (cn = { int: "Integer", float: "Float", str: "String", sym: "Symbol", bool: "TrueClass", nil: "NilClass" }[t] || (arr(t) && "Array") || (hsh(t) && "Hash"))
+        return if t == :bool || t == :nil && recv.op != :const # true/false share a type; a joined nil may still widen
+        i.op = :sconst; i.args = [cn]; i.ty = :str; return
+      end
       if t == :dyn && args.empty? && %i[to_s inspect].include?(name) then i.op = :call; i.args = [fn(name == :to_s ? :__dyn_to_s : :__dyn_inspect), recv]; i.ty = :str; return end
       if t == :dyn && args.empty? && name == :to_sym then i.op = :call; i.args = [fn(:__dyn_sym), recv]; i.ty = :sym; return end
       if t == :dyn && args.empty? && name == :to_i then i.op = :call; i.args = [fn(:__dyn_to_i), recv]; i.ty = :int; return end
@@ -1104,6 +1132,16 @@ module Indus
         in [:str, :to_sym] then i.op = :call; i.args = [fn(:__str_to_sym), recv]; i.ty = :sym; return
         in [:sym, :to_sym] then i.op = :nop; i.args = [recv]; i.ty = :sym; return
         in [:sym, :inspect] then i.op = :call; i.args = [fn(:__sym_inspect), recv]; i.ty = :str; return
+        in [:sym, :length | :size | :upcase | :downcase | :capitalize | :succ | :next | :empty?] # Symbol methods through the name
+          nm = Inst.new(:call, [fn(:__sym_name), recv]); nm.ty = :str; nm.block = i.block; i.block.insts.insert(i.block.insts.index(i), nm)
+          if %i[length size].include?(name) then i.op = :alen; i.args = [nm]; i.ty = :int; return end
+          if name == :empty? then i.op = :call; i.args = [fn(:__str_empty_p), nm]; i.ty = :bool; return end
+          r = Inst.new(:call, [fn(:"__str_#{name == :next ? :succ : name}"), nm]); r.ty = :str; r.block = i.block; i.block.insts.insert(i.block.insts.index(i), r)
+          i.op = :call; i.args = [fn(:__str_to_sym), r]; i.ty = :sym; return
+        in [:nil, :to_a] then i.op = :anew; i.args = [(z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z); z), z]; i.ty = [:arr, :dyn]; return
+        in [:nil, :to_i] then i.op = :const; i.args = [0]; i.ty = :int; return
+        in [:nil, :to_f] then i.op = :fconst; i.args = [0.0]; i.ty = :float; return
+        in [:nil, :to_s | :inspect] then i.op = :sconst; i.args = [name == :to_s ? "" : "nil"]; i.ty = :str; return
         in [:int, :to_f] then i.op = :itof; i.args = [recv]; i.ty = :float; return
         in [:float, :to_i] then i.op = :to_i; i.args = [recv]; i.ty = :int; return
         in [:float, :to_f] then i.op = :nop; i.args = [recv]; i.ty = :float; return
@@ -1141,14 +1179,29 @@ module Indus
           fm = fams[0]
           un = Inst.new(:call, [fn(:"__dyn_#{fm == 'num' ? 'int' : fm}"), recv]); un.ty = { "str" => :str, "arr" => [:arr, :dyn], "hash" => [:hash, :dyn, :dyn], "num" => :int }[fm]; un.block = i.block
           i.block.insts.insert(i.block.insts.index(i), un)
-          i.op = :call; i.args = [prelude_method(fm, name, args.size), un, *args]; return
+          pm = prelude_method(fm, name, args.size); i.op = :call; i.args = [pm, un, *args, *default_args(pm, i, args.size)]; return
         end
       end
       # prelude methods by family and name (__hash_x, __num_x, __str_x, __arr_x); an arity-suffixed
       # sibling (__arr_last1) serves a call with that many arguments, since defaults cannot be typed here
+      if arr(t) && t[1] == :sym && args.empty? && %i[sort min max].include?(name) # symbols order by name
+        i.op = :call; i.args = [fn(:"__arr_#{name}_sym"), recv]; return
+      end
+      if t == :sym && args.size == 1 && %i[<=> start_with? end_with? [] ==].include?(name) && name != :==
+        nm = Inst.new(:call, [fn(:__sym_name), recv]); nm.ty = :str; nm.block = i.block; i.block.insts.insert(i.block.insts.index(i), nm)
+        a0 = args[0]
+        if of(f, a0) == :sym then a0 = Inst.new(:call, [fn(:__sym_name), a0]); a0.ty = :str; a0.block = i.block; i.block.insts.insert(i.block.insts.index(i), a0) end
+        i.op = :mcall; i.args = [name, nm, a0]; i.ty = nil; return bind(f, i)
+      end
+      if t == :float && args.empty? && %i[round floor ceil truncate to_i].include?(name)
+        i.op = :call; i.args = [fn(name == :round ? :__float_round0 : name == :floor ? :__num_floor : name == :ceil ? :__num_ceil : :__num_truncate), recv]; i.ty = :int; return
+      end
+      if t == :float && args.size == 1 && name == :fdiv then i.op = :div; i.args = [recv, args[0]]; i.ty = :float; return end
+      if t == :float && args.size == 1 && name == :divmod then i.op = :call; i.args = [fn(:__float_divmod), recv, args[0]]; return end
+      if t == :int && args.size == 1 && name == :divmod && of(f, args[0]) == :float then i.op = :call; i.args = [fn(:__float_divmod), recv, args[0]]; return end
       fam = hsh(t) ? "hash" : (t == :int || t == :float) ? "num" : t == :str ? "str" : arr(t) ? "arr" : nil
       if fam && (fn = prelude_method(fam, name, args.size))
-        i.op = :call; i.args = [fn, recv, *args]; i.routed = name; return # routed by the receiver's family: rebindable if the receiver changes kind
+        i.op = :call; i.args = [fn, recv, *args, *default_args(fn, i, args.size)]; i.routed = name; return # routed by the receiver's family: rebindable if the receiver changes kind
       end
       if t == :int && %i[succ pred].include?(name) && args.empty? # Integer#succ / #pred
         c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
@@ -1167,9 +1220,26 @@ module Indus
       end
     end
 
+    # the arity-suffixed helper first; the plain name only if it takes receiver + argc parameters
+    # (falling back regardless of arity silently dropped arguments: [1, 2, 2].count(2) was 3)
     def self.prelude_method(fam, name, argc)
       base = name.to_s.sub("?", "_p").sub("!", "_bang")
-      fnq(:"__#{fam}_#{base}#{argc}") || fnq(:"__#{fam}_#{base}")
+      f = fnq(:"__#{fam}_#{base}#{argc}")
+      return f if f
+      f = fnq(:"__#{fam}_#{base}") or return nil
+      return f if f.rest || f.params.size == argc + 1
+      # fewer arguments than parameters: fine when the missing ones are optionals with literal defaults
+      @lower.required_count(f) <= argc + 1 && argc + 1 <= f.params.size && @lower.optional_defaults(f).none? { _1 == :unsupported } ? f : nil
+    end
+
+    # the constants that complete a routed call to a prelude function with optional parameters
+    def self.default_args(f, at, argc)
+      missing = f.params.size - (argc + 1)
+      return [] if missing <= 0
+      @lower.optional_defaults(f).last(missing).map do |v|
+        c = Inst.new(:const, [v || 0]); c.ty = v.nil? ? :nil : :int; c.block = at.block
+        at.block.insts.insert(at.block.insts.index(at), c); c
+      end
     end
 
     def self.sym_const(at, name)
@@ -1233,6 +1303,13 @@ module Indus
         tr = Inst.new(:trap, []); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr)
         i.op = :const; i.args = [0]; i.ty = :nil
       elsif t == :nil then nil
+      elsif t == :int && i.args.size == 2 && !@settled.nil? && of(f, i.args[1]) == :int # n[k]: bit k
+        one = Inst.new(:const, [1]); one.ty = :int; one.block = i.block; i.block.insts.insert(i.block.insts.index(i), one)
+        sh = Inst.new(:shr, [r, i.args[1]]); sh.ty = :int; sh.block = i.block; i.block.insts.insert(i.block.insts.index(i), sh)
+        i.op = :and; i.args = [sh, one]; i.ty = :int
+      elsif t == :sym # :abc[0]: index the name
+        nm = Inst.new(:call, [fn(:__sym_name), r]); nm.ty = :str; nm.block = i.block; i.block.insts.insert(i.block.insts.index(i), nm)
+        i.args[0] = nm; i.ty = nil
       elsif @settled then raise "[] on #{t.inspect}" end # a scalar before settling may be a provisional join: wait
     end
 
@@ -1282,7 +1359,7 @@ module Indus
     def self.infer(f, i)
       a = i.args
       case i.op
-      when :const then %i[nil sym bool lambda].include?(i.ty) ? i.ty : :int
+      when :const then %i[nil sym bool lambda str].include?(i.ty) ? i.ty : :int # :str: the nil word in a String slot (__nil_str_value)
       when :fconst then :float
       when :sconst, :scat, :sappend, :itos, :bool_to_s, :chr, :sdup, :salloc then :str
       when :rawld8 then :int
@@ -1300,18 +1377,20 @@ module Indus
       when :hkey_at then (t = of(f, a[0])) && hsh(t) ? t[1] : nil
       when :hval_at then (t = of(f, a[0])) && hsh(t) ? t[2] : nil
       when :seq, :sne, :scmp then :bool
-      when :puts_i, :puts_str, :puts_bool, :puts_opt, :puts_nil, :print_i, :print_str, :p_str then :int
+      when :puts_i, :puts_str, :puts_bool, :puts_opt, :p_opt, :puts_nil, :print_i, :print_str, :p_str then :int
       when :p_v, :print_v then of(f, a[0]) && :int
       when :inspect_v then of(f, a[0]) && :str
       when :idx, :idx_set, :dsend, :mcall then nil
       when :lshift_or_append then (t = of(f, a[0])) && (t == :int ? :int : t)
-      when :to_s then (t = of(f, a[0])) && (t == :str ? :str : narrow(t) == :int ? :str : nil)
+      when :to_s then (t = of(f, a[0])) && (t == :str ? :str : narrow(t) == :int ? :str : %i[nil bool float int?].include?(t) ? :str : nil)
       when :puts_v then of(f, a[0]) && :int
       when :add, :sub, :mul, :div
         l, r = of(f, a[0]), of(f, a[1])
         l && r ? join(narrow(l), narrow(r)) : nil # both sides known, or no guess: a str * n is not an int
-      when :and, :or then (of(f, a[0]) == :bool && of(f, a[1]) == :bool) ? :bool : :int
-      when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :rawmunmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub, :handle then :int
+      when :and, :or then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int # nil is the word 0, false: nil & x, nil | x are booleans
+      when :xor then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int
+      when :mod then i.args.any? { of(f, _1) == :float } ? :float : :int
+      when :shl, :shr, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :rawmunmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub, :handle then :int
       when :cmp, :ucmp, :isa, :isa_dyn then :bool
       when :box then :dyn
       when :unbox then a[1]
@@ -1375,7 +1454,7 @@ module Indus
         b.insts.dup.each do |i|
           # operators: a float or Bignum operand lifts the other
           case i.op
-          when :add, :sub, :mul, :div, :cmp
+          when :add, :sub, :mul, :div, :cmp, :mod
             if i.args.any? { of(f, _1) == :float }
               i.args.map! { |v| %i[int int?].include?(of(f, v)) ? coerce(f, b, i, v, :float) : v }
               i.cond = :"f#{i.cond}" if i.op == :cmp
