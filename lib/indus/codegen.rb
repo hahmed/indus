@@ -581,9 +581,17 @@ module Indus
           @asm.call_write
         when :condbr
           c, t, e = i.args
-          phi_moves(b, t); phi_moves(b, e)
           nb = next_block(b)
-          if c.op == :cmp && fused?(c)
+          if phi_pending?(b, t) || phi_pending?(b, e)
+            # a successor's phi takes a value from this block: the copies belong to that edge only. Emitted
+            # before the branch they would run on the other edge too and clobber a register live there.
+            lf = phi_pending?(b, e) ? @asm.uniq : lbl(e)
+            if c.op == :cmp && fused?(c) then @asm.bcond(Asm::INV[c.cond], lf)
+            elsif c.ty == :dyn then r = reg(c); @asm.cbz(r, lf); @asm.cmpi(r, 10); @asm.bcond(:eq, lf)
+            else @asm.cbz(reg(c), lf) end
+            phi_moves(b, t); @asm.b(lbl(t))
+            if phi_pending?(b, e) then @asm.label(lf); phi_moves(b, e); @asm.b(lbl(e)) end
+          elsif c.op == :cmp && fused?(c)
             if nb == e then @asm.bcond(c.cond, lbl(t))
             else @asm.bcond(Asm::INV[c.cond], lbl(e)); @asm.b(lbl(t)) unless nb == t end
           elsif c.ty == :dyn # nil (0) and false (10) are the falsy words
@@ -651,6 +659,7 @@ module Indus
              end
       d.is_a?(Integer) ? @asm.mov(d, sreg) : @asm.str(sreg, @spill_base + 8 * d[1])
     end
+    def phi_pending?(from, to) = to.phis.any? { |p| (v = p.args.find { _1[0] == from }&.last) && loc(p) != loc(v) }
     def phi_moves(from, to)
       moves = to.phis.filter_map { |p| v = p.args.find { _1[0] == from }&.last; v && [loc(p), loc(v)] }
       moves.reject! { |(d, s)| d == s }

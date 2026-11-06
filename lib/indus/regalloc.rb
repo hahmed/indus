@@ -157,14 +157,14 @@ module Indus
         # the hint's last use is this very instruction (`i = i + 1` feeding the phi): for an op whose
         # codegen reads every operand before writing the result, the register can be reused in place,
         # and the latch copy disappears
-        if ENV["REUSE_LAST"] && h && REUSE_OK.include?(it.v.op) && (a = active.find { |x| x.v.reg == h && x.stop == it.start }) && pools.include?(pool_of.(h, fl))
+        if !ENV["NOREUSE"] && h && REUSE_OK.include?(it.v.op) && (a = active.find { |x| x.v.reg == h && x.stop == it.start }) && pools.include?(pool_of.(h, fl))
           active.delete(a); take.(it, h); next
         end
         # the hint is a loop phi read after the loop (`puts sum`): its interval spans the body although
         # it is dead there from our definition to the back edge. Share its register when the phi is not
         # live out of any block we live in and nothing in our span reads it; our value is what the phi
         # becomes at the back edge, so after the loop the register holds the right thing.
-        if ENV["SHARE_PHI"] && h && REUSE_OK.include?(it.v.op) && (a = active.find { |x| x.v.reg == h && x.v.op == :phi }) && it.stop <= a.stop &&
+        if !ENV["NOREUSE"] && h && REUSE_OK.include?(it.v.op) && (a = active.find { |x| x.v.reg == h && x.v.op == :phi }) && it.stop <= a.stop &&
            pools.include?(pool_of.(h, fl)) && dead_across?(a.v, it, blocks, bstart, bend, live_out, pos)
           it.v.reg = h; it.shared = true; active << it; next
         end
@@ -174,6 +174,8 @@ module Indus
         else
           # spill: the active interval in an allowed pool that ends last, if later than ours
           cands = active.select { |a| a.v.reg && pools.include?(pool_of.(a.v.reg, fl)) && a.v.op != :param }
+          # a register shared between a phi and its back-edge value cannot be taken from one of them alone
+          cands.reject! { |a| a.shared || active.any? { |x| x.shared && x.v.reg == a.v.reg } }
           victim = cands.max_by(&:stop)
           if victim && victim.stop > it.stop
             r = victim.v.reg; victim.v.reg = nil; spill.(victim); active.delete(victim)
@@ -191,7 +193,7 @@ module Indus
       blocks.all? do |b|
         next true if bend[b] < it.start || bstart[b] > it.stop
         next false if live_out[b][p]
-        b.insts.none? { |i| pos[i] > it.start && pos[i] <= it.stop && i.args.include?(p) }
+        b.insts.none? { |i| pos[i] > it.start && i.args.include?(p) } # any later read in a block we touch: the register holds our value by then
       end
     end
 
