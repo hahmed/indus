@@ -1,129 +1,115 @@
 # Memory without a generational GC
 
-*Why Indus does not need the collector everyone assumes it needs, in the order the
-reasoning actually went. Written for a conversation with someone who knows GCs well.*
+Decision: Indus does not get a generational collector. Measured 2026-11-06.
 
-## The three brackets
+## Three ways to free memory
 
-Every runtime frees memory one of three ways. The interesting design question is how much
-work you can push leftward.
+1. **Static, from structure.** Rust: one owner per value, freed when the owner dies.
+   Zero runtime cost. Ruby has no ownership, so this is not available.
+2. **Tracing GC.** Copying costs ∝ live data. Mark-sweep costs ∝ all data.
+   Generational adds a write barrier on every pointer store to collect young objects
+   often and old ones rarely.
+3. **Escape analysis.** The compiler proves a value dies before its function or loop
+   iteration ends. Stack object, or reset the bump pointer at the back edge. Zero cost
+   where proven, GC elsewhere.
 
-1. **Statically, from structure.** The compiler knows when a value dies and emits the
-   free (or never allocates on the heap at all). Rust gets this from ownership: every value
-   has one owner, dies with it, the programmer proves it to the borrow checker. Zero cost at
-   run time.
-2. **Dynamically, by tracing.** The runtime finds what is reachable from the roots and
-   reclaims the rest. Go, Java, CRuby. The cost shape depends on the algorithm: copying is
-   proportional to *live* data, mark-sweep to *all* data, and generational schemes trade a
-   write barrier on every pointer store for collecting the young often and the old rarely.
-3. **Statically, by proof of lifetime.** Escape analysis: the compiler proves a value does
-   not outlive its function or its loop iteration and keeps it off the heap (stack object)
-   or reclaims it wholesale at the loop's back edge (region). Zero cost where proven; falls
-   back to bracket 2 elsewhere. The JVM does some of this; the BEAM gets the same effect
-   from per-process heaps thrown away at process death; Phoenix's per-request discipline is
-   the same idea done by hand.
-
-Ruby has no ownership, so bracket 1 is not available as such. The Indus bet is that most
-Ruby values have *provable lifetimes* anyway (bracket 3), and the collector only has to
-handle what is genuinely shared or long-lived.
+Indus: 3 where provable, 2 for the rest.
 
 ## What Indus has
 
-- **No object headers.** A pointer is followed with the *type of the slot that holds it*
-  (the collector is given the field types per class, the element type per array, the
-  key/value types per hash). The collector never guesses what a word is. This is the
-  opposite of a conservative collector, and it is what makes everything else cheap:
-  objects are exactly their fields, an Integer is a machine word, a Float is a register.
-- **A copying (Cheney) collector**, two semispaces, in ~330 lines of Ruby compiled by the
-  same compiler. Cost proportional to live data. The old space is freed by swapping, not
-  per object: no fragmentation, no free lists, no sweep.
-- **Stack objects** (tier 0): an object that never escapes its function lives in the frame.
-- **Loop regions** (tier 1): when nothing allocated in a loop iteration survives the back
-  edge, the bump pointer is reset there. A per-request arena, derived rather than written.
-  The `server` benchmark runs in 4 MB this way where Spinel takes 67.
-- **Stable handles** for the one case that defeats "a value is where it was made": a
-  container grown through a parameter gets a one-word cell, so growth is visible to every
-  holder (notes/32, notes/53). Only functions that grow pay.
+- No object headers. The collector is told the type of every slot (field types per class,
+  element type per array, key/value per hash). Never guesses what a word is.
+- Copying collector, two semispaces, ~330 lines of Ruby. Cost ∝ live data. Old space
+  freed by one swap. No fragmentation, no sweep.
+- Stack objects: an object that never escapes its function lives in the frame.
+- Loop regions: if nothing allocated in an iteration survives the back edge, the bump
+  pointer resets there. `server` benchmark runs in 4 MB; Spinel 67 MB.
+- Cells for containers grown through a parameter (notes/32, notes/53).
 
-## Why not generational, measured
+## The measurement
 
-The plan was a nursery, a remembered set, and write barriers, for csv_build (400k rows
-kept, 276 ms). Before building it, two measurements:
+csv_build keeps 400k rows. 276 ms.
 
-- Run csv_build with a 1 GB heap so the collector never fires: **276 -> 185 ms**. That is
-  the *ceiling* of any collector change -- 90 ms on one benchmark, and zero on
-  template_render and tree_walker, which allocate heavily but keep little (copying is
-  already free for them).
-- A pure-retention probe (400k strings kept, five collections): the collector moves data at
-  **~7 GB/s**, near memcpy. A smarter collector cannot take much back from that.
+- 1 GB heap, collector never runs: **185 ms**. Ceiling of any GC change: 90 ms, one
+  benchmark. template_render, tree_walker: 0 gain.
+- 400k strings kept, 5 collections: collector moves ~7 GB/s. Near memcpy.
+- Cost of generational: a compare on every pointer store, in every program. fib, nbody,
+  tree_walker pay 0 for GC today.
 
-Against that: a write barrier is a compare on every pointer store in every program,
-forever -- paid by fib, nbody and tree_walker, which currently pay nothing for the GC at
-all. The design rule is "dynamism and memory management cost only where used"; a barrier
-violates it to recover at most 90 ms on one program. Not built.
+Not built.
 
-## Where the time actually was
+## Where the time is
 
-The same 1 GB run showed csv_build allocating **477 MB for 400k rows**: 1.2 KB a row for
-~40 bytes of content. Not a collection problem; an *allocation rate* problem, spread over
-ten small allocations per row that Ruby semantics mostly require (fresh literals in an
-array, to_s, interpolations, `* 2`, gsub, the row buffer growing from empty, its cell).
+Same 1 GB run: csv_build allocates **477 MB** for 400k rows. 1.2 KB per row, ~40 bytes of
+content. Ten small allocations per row, most required by Ruby semantics (`"a" + "b"`
+makes a new string).
 
-Rust wins this benchmark by allocating ~100 bytes a row -- not by collecting better, by
-*knowing when each temporary dies* and reusing the buffer. The Indus equivalent is the
-loop region. csv_build defeats the current region rule because one value escapes each
-iteration (`rows << line`). The extension -- allow named survivors, copy them out at the
-back edge, reset everything else -- is compile-time ownership inference for the common loop
-shape. It reaches the 185 ms floor with no runtime cost outside such loops. That is the
-next memory project; the collector is not.
+Rust: ~100 bytes per row. Not better collection; knows when temporaries die, reuses the
+buffer.
 
-Two cheap fixes fell out of the measurement: a string growing from empty now starts at 32
-bytes (exact fit from zero reallocated on every append: 477 -> 429 MB), and gsub with a
-string pattern sizes its result once instead of concatenating per match.
+Indus equivalent: loop regions. csv_build defeats the current rule because `rows << line`
+escapes. Extension: allow named survivors, copy them out at the back edge, reset the rest.
+Reaches 185 ms. No runtime cost elsewhere. Next memory project.
 
-## Honest limitations, for the committer conversation
+Fixed from the same measurement:
+- strings growing from empty start at 32 bytes (was exact fit from 0, realloc every
+  append): 477 → 429 MB.
+- gsub(string) sizes result once (was concatenating per match, 260 B garbage per call).
+- csv_build 276 → 262 ms.
 
-- **Pauses are proportional to live data.** No concurrent or incremental collection,
-  because there is no barrier. A 500 MB live set means tens of milliseconds per collection.
-  For a long-running server with a large resident set this is the real cost of the design,
-  and the honest answer is: regions keep most request work out of the heap entirely, so
-  the live set is the genuinely long-lived state, and collections are rare -- but when one
-  runs, it runs over all of it.
-- **Memory is not returned to the OS** when the live set shrinks: the abandoned semispace
-  stays mapped. RSS tracks the high-water mark. Fixable (munmap on shrink), not done.
-- **Semispaces mean 2x address space** for the live set. Address space, not RSS: pages are
-  touched only as they are used.
-- **Large live sets double the space on growth** (a quarter-full-after-collection rule);
-  a run that grows its live set steadily pays log(n) extra copies. Measured on csv_build:
-  28 collections, and growing faster cost RSS for nothing.
-- **Typed slots need whole-program types.** Code compiled later (a seam) must agree with
-  the layouts already chosen; a class whose layout changes at run time is the world-age
-  problem (notes/37), still parked.
+## Limitations
 
-## How this compares
+- Pauses ∝ live set. No barrier → no concurrent/incremental collection. 500 MB live set:
+  tens of ms per collection.
+- Memory not returned to OS on shrink. RSS tracks high-water mark. Fixable (munmap).
+- Semispaces: 2× address space for the live set. Address space, not RSS.
+- Typed slots need whole-program types. Runtime class-layout change = world-age problem
+  (notes/37), parked.
+- No finalizers, ObjectSpace, WeakRef. No headers → cannot enumerate objects.
+- No `frozen?` bit, no `object_id`, no singleton methods.
+
+## Strengths to name
+
+- Precise roots (typed homes per safepoint). CRuby scans the C stack conservatively,
+  cannot move most objects, compacts partially. Indus moves everything.
+- Bump allocation: 3 instructions. Rust's Box goes through malloc size classes. Part of
+  binary_trees 1.0 ms vs Rust 2.5.
+- CRuby's Variable Width Allocation (3.2+) already moves toward "objects are their
+  fields". Typed slots are the end of that road.
+
+## Comparison
 
 | | CRuby | Spinel | Go | Rust | Indus |
 |---|---|---|---|---|---|
-| value representation | tagged VALUE + 40 B RVALUE | 16 B box + 48 B header | typed, unboxed | typed, unboxed | typed, unboxed, 1-word tag only where polymorphic |
-| collector | mark-sweep + compaction, incremental | mark-sweep | concurrent mark-sweep, barrier | none (ownership) | copying, typed slots, no barrier |
-| cost scales with | all objects | all objects | all objects + barrier | 0 | live objects only |
-| short-lived work | heap | heap | heap (some escape analysis) | stack/arena by ownership | stack objects + loop regions, proved |
-| csv_build-shaped code | — | 410 ms | — | ~100 B/row | 262 ms, 185 floor without regions-with-survivors |
+| value | tagged VALUE + 40 B RVALUE | 16 B box + 48 B header | typed | typed | typed, 1-word tag only where polymorphic |
+| collector | mark-sweep, incremental | mark-sweep | concurrent mark-sweep + barrier | none | copying, typed slots, no barrier |
+| cost ∝ | all objects | all objects | all objects + barrier | 0 | live objects |
+| short-lived work | heap | heap | heap, some escape analysis | stack by ownership | stack objects + regions, proved |
 
-The one-sentence version: *Spinel and CRuby pay per object, Go pays per store, Rust makes
-the programmer pay, Indus pays per live object and only where a lifetime cannot be
-proved.*
+One sentence: Spinel and CRuby pay per object, Go pays per store, Rust makes the
+programmer pay, Indus pays per live object and only where a lifetime cannot be proved.
 
-## What I would ask a Ruby core committer
+## Where Rust stays ahead
 
-- How much of CRuby's object header is load-bearing for semantics (frozen, object_id,
-  singleton class, flags) versus for the collector? Indus has none of it and has not
-  needed `object_id` or `freeze` in 240 oracle programs; `frozen?` is the one thing it
-  cannot answer truthfully.
-- Variable Width Allocation moved CRuby towards "objects are their fields"; is there
-  appetite for the typed-slot idea (the collector told the field types) in CRuby's GC, or
-  does the C extension API make that impossible?
-- The YJIT view of escape analysis: how much of a typical Rails request's allocation is
-  provably request-local? If it is most of it, regions beat a better collector there too.
+Allocation volume forced by Ruby semantics. Compute: parity (fib 14.5 vs 14.8). Memory
+traffic: often ahead (binary_trees 1.0 vs 2.5). Allocation: behind by exactly what the
+compiler cannot prove away. A Ruby that allocates like Rust is not Ruby.
 
-*Numbers from 2026-11-05/06; see indus notes/64, bench/REPORT.md.*
+## Spinel vs Indus
+
+Different question, not different ability. Spinel: a compiler the Ruby community can own
+in C for twenty years, close to full Ruby. Every conservative choice serves that. Indus:
+an experiment on how much of Ruby's cost is representation. Allowed to refuse programs,
+whole-program, written in Ruby. Experiments beat products on benchmarks; that is their
+job. What Indus has is findings. The ask to a committer: which of these survives contact
+with full Ruby?
+
+## Questions for a core committer
+
+- How much of CRuby's object header is semantics (frozen, object_id, singleton) vs
+  collector? Indus has none; 238 oracle programs have not needed object_id or freeze.
+- Is there appetite for typed slots in CRuby's GC, or does the C extension API prevent it?
+- How much of a Rails request's allocation is provably request-local? If most, regions
+  beat a better collector.
+
+*Numbers: indus notes/64, bench/REPORT.md.*
