@@ -1716,3 +1716,7 @@ end
 def __dyn_join(v, sep) = __arr_join(__dyn_arr(v), sep)
 def __dyn_first1(v, n) = __arr_first1(__dyn_arr(v), n)
 def __dyn_last1(v, n) = __arr_last1(__dyn_arr(v), n)
+def __dyn_slice_range(v, lo, hi, excl)
+  return __arr_slice_range(__dyn_arr(v), lo, hi, excl) if __tag(v) == 4
+  __str_slice_range(__dyn_str(v), lo, hi, excl)
+end

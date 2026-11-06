@@ -469,10 +469,10 @@ module Indus
       exc = emit(:exc_value, [])
       arms = rescues.map do |(classes, ref, body)|
         test = classes.map { |cn| emit(:isa, [exc, cn]) }.reduce { |a, b| emit(:or, [a, b]) }
-        [test, ref, body]
+        [test, ref, body, classes]
       end
       ends = []
-      arms.each do |test, ref, body|
+      arms.each do |test, ref, body, classes|
         tb, nb = @f.new_block(:rescue), @f.new_block(:norescue)
         emit(:condbr, [test, tb, nb])
         @cur = tb; @locals = before.dup
@@ -720,6 +720,7 @@ module Indus
       when Prism::UnlessNode then if_expr(n, negate: true)
       when Prism::UntilNode then while_stmt(n, negate: true)
       when Prism::CaseNode then case_expr(n)
+      when Prism::CaseMatchNode then case_match_expr(n)
       when Prism::BeginNode then begin_expr(n)
       when Prism::RescueModifierNode then rescue_modifier(n) # expr rescue fallback
       when Prism::SuperNode, Prism::ForwardingSuperNode # super(args) / super: the superclass's version of this method
@@ -1323,6 +1324,9 @@ module Indus
         else
           emit(:call, [demand(:__float_round), expr(n.receiver), expr(args[0])])
         end
+      elsif n.name == :throw && n.receiver.nil? && args.size >= 1 # throw :tag, value
+        exc = new_exception(:IndusThrow, [args[0], args[1] || Prism::NilNode.new(n.send(:source), 0, n.location, 0)])
+        emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc]); nil_const
       elsif n.name == :raise && n.receiver.nil?
         # raise "m" -> RuntimeError.new("m"); raise K, "m" -> K.new("m"); raise obj -> obj
         exc = if args.empty? then new_exception(:RuntimeError, [])
@@ -1604,6 +1608,12 @@ module Indus
       end
       if n.receiver && !@recv_value && n.name == :map && times_enum?(n.receiver)
         return iterate_array_value(n, args, range_array(n.receiver))
+      end
+      if n.name == :catch && n.receiver.nil? && blk.is_a?(Prism::BlockNode) && args.size == 1 # catch(:tag) { }: a begin rescuing the throw of that tag
+        tmpl = Prism.parse("tag__ = nil\nbegin\nrescue IndusThrow => thr__\n  raise thr__ unless thr__.tag == tag__\n  thr__.value\nend").value.statements.body[1]
+        rc = tmpl.rescue_clause
+        @locals[lname(:tag__)] = expr(args[0])
+        return begin_expr(nil, stmts: blk.body&.body || [], rescues: [[[:IndusThrow], rc.reference, rc.statements.body]], ensure_body: [])
       end
       if n.name == :loop && n.receiver.nil? && blk.is_a?(Prism::BlockNode) # loop { }: while true, ended by break (or a raise)
         hb, bb, xb = @f.new_block(:head), @f.new_block(:body), @f.new_block(:exit)
@@ -2220,6 +2230,87 @@ module Indus
     end
 
     def class_const?(c) = c.is_a?(Prism::ConstantReadNode) && (@classes[c.name] || %i[Integer Float String Array Hash Symbol].include?(c.name))
+
+    # case/in: each arm is a chain of tests that branch to the next arm on failure; bindings happen as
+    # the tests pass (a failed arm restores the locals), the guard runs after the bindings
+    def case_match_expr(n)
+      subj = expr(n.predicate)
+      mb = @f.new_block(:pmerge)
+      arms = []
+      before = @locals.dup
+      n.conditions.each do |inn|
+        fail_b = @f.new_block(:pnext)
+        @locals = before.dup
+        pat = inn.pattern
+        guard = nil
+        if pat.is_a?(Prism::IfNode) then guard = pat.predicate; pat = pat.statements.body[0]
+        elsif pat.is_a?(Prism::UnlessNode) then guard = [:not, pat.predicate]; pat = pat.statements.body[0] end
+        pattern_match(pat, subj, fail_b)
+        if guard
+          g = guard.is_a?(Array) ? emit(:cmp, [expr(guard[1]), const(0)], :eq) : expr(guard)
+          ok = @f.new_block(:pguard); emit(:condbr, [g, ok, fail_b]); @cur = ok
+        end
+        v = (inn.statements&.body || []).map { expr(_1) }.last || nil_const
+        arms << [@cur, @locals, v] unless @cur.term
+        emit(:br, [mb]) unless @cur.term
+        @cur = fail_b
+      end
+      @locals = before.dup
+      ev = if n.else_clause then (n.else_clause.statements&.body || []).map { expr(_1) }.last || nil_const
+           else emit(:trap, []); nil_const end # NoMatchingPatternError
+      arms << [@cur, @locals, ev] unless @cur.term
+      emit(:br, [mb]) unless @cur.term
+      @cur = mb
+      @locals = merge_locals(mb, arms.map { |(b, l, _)| [b, l] })
+      ph = mb.phi; ph.args = arms.map { |(b, _, v)| [b, v] }; ph
+    end
+
+    # emit the tests for `pat` against value v; on failure branch to fail_b; fall through on success
+    def pattern_match(pat, v, fail_b)
+      check = ->(cond) { ok = @f.new_block(:pok); emit(:condbr, [cond, ok, fail_b]); @cur = ok }
+      case pat
+      when Prism::LocalVariableTargetNode then @locals[lname(pat.name)] = v
+      when Prism::CapturePatternNode then pattern_match(pat.value, v, fail_b); @locals[lname(pat.target.name)] = v
+      when Prism::ConstantReadNode then check.(emit(:isa, [v, pat.name]))
+      when Prism::NilNode then check.(emit(:cmp, [v, nil_const], :eq))
+      when Prism::PinnedVariableNode then check.(emit(:cmp, [v, expr(pat.variable)], :eq))
+      when Prism::PinnedExpressionNode then check.(emit(:cmp, [v, expr(pat.expression)], :eq))
+      when Prism::RangeNode # a range matches numbers (or strings) in it; anything else fails rather than errors
+        bound = pat.left || pat.right
+        check.(emit(:isa, [v, bound.is_a?(Prism::StringNode) ? :String : :Numeric]))
+        lo = pat.left && expr(pat.left); hi = pat.right && expr(pat.right)
+        check.(emit(:cmp, [v, lo], :ge)) if lo
+        check.(emit(:cmp, [v, hi], pat.exclude_end? ? :lt : :le)) if hi
+      when Prism::AlternationPatternNode # a | b: a passes, or b does (no bindings inside)
+        ok = @f.new_block(:palt); try_b = @f.new_block(:palt2)
+        pattern_match(pat.left, v, try_b); emit(:br, [ok])
+        @cur = try_b; pattern_match(pat.right, v, fail_b); emit(:br, [ok])
+        @cur = ok
+      when Prism::ArrayPatternNode
+        check.(emit(:isa, [v, pat.constant.name])) if pat.constant
+        check.(emit(:isa, [v, :Array]))
+        n = pat.requireds.size + pat.posts.size
+        check.(emit(:cmp, [emit(:alen, [v]), const(n)], pat.rest ? :ge : :eq))
+        pat.requireds.each_with_index { |e, k| pattern_match(e, emit(:idx, [v, const(k)]), fail_b) }
+        if pat.rest.is_a?(Prism::SplatNode) && pat.rest.expression
+          @locals[lname(pat.rest.expression.name)] = emit(:mcall, [:slice_range, v, const(pat.requireds.size), const(-1 - pat.posts.size), const(0)])
+        end
+        pat.posts.each_with_index { |e, k| pattern_match(e, emit(:idx, [v, emit(:sub, [emit(:alen, [v]), const(pat.posts.size - k)])]), fail_b) }
+      when Prism::HashPatternNode
+        check.(emit(:isa, [v, pat.constant.name])) if pat.constant
+        check.(emit(:isa, [v, :Hash]))
+        pat.elements.each do |el|
+          key = el.key; kname = key.unescaped.to_sym
+          kc = const(sym_id(kname.to_s)); kc.ty = :sym
+          check.(emit(:hkey, [v, kc]))
+          got = emit(:idx, [v, kc])
+          if el.value.nil? || el.value.is_a?(Prism::ImplicitNode) then @locals[lname(kname)] = got # { name: } binds name
+          else pattern_match(el.value, got, fail_b) end
+        end
+      when Prism::FindPatternNode then raise "find pattern [*, x, *]: not supported"
+      else check.(emit(:cmp, [v, expr(pat)], :eq)) # a literal value
+      end
+    end
 
     def when_test(subj, c)
       return ->() { expr(c) } unless subj

@@ -289,6 +289,10 @@ module Indus
           v, cname = i.args; r = reg(v)
           case cname
           when :Integer then @asm.emit(0x92400000 | (r << 5) | 16); @asm.cmpi(16, 1); @asm.cset(d, :eq)        # bit 0
+          when :Numeric # a fixnum (bit 0) or a float (tag 14)
+            @asm.emit(0x92400000 | (r << 5) | 16); @asm.cmpi(16, 1); @asm.cset(d, :eq)
+            @asm.emit(0x92400C00 | (r << 5) | 16); @asm.cmpi(16, 14); @asm.cset(16, :eq); @asm.orr(d, d, 16)
+          when :Comparable, :Object then @asm.mov_imm(d, 1) # every tagged value compares (or is an Object)
           when :NilClass then @asm.cmpi(r, 0); @asm.cset(d, :eq)
           else
             tag = { String: 2, Array: 4, Hash: 6, Float: 14, TrueClass: 10, FalseClass: 10, Symbol: 12 }[cname]

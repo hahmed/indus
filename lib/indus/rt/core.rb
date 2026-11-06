@@ -810,6 +810,15 @@ class RangeError < StandardError
 end
 class FloatDomainError < RangeError
 end
+# catch/throw ride on the exception machinery: throw raises this, catch rescues it by tag
+class IndusThrow < StandardError
+  attr_reader :tag, :value
+  def initialize(tag, value)
+    @tag = tag
+    @value = value
+    @message = "uncaught throw"
+  end
+end
 class StopIteration < IndexError
 end
 class FrozenError < RuntimeError

@@ -1176,6 +1176,7 @@ module Indus
         cands.each { |k| related(k).each { _1.tagged = true; _1.boxed = true } }
         i.args[1] = un; return bind(f, i)
       end
+      if t == :dyn && name == :slice_range && args.size == 3 then i.op = :call; i.args = [fn(:__dyn_slice_range), recv, *args]; return end
       if t == :dyn && args.size == 1 && %i[include? join first last].include?(name) && (dh = fnq(:"__dyn_#{name.to_s.sub('?', '_p')}#{%i[first last].include?(name) ? 1 : ''}"))
         i.op = :call; i.args = [dh, recv, args[0]]; return # the tag picks the family at run time
       end
