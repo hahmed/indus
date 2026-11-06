@@ -174,8 +174,8 @@ module Indus
           def ==(o) = #{fl.empty? ? "true" : fl.map { "#{_1} == o.#{_1}" }.join(" && ")}
           def [](i) = i.is_a?(Integer) ? to_a[i] : to_h[i.to_sym]
           def each(&blk) = to_a.each(&blk)
-          def to_s = "#<struct #{k.name} " + [#{fl.map { "\"#{_1}=\" + #{_1}.inspect" }.join(", ")}].join(", ") + ">"
-          def inspect = to_s
+          def inspect = "#<struct #{k.name} " + [#{fl.map { "\"#{_1}=\" + #{_1}.inspect" }.join(", ")}].join(", ") + ">"
+          def to_s = inspect
         RUBY
         synth_defs = Prism.parse(synth).value.statements.body
         body_defs = st.value.block.is_a?(Prism::BlockNode) ? (st.value.block.body&.body || []) : []
