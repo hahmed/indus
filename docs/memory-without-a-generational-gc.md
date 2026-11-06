@@ -95,21 +95,13 @@ Allocation volume forced by Ruby semantics. Compute: parity (fib 14.5 vs 14.8). 
 traffic: often ahead (binary_trees 1.0 vs 2.5). Allocation: behind by exactly what the
 compiler cannot prove away. A Ruby that allocates like Rust is not Ruby.
 
-## Spinel vs Indus
+## Open questions
 
-Different question, not different ability. Spinel: a compiler the Ruby community can own
-in C for twenty years, close to full Ruby. Every conservative choice serves that. Indus:
-an experiment on how much of Ruby's cost is representation. Allowed to refuse programs,
-whole-program, written in Ruby. Experiments beat products on benchmarks; that is their
-job. What Indus has is findings. The ask to a committer: which of these survives contact
-with full Ruby?
-
-## Questions for a core committer
-
-- How much of CRuby's object header is semantics (frozen, object_id, singleton) vs
-  collector? Indus has none; 238 oracle programs have not needed object_id or freeze.
-- Is there appetite for typed slots in CRuby's GC, or does the C extension API prevent it?
-- How much of a Rails request's allocation is provably request-local? If most, regions
-  beat a better collector.
+- How much of CRuby's object header is semantics (frozen, object_id, singleton class) and
+  how much is for the collector? Indus has none of it; 238 oracle programs have not needed
+  object_id or freeze.
+- How much of a Rails request's allocation is request-local? If most, regions matter more
+  than a better collector. Measure on a real app.
+- Can typed slots coexist with a C extension API, or do extensions force headers?
 
 *Numbers: indus [notes/64](https://github.com/hahmed/indus/blob/main/docs/notes/64_generational_gc_not_needed.md), bench/REPORT.md.*
