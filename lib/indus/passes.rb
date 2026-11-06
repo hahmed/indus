@@ -8,7 +8,7 @@ module Indus
     # program with seams keeps everything: the resident compiler may call any.
     def self.prune(funcs)
       seams = funcs.any? { |f| f.all.any? { _1.op == :seam } }
-      live = {}; work = funcs.select { |f| f.name == :main || f.name == :__gc_run }
+      live = {}; work = funcs.select { |f| f.name == :main || f.name == :__gc_run || f.name == :__gc_keep } # the runtime enters the collector; codegen calls __gc_keep
       until work.empty?
         f = work.pop
         next if live[f]

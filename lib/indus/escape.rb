@@ -157,7 +157,9 @@ module Indus
         surv = region_safe?(f, h, body)
         next unless surv
         next if !(surv[:grown].empty? && surv[:keeps].empty?) && latches.size > 1 # survivors must dominate the latch; one latch keeps that trivially
-        next unless surv[:keeps].all? { |st| st.block == latches[0] } # the store happens every iteration, in the latch block
+        # the store is in the latch (every iteration) or in a block whose only way out is the latch (some
+        # iterations: the slot is then a phi with 0 on the other paths)
+        next unless surv[:keeps].all? { |st| st.block == latches[0] || st.block.succs == [latches[0]] }
         # save the bump pointer before the loop, restore on every back edge. The mark and the collection
         # count are loop-carried: when a restore cannot happen (a collection ran, a container moved into
         # the region) the back edge starts a new region from where the heap is now, instead of giving up
@@ -172,7 +174,13 @@ module Indus
         # array is addressed through its new handle) and copy the value down at the back edge
         slots = surv[:keeps].map do |st|
           sl = Inst.new(:aslot, [st, st.args[1]]); sl.ty = :int; sl.block = st.block; sl.kind = st.args[2].ty
-          st.block.insts.insert(st.block.insts.index(st) + 1, sl); sl
+          st.block.insts.insert(st.block.insts.index(st) + 1, sl)
+          next sl if st.block == latches[0]
+          l = latches[0]
+          zero = Inst.new(:const, [0]); zero.ty = :int; zero.block = pre; pre.insts.insert(pre.insts.index(pre.term), zero)
+          preds = f.blocks.select { |b| b.succs.include?(l) }
+          ph = Inst.new(:phi, preds.map { |b| [b, b == st.block ? sl : zero] }); ph.ty = :int; ph.block = l; ph.kind = sl.kind
+          l.phis << ph; ph
         end
         latches.each do |l|
           r = Inst.new(:hrestore, [save, epoch, *surv[:grown], *slots]); r.block = l; r.ngrown = surv[:grown].size; r.ty = :int # the mark for the next iteration
@@ -201,15 +209,19 @@ module Indus
     #   grown: a pre-existing container that grew (its new handle lives in the region); the back edge
     #          skips the reset when that happened (rarely: growth doubles).
     # Anything else that escapes still refuses the region. Returns nil, or {keeps:, grown:}.
-    KEEP_TYPES = %i[str strbuf].freeze
+    # strings and string cells are copied by the runtime; any other pointer type goes through
+    # __gc_keep (a one-root collection of the region, so a kept object brings what it owns)
+    STR_KEEP = %i[str strbuf].freeze
+    def self.keepable?(t) = heap?(t) && (STR_KEEP.include?(t) || GC.enabled?)
     def self.region_safe?(f, h, body)
       fresh = {} # heap-typed values defined this iteration (may be fresh: used to detect leaks)
       body.each_key { |b| (b.phis + b.insts).each { |i| fresh[i] = true if heap?(i.ty) && !(b == h && i.op == :phi) } }
       keeps = []; grown = []
       uses = Hash.new(0)
       f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { |a| uses[a] += 1 if a.is_a?(Inst) } }
-      # a value only this iteration holds: allocated here, or returned fresh by a callee, and used once (the store)
-      sole = ->(v) { v.is_a?(Inst) && fresh[v] && KEEP_TYPES.include?(v.ty) && uses[v] == 1 &&
+      # a value only this iteration holds: allocated here, or returned fresh by a callee. Other uses in the
+      # iteration die with it; a second store would be caught as its own escape.
+      sole = ->(v) { v.is_a?(Inst) && fresh[v] && keepable?(v.ty) &&
                      ((OWN_ALLOC.include?(v.op) && !%i[aset hset bufappend].include?(v.op)) || (v.op == :call && v.args[0].returns_fresh)) }
       # surely allocated this iteration: a store into one of these cannot leak. A load (aget,
       # fld_get, bufderef ...) or a call result may be a pre-existing object, so it is not here.
@@ -240,6 +252,16 @@ module Indus
           # a fresh value used outside the body survives the loop
           i.args.each { |a| return nil if a.is_a?(Inst) && fresh[a] && !body[i.block] } if false
         end
+      end
+      # a grown container's new handle must reach the header phi: directly, or through phis in the body whose
+      # other arms carry the container unchanged (the store was conditional). The value compared at the back
+      # edge is the one the header phi receives.
+      grown = grown.uniq.map do |g|
+        incoming = h.phis.flat_map { |p| p.args.map(&:last) }.find { |v| v == g || (v.op == :phi && body[v.block] && v.block != h && unchanged_or(v, g, h)) }
+        return nil unless incoming
+        incoming
+      end
+      body.each_key do |b|
         b.succs.each { |s| s.phis.each { |p| p.args.each { |(pred, v)| return nil if pred == b && fresh[v] && (s == h || !body[s]) && !grown.include?(v) } } }
       end
       # uses outside the body
@@ -250,11 +272,18 @@ module Indus
           return nil if vals.any? { |a| a.is_a?(Inst) && fresh[a] && !grown.include?(a) }
         end
       end
-      # a grown container's new handle must reach the back edge unchanged: it is the header phi's incoming value
-      grown.each { |g| return nil unless h.phis.any? { |p| p.args.any? { |(_, v)| v == g } } }
       # the kept value's own container must be the one that reaches the back edge
-      keeps.each { |k| return nil unless grown.include?(k) }
+      keeps.each { |k| return nil unless grown.include?(k) || grown.any? { |g| g.op == :phi && unchanged_or(g, k, h) } }
+      # one object keep per iteration: __gc_keep clears its forwarding bits per call, so two keeps
+      # sharing a sub-object would copy it twice
+      return nil if keeps.count { |k| !STR_KEEP.include?(k.args[2].ty) } > 1
       { keeps: keeps, grown: grown.uniq }
+    end
+
+    # every arm of phi v is g, a header phi (the container before the store), or such a phi again
+    def self.unchanged_or(v, g, h, seen = {})
+      return false if seen[v]; seen[v] = true
+      v.args.all? { |(_, a)| a == g || (a.op == :phi && (a.block == h || unchanged_or(a, g, h, seen))) }
     end
   end
 end

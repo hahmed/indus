@@ -271,6 +271,8 @@ def __gc_forward(slot, tid, from, from_end, free, wtop, bitmap, types)
   if p < from || p >= from_end
     __st(g + 72, free)
     __st(g + 80, wtop)
+    # keeping a region survivor (__gc_keep): the region is the from-space; anything outside it is old
+    return 0 if __ld(g + 120) != 0
     if p >= __ld(g + 32) && p < __ld(g + 40)
       # a pointer into to-space is either already updated this collection (an
       # in-place object reached twice: a stack object held by two frames) or a
@@ -364,6 +366,137 @@ def __gc_scan(obj, tid, from, from_end, bitmap, types)
       cid = __ld32(desc + 8 + n * 8)
       if cid == tag
         __gc_scan(obj, __ld32(desc + 12 + n * 8), from, from_end, bitmap, types)
+        n = np
+      end
+      n = n + 1
+    end
+  end
+  0
+end
+
+# Keep one loop-region survivor (lib/indus/escape.rb, notes/65). The object in *slot and
+# everything it owns inside the region [mark, top) are copied, packed, to `cursor`; the
+# slot and the copied pointers are rewritten; returns the cursor after the copies. The
+# idle to-space is the scratch area: a Cheney pass with the region as from-space, then one
+# block move down. Nothing else points into the region (the compiler proved it), so the
+# region's own words are free to hold forwarding pointers.
+def __gc_keep(slot, tid, mark, cursor, top)
+  g = __gbase
+  return cursor if slot == 0
+  p = __ld(slot)
+  return cursor if p == 0
+  to = __ld(g + 32)
+  bitmap = __ld(g + 48)
+  work = __ld(g + 56)
+  types = __adr_tables + 4
+  nbytes = (top - mark) / 128 + 8
+  i = 0
+  while i < nbytes
+    __st(bitmap + i, 0)
+    i = i + 8
+  end
+  __st(g + 120, 1)
+  __gc_forward(slot, tid, mark, top, to, work, bitmap, types)
+  free = __ld(g + 72)
+  wtop = __ld(g + 80)
+  while wtop > work
+    wtop = wtop - 16
+    obj = __ld(wtop)
+    otid = __ld(wtop + 8)
+    __st(g + 72, free)
+    __st(g + 80, wtop)
+    __gc_scan(obj, otid, mark, top, bitmap, types)
+    free = __ld(g + 72)
+    wtop = __ld(g + 80)
+  end
+  __st(g + 120, 0)
+  # pointers into the scratch block become pointers into the final block
+  __gc_reloc(slot, tid, to, free, cursor - to, types)
+  len = free - to
+  i = 0
+  while i < len
+    __st(cursor + i, __ld(to + i))
+    i = i + 8
+  end
+  cursor + len
+end
+
+# shift every pointer in the copied subgraph that points into [to, free) by delta.
+# A pointer already shifted lies outside that range, so sharing and cycles stop here.
+def __gc_reloc(slot, tid, to, free, delta, types)
+  p = __ld(slot)
+  return 0 if p == 0
+  desc = __gc_desc(types, tid)
+  kind = __ld32(desc)
+  tag = 0
+  if kind == 5
+    tag = p & 15
+    return 0 if (tag & 1) == 1 || tag == 10 || tag == 12 || tag == 0
+    p = p - tag
+    if tag == 2
+      tid = __ld32(desc + 4)
+    elsif tag == 4
+      tid = __ld32(desc + 8)
+    elsif tag == 6
+      tid = __ld32(desc + 12)
+    elsif tag == 14
+      tid = __ld32(desc + 16)
+    else
+      cid = __ld(p)
+      np = __ld32(desc + 20)
+      n = 0
+      tid = -1
+      while n < np
+        if __ld32(desc + 24 + n * 8) == cid
+          tid = __ld32(desc + 28 + n * 8)
+          n = np
+        end
+        n = n + 1
+      end
+      return 0 if tid < 0
+    end
+    desc = __gc_desc(types, tid)
+    kind = __ld32(desc)
+  end
+  return 0 if p < to || p >= free
+  __st(slot, p + delta + tag)
+  if kind == 1
+    etid = __ld32(desc + 4)
+    if etid >= 0 && etid < 1000000
+      n = __ld(p - 8)
+      i = 0
+      while i < n
+        __gc_reloc(p + i * 8, etid, to, free, delta, types)
+        i = i + 1
+      end
+    end
+  elsif kind == 2
+    ktid = __ld32(desc + 4)
+    vtid = __ld32(desc + 8)
+    cap = __ld(p - 16)
+    i = 0
+    while i < cap
+      if __ld(p + i * 16) != 0
+        __gc_reloc(p + i * 16, ktid, to, free, delta, types) if ktid >= 0 && ktid < 1000000
+        __gc_reloc(p + i * 16 + 8, vtid, to, free, delta, types) if vtid >= 0 && vtid < 1000000
+      end
+      i = i + 1
+    end
+  elsif kind == 3
+    nf = __ld32(desc + 8)
+    i = 0
+    while i < nf
+      __gc_reloc(p + __ld32(desc + 12 + i * 8), __ld32(desc + 16 + i * 8), to, free, delta, types)
+      i = i + 1
+    end
+  elsif kind == 4
+    ctag = __ld(p)
+    np = __ld32(desc + 4)
+    n = 0
+    while n < np
+      if __ld32(desc + 8 + n * 8) == ctag
+        __st(slot, p) # scan as the concrete class, then re-shift once
+        __gc_reloc(slot, __ld32(desc + 12 + n * 8), to, free, delta, types)
         n = np
       end
       n = n + 1

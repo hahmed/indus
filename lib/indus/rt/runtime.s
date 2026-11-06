@@ -259,6 +259,7 @@ rt_str_hash:
 //   rt_keep_cell(x0 slot, x1 cursor) -> x1              slot holds a one-word cell whose word is a string handle
 // A handle is 16 past its header ([-16] cap, [-8] len). The copy keeps cap = len (trimmed).
 rt_keep_str:
+        cbz     x0, 9f                  // no slot this iteration (the store was conditional)
         stp     x29, x30, [sp, #-48]!
         stp     x19, x20, [sp, #16]
         stp     x21, x22, [sp, #32]
@@ -285,8 +286,9 @@ rt_keep_str:
 2:      ldp     x21, x22, [sp, #32]
         ldp     x19, x20, [sp, #16]
         ldp     x29, x30, [sp], #48
-        ret
+9:      ret
 rt_keep_cell:
+        cbz     x0, 9f                  // no slot this iteration (the store was conditional)
         stp     x29, x30, [sp, #-48]!
         stp     x19, x20, [sp, #16]
         stp     x21, x22, [sp, #32]
@@ -307,7 +309,7 @@ rt_keep_cell:
 2:      ldp     x21, x22, [sp, #32]
         ldp     x19, x20, [sp, #16]
         ldp     x29, x30, [sp], #48
-        ret
+9:      ret
 
 // rt_hash_new(x0 cap) -> handle. Layout: [key,val] slots * cap (open
 // addressing, zeroed), then cap words of slot indices in insertion order,
@@ -942,6 +944,11 @@ rt_gc:
         stp     d26, d27, [sp, #144]
         stp     d28, d29, [sp, #160]
         stp     d30, d31, [sp, #176]
+        ldr     x0, [x27, #16]                  // bytes the heap took since the last collection: from-space start to the bump
+        sub     x0, x28, x0
+        ldr     x1, [x27, #112]
+        add     x1, x1, x0
+        str     x1, [x27, #112]                 // __gc_allocated
         mov     x0, x29                         // the frame chain, starting here
         bl      __gc_run
         mov     x28, x0                         // allocation continues in to-space

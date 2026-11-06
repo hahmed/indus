@@ -62,7 +62,8 @@ module Indus
         if GC.enabled?
           endp = heap[off, 8].unpack1("Q"); from = heap[unit.globals[:__gc_from], 8].unpack1("Q")
           used = endp - from; n = heap[unit.globals[:__gc_count], 8].unpack1("Q")
-          $stderr.puts "indus: heap #{used >= 1 << 20 ? "#{(used / 1048576.0).round(1)} MB" : "#{used / 1024} KB"} live-ish after #{n} collections"
+          total = heap[unit.globals[:__gc_allocated], 8].unpack1("Q") + used # bytes that reached the heap (regions and stack objects excluded)
+          $stderr.puts "indus: heap #{used >= 1 << 20 ? "#{(used / 1048576.0).round(1)} MB" : "#{used / 1024} KB"} live-ish after #{n} collections, #{(total / 1048576.0).round(1)} MB allocated"
         else
           used = heap[off, 8].unpack1("Q") - heap.to_i - 4096
           $stderr.puts "indus: heap #{used >= 1 << 20 ? "#{(used / 1048576.0).round(1)} MB" : "#{used / 1024} KB"}"

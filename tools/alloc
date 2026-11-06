@@ -1,0 +1,58 @@
+#!/usr/bin/env ruby
+# Bytes allocated per benchmark: where the time goes when a program is allocation-bound.
+#
+#   tools/alloc [bench ...]          default: the eight benchmarks with Rust ports
+#
+# Columns (MB):
+#   indus raw     every allocation the compiled program makes (NOTIER1: no loop regions)
+#   indus heap    what reaches the heap once regions reset the bump pointer at back edges
+#   rust          the Rust port under a counting global allocator (podman; "-" if no port / no podman)
+# The ratio heap/rust is the allocation gap Rust's ownership buys. raw-heap is what regions prove away.
+require "fileutils"
+
+ROOT = File.expand_path("..", __dir__)
+PORTS = File.join(ROOT, "bench/ports")
+OUT = File.expand_path("~/tmp/alloc"); FileUtils.mkdir_p(OUT)
+IMG = "indus-bench"
+
+benches = ARGV.empty? ? %w[fib binary_trees nbody shapes str_build wordfreq server range_each csv_build template_render] : ARGV
+
+def indus_mb(bench, env)
+  out = IO.popen(env.merge("HEAP" => "1"), ["timeout", "-k", "2", "120", "#{ROOT}/bin/indus", "#{ROOT}/bench/#{bench}.rb"], err: [:child, :out], &:read)
+  m = out[/, ([\d.]+) MB allocated/, 1] || out[/indus: heap ([\d.]+) MB\n/, 1] # no-GC mode prints heap use only
+  m ? m.to_f : nil
+end
+
+COUNTER = <<~RS
+  use std::alloc::{GlobalAlloc, Layout, System};
+  use std::sync::atomic::{AtomicUsize, Ordering};
+  struct Counting;
+  static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+  unsafe impl GlobalAlloc for Counting {
+      unsafe fn alloc(&self, l: Layout) -> *mut u8 { ALLOCATED.fetch_add(l.size(), Ordering::Relaxed); System.alloc(l) }
+      unsafe fn dealloc(&self, p: *mut u8, l: Layout) { System.dealloc(p, l) }
+      unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 { ALLOCATED.fetch_add(n, Ordering::Relaxed); System.realloc(p, l, n) }
+  }
+  #[global_allocator] static A: Counting = Counting;
+  fn __report() { eprintln!("allocated {}", ALLOCATED.load(Ordering::Relaxed)); }
+RS
+
+def rust_mb(bench)
+  src = File.join(PORTS, "rust", "#{bench}.rs")
+  return nil unless File.exist?(src) && system("podman info >/dev/null 2>&1")
+  prog = COUNTER + File.read(src).sub(/fn main\(\) \{/, "fn main() { let _g = Guard; ") + "\nstruct Guard; impl Drop for Guard { fn drop(&mut self) { __report(); } }\n"
+  File.write(File.join(OUT, "#{bench}.rs"), prog)
+  out = `podman run --rm -v #{OUT}:/w #{IMG} sh -c 'cd /w && rustc -O -o #{bench}_alloc #{bench}.rs 2>&1 && ./#{bench}_alloc 2>&1 >/dev/null' 2>&1`
+  m = out[/allocated (\d+)/, 1]
+  m ? m.to_i / 1048576.0 : (warn "#{bench}: rust build/run failed:\n#{out}"; nil)
+end
+
+fmt = ->(v) { v ? format("%8.1f", v) : "       -" }
+puts format("%-16s %8s %8s %8s  %s", "bench", "raw", "heap", "rust", "heap/rust")
+benches.each do |b|
+  raw = indus_mb(b, "NOTIER1" => "1")
+  heap = indus_mb(b, {})
+  rust = rust_mb(b)
+  ratio = heap && rust && rust > 0.05 ? format("%.1fx", heap / rust) : "-"
+  puts format("%-16s %s %s %s  %s", b, fmt.(raw), fmt.(heap), fmt.(rust), ratio)
+end

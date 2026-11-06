@@ -320,7 +320,14 @@ module Indus
             if slots.empty? then @asm.mov(Asm::HEAP, r)
             else # move each kept value down to the mark, then bump from where the copies end: that is the next mark
               @asm.mov(1, r)
-              slots.each { |sl| @asm.mov(0, reg(sl, 0)); @asm.bl(sl.kind == :strbuf ? :rt_keep_cell : :rt_keep_str) }
+              slots.each do |sl|
+                case sl.kind
+                when :str, :strbuf then @asm.mov(0, reg(sl, 0)); @asm.bl(sl.kind == :strbuf ? :rt_keep_cell : :rt_keep_str)
+                else # __gc_keep(slot, tid, mark, cursor, top) -> cursor
+                  @asm.mov(3, 1); @asm.mov(0, reg(sl, 0)); @asm.mov_imm(1, @asm.gc_table.tid(sl.kind)); @asm.mov(2, r); @asm.mov(4, Asm::HEAP)
+                  @asm.bl(:__gc_keep); @asm.mov(1, 0)
+                end
+              end
               @asm.mov(Asm::HEAP, 1); @asm.mov(9, 1)
             end
             # frame maps are per function, so a dead slot may still hold a pointer into the memory

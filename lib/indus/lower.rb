@@ -140,6 +140,7 @@ module Indus
       lower_deferred_lambdas
       install_symbol_names(main)
       demand(:__gc_run) if @funcs[:__gc_run] # the collector is entered from the runtime, not by a call
+      demand(:__gc_keep) if @funcs[:__gc_keep] # loop regions call it from codegen
       drain_demands
       all = [main, *@funcs.values.reject { @lazy.key?(_1.name) }, *methods.map { _1[2] }, *@classes.values.select(&:closure).map { _1.methods[:call] }]
       all.each { prune(_1) }
