@@ -932,7 +932,9 @@ module Indus
         l = expr(n.left)
         if l.ty == :nil then expr(n.right)                       # nil || y  ->  y, at compile time
         else or_value(l) { expr(n.right) } end
-      when Prism::AndNode then bool_expr(n)
+      when Prism::AndNode # a && b as a value: b when a is truthy, else a (Ruby returns the operand, not a boolean)
+        l = expr(n.left)
+        l.ty == :nil ? l : and_value(l) { expr(n.right) }
       when Prism::IndexTargetNode then raise "unsupported index target"
       else raise "unsupported: #{n.class}"
       end
@@ -947,6 +949,17 @@ module Indus
       @cur = eb; r = yield; eend, el = @cur, @locals; emit(:br, [mb])
       @cur = mb; @locals = merge_locals(mb, [[tb, before], [eend, el]])
       p = mb.phi; p.args = [[tb, l], [eend, r]]; p
+    end
+
+    # l && <right>: right if l is truthy, else l, as a value
+    def and_value(l)
+      tb, eb, mb = @f.new_block(:andt), @f.new_block(:andf), @f.new_block(:andm)
+      emit(:condbr, [l, tb, eb])
+      before = @locals.dup
+      @cur = tb; r = yield; tend, tl = @cur, @locals; emit(:br, [mb])
+      @cur = eb; emit(:br, [mb])
+      @cur = mb; @locals = merge_locals(mb, [[tend, tl], [eb, before]])
+      p = mb.phi; p.args = [[tend, r], [eb, l]]; p
     end
 
     # a && b / a || b as a value: control flow + phi
