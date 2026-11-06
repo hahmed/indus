@@ -1308,6 +1308,7 @@ module Indus
       when :__st8 then (a = expr(args[0]); ix = expr(args[1]); v = expr(args[2]); emit(:rawst8, [a, ix, v]); v)
       when :__sdup then emit(:sdup, [expr(args[0])])
       when :__is_arr then emit(:is_arr, [expr(args[0])]) # folded by Types from the operand's type
+      when :__to_dyn then emit(:todyn, [expr(args[0])])  # tag by the operand's type (Types fills it in)
       when :__is_sym then emit(:is_sym, [expr(args[0])]) # true when the value's static type is Symbol (Types folds it)
       when :__is_dyn then emit(:is_dyn, [expr(args[0])])
       when :__hcount then emit(:hcap, [expr(args[0])])                      # entries in insertion order: count, key i, value i

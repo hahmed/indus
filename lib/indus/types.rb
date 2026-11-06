@@ -110,10 +110,24 @@ module Indus
               g = Inst.new(:cell_get, [i.args[1]]); g.ty = ct[1]; g.block = i.block; i.block.insts.insert(i.block.insts.index(i), g)
               i.args[1] = g; changed = true
             end
+            if i.op == :todyn && (vt = of(f, i.args[0])) # tag by what the operand turned out to be
+              if vt == :dyn then i.op = :nop else i.op = :box; i.args = [i.args[0], vt] end
+              i.ty = :dyn; changed = true
+            end
             each_flow(f, i) do |v, dest|
               next unless v.is_a?(Inst)
               if @settled && dest == :int? && v.op == :const && v.ty == :nil then v.args[0] = INT_NIL; v.ty = :int; changed = true end # nil in a nullable int slot is the sentinel (settled: the slot might still widen to a pointer type)
               changed = true if (dest == :dyn || arr(dest) && dest[1] == :dyn || hsh(dest) && dest[2] == :dyn) && widen_elements_to_dyn(f, v, dest)
+              # a typed container entering a tagged slot it does not own (an element read out of
+              # another container): the tag promises tagged elements, so a copy that has them goes
+              # instead. Inserted here, during typing, so the copier is typed like any other call.
+              if dest == :dyn && (vt = of(f, v)).is_a?(Array) && %i[hval_at hkey_at aget hget apop].include?(v.op) &&
+                 (arr(vt) && vt[1] && vt[1] != :dyn || hsh(vt) && vt[1] && (vt[1] != :dyn || vt[2] != :dyn))
+                cp = Inst.new(:call, [fn(arr(vt) ? :__box_elems_arr : :__box_elems_hash), v])
+                cp.ty = arr(vt) ? [:arr, :dyn] : [:hash, :dyn, :dyn]
+                cp.block = i.block; i.block.insts.insert(i.block.insts.index(i), cp)
+                swap_operand(i, v, cp); changed = true
+              end
               changed = true if dest == :strbuf && of(f, v) == :str && make_cell(f, v, i)
             end
             if i.op == :raise && (t = of(f, i.args[0])) && join(@exc_type, t) != @exc_type then @exc_type = join(@exc_type, t); changed = true end
@@ -777,6 +791,9 @@ module Indus
       case v.op
       when :param then f.ptypes[f.params.index(v)] = nt
       when :call then v.args[0].rtype = nt # the callee's returned container: its stores box, through its own ret flow
+      when :hval_at, :hkey_at
+        return false # a value read out of a hash's own storage: relabelling it would promise tagged
+                     # elements the hash does not hold. The flow inserts a converting copy instead.
       else v.ty = nt
       end
       true
@@ -1325,6 +1342,7 @@ module Indus
         # a generic prelude function may still be swapped for an instance once the argument
         # types are known: commit to no result type before then
         generic?(a[0]) && (a[1..].any? { |v| of(f, v).nil? } || deferred_generic?(a[0], a[1..].map { of(f, _1) })) ? nil : a[0].rtype
+      when :todyn then :dyn
       when :itof, :ffrom then :float
       when :onew then a[0].name
       when :fld_get then (k = of(f, a[0])) && ivar_type(k, a[1])

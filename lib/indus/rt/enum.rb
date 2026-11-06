@@ -1447,3 +1447,25 @@ def __str_range(lo, hi, excl)
   out
 end
 def __arr_to_a(a) = a
+
+# a typed container as a tagged one: a copy whose elements are tagged. The parameter keeps
+# its own element type; `out` is a tagged container, so each store boxes.
+def __box_elems_arr(a)
+  out = []
+  i = 0
+  while i < a.length
+    out.push(__to_dyn(a[i]))
+    i = i + 1
+  end
+  out
+end
+
+def __box_elems_hash(h)
+  out = {}
+  i = 0
+  while i < __hcount(h)
+    out[__to_dyn(__hkey_at(h, i))] = __to_dyn(__hval_at(h, i))
+    i = i + 1
+  end
+  out
+end
