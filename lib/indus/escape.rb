@@ -27,6 +27,7 @@ module Indus
       end
       loop do
         changed = false
+        @fresh_fields = fresh_fields(funcs)
         funcs.each do |f|
           esc = escaped(f)
           esc_noret = escaped(f, with_ret: false)
@@ -105,19 +106,56 @@ module Indus
     # beyond what the allocation already does
     def self.fresh_here?(v) = v.is_a?(Inst) && %i[onew anew hnew mkbuf cell_new].include?(v.op) # memory this function made (a cell holds one word, like a field)
 
-    def self.store_summary(f)
-      sp = Array.new(f.params.size, false); so = false
-      # the memory written is whatever o came from: through phis, and through bufappend / aset / hset results
-      # (the same container, possibly reallocated)
-      origins = ->(o, seen = {}) do
-        return [] if seen[o]; seen[o] = true
-        case o.op
-        when :phi then o.args.flat_map { |(_, v)| origins.(v, seen) }
-        when :bufappend, :aset, :hset then origins.(o.args[0], seen)
-        else [o]
+    # the memory a value names: through phis, through bufappend / aset / hset results (the same container,
+    # possibly reallocated), through bufderef (the cell's string), and through a field that only ever holds
+    # a fresh value (then it is as local as the object it belongs to)
+    def self.origins(f, o, seen = {})
+      return [] if seen[o]; seen[o] = true
+      case o.op
+      when :phi then o.args.flat_map { |(_, v)| origins(f, v, seen) }
+      when :bufappend, :aset, :hset, :bufderef then origins(f, o.args[0], seen)
+      when :fld_get then @fresh_fields[[ty(f, o.args[0]), o.args[1]]] ? origins(f, o.args[0], seen) : [o]
+      else [o]
+      end
+    end
+
+    # like origins, without the fresh-field step (used while computing the fresh fields themselves)
+    def self.raw_origins(o, seen = {})
+      return [] if seen[o]; seen[o] = true
+      case o.op
+      when :phi then o.args.flat_map { |(_, v)| raw_origins(v, seen) }
+      when :bufappend, :aset, :hset, :bufderef then raw_origins(o.args[0], seen)
+      else [o]
+      end
+    end
+
+    # (class, field) -> every store into it is a value allocated by the storing function (or returned fresh)
+    def self.fresh_fields(funcs)
+      ff = Hash.new(true); seen = {}
+      funcs.each do |f|
+        f.all.each do |i|
+          next unless i.op == :fld_set
+          o, ix, v = i.args
+          key = [ty(f, o), ix]; seen[key] = true
+          next unless v.is_a?(Inst) && heap?(ty(f, v))
+          # the stored value, at its source: an allocation here, a fresh return, or the field's own
+          # current value written back (`@out << x` is fld_set self, bufappend(fld_get self))
+          roots = raw_origins(v)
+          fresh = roots.all? do |r|
+            (OWN_ALLOC.include?(r.op) && !%i[aset hset bufappend].include?(r.op)) || (r.op == :call && r.args[0].returns_fresh) ||
+              (r.op == :fld_get && r.args[0] == o && r.args[1] == ix)
+          end
+          ff[key] = false unless fresh
         end
       end
-      into = ->(o) { origins.(o).each { |r| r.op == :param ? sp[f.params.index(r)] = true : (so = true unless fresh_here?(r)) } }
+      seen.each_key { |k| ff[k] = ff[k] } # materialise; unknown fields stay false
+      ff.default = false
+      ff
+    end
+
+    def self.store_summary(f)
+      sp = Array.new(f.params.size, false); so = false
+      into = ->(o) { origins(f, o).each { |r| r.op == :param ? sp[f.params.index(r)] = true : (so = true unless fresh_here?(r)) } }
       f.all.each do |i|
         case i.op
         when :fld_set
@@ -157,9 +195,10 @@ module Indus
         surv = region_safe?(f, h, body)
         next unless surv
         next if !(surv[:grown].empty? && surv[:keeps].empty?) && latches.size > 1 # survivors must dominate the latch; one latch keeps that trivially
-        # the store is in the latch (every iteration) or in a block whose only way out is the latch (some
-        # iterations: the slot is then a phi with 0 on the other paths)
-        next unless surv[:keeps].all? { |st| st.block == latches[0] || st.block.succs == [latches[0]] }
+        # the store is in the latch (every iteration) or in a block from which the only way out leads to the
+        # latch through a chain of single-successor blocks (some iterations: at the first merge the slot
+        # becomes a phi with 0 on the other paths, and flows down)
+        next unless surv[:keeps].all? { |st| st.block == latches[0] || (path = chain_to(st.block, latches[0], body)) }
         # save the bump pointer before the loop, restore on every back edge. The mark and the collection
         # count are loop-carried: when a restore cannot happen (a collection ran, a container moved into
         # the region) the back edge starts a new region from where the heap is now, instead of giving up
@@ -176,11 +215,18 @@ module Indus
           sl = Inst.new(:aslot, [st, st.args[1]]); sl.ty = :int; sl.block = st.block; sl.kind = st.args[2].ty
           st.block.insts.insert(st.block.insts.index(st) + 1, sl)
           next sl if st.block == latches[0]
-          l = latches[0]
           zero = Inst.new(:const, [0]); zero.ty = :int; zero.block = pre; pre.insts.insert(pre.insts.index(pre.term), zero)
-          preds = f.blocks.select { |b| b.succs.include?(l) }
-          ph = Inst.new(:phi, preds.map { |b| [b, b == st.block ? sl : zero] }); ph.ty = :int; ph.block = l; ph.kind = sl.kind
-          l.phis << ph; ph
+          # at each merge on the way down, the slot is sl on the arm we came from and 0 on the others
+          cur = sl; from = st.block
+          chain_to(st.block, latches[0], body).each do |m|
+            preds = f.blocks.select { |b| b.succs.include?(m) }
+            if preds.size > 1
+              ph = Inst.new(:phi, preds.map { |b| [b, b == from ? cur : zero] }); ph.ty = :int; ph.block = m; ph.kind = sl.kind
+              m.phis << ph; cur = ph
+            end
+            from = m
+          end
+          cur
         end
         latches.each do |l|
           r = Inst.new(:hrestore, [save, epoch, *surv[:grown], *slots]); r.block = l; r.ngrown = surv[:grown].size; r.ty = :int # the mark for the next iteration
@@ -189,6 +235,17 @@ module Indus
           save.args << [l, r]; epoch.args << [l, e]
         end
       end
+    end
+
+    # the blocks from b (exclusive) to the latch (inclusive) when every block on the way has one successor
+    def self.chain_to(b, latch, body)
+      path = []
+      until b == latch
+        return nil unless b.succs.size == 1 && body[b.succs[0]]
+        b = b.succs[0]; path << b
+        return nil if path.size > 64
+      end
+      path
     end
 
     def self.loop_body(f, h, latches)
@@ -221,12 +278,14 @@ module Indus
       f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { |a| uses[a] += 1 if a.is_a?(Inst) } }
       # a value only this iteration holds: allocated here, or returned fresh by a callee. Other uses in the
       # iteration die with it; a second store would be caught as its own escape.
-      sole = ->(v) { v.is_a?(Inst) && fresh[v] && keepable?(v.ty) &&
-                     ((OWN_ALLOC.include?(v.op) && !%i[aset hset bufappend].include?(v.op)) || (v.op == :call && v.args[0].returns_fresh)) }
+      fresh_origin = ->(r) { (OWN_ALLOC.include?(r.op) && !%i[aset hset bufappend].include?(r.op)) || (r.op == :call && r.args[0].returns_fresh) }
+      sole = ->(v) { v.is_a?(Inst) && fresh[v] && keepable?(v.ty) && (os = origins(f, v)).all? { |r| fresh[r] && fresh_origin.(r) } && !os.empty? }
       # surely allocated this iteration: a store into one of these cannot leak. A load (aget,
       # fld_get, bufderef ...) or a call result may be a pre-existing object, so it is not here.
       own = {}
       body.each_key { |b| b.insts.each { |i| own[i] = true if OWN_ALLOC.include?(i.op) && heap?(i.ty) && (!%i[aset hset bufappend].include?(i.op) || own[i.args[0]]) } }
+      # a field read from an own object, when the field only ever holds fresh values, is own memory too
+      body.each_key { |b| b.insts.each { |i| own[i] = true if %i[fld_get bufderef].include?(i.op) && heap?(i.ty) && (os = origins(f, i)).all? { |r| own[r] } && !os.equal?([i]) && os != [i] } }
       body.each_key do |b|
         b.insts.each do |i|
           case i.op
