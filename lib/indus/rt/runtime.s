@@ -302,7 +302,9 @@ rt_keep_str:
         cbz     x21, 1f
         ldur    x22, [x21, #-8]         // len
         add     x1, x20, #16            // new handle
-        str     x22, [x20]              // cap = len
+        add     x3, x22, #15            // cap = len rounded up to the 16 bytes the copy occupies anyway:
+        and     x3, x3, #0xfffffffffffffff0 // free slack for a short append later (a newline, a comma)
+        str     x3, [x20]
         str     x22, [x20, #8]          // len
         mov     x0, x1
         mov     x2, x22
@@ -311,9 +313,8 @@ rt_keep_str:
         bl      rt_memcpy
         ldp     x0, x22, [sp], #16
         str     x0, [x19]               // patch the slot
-        add     x1, x0, x22
-        add     x1, x1, #15
-        and     x1, x1, #0xfffffffffffffff0
+        ldur    x1, [x0, #-16]          // cursor: past the rounded cap
+        add     x1, x0, x1
         b       2f
 1:      mov     x1, x20
 2:      ldp     x21, x22, [sp, #32]
@@ -984,6 +985,11 @@ rt_gc:
         str     x1, [x27, #112]                 // __gc_allocated
         mov     x0, x29                         // the frame chain, starting here
         bl      __gc_run
+        ldr     x1, [x27, #16]                  // the survivors now sit at the start of the new space:
+        sub     x1, x0, x1                      // not new allocation, take them back out of the count
+        ldr     x2, [x27, #112]
+        sub     x2, x2, x1
+        str     x2, [x27, #112]
         mov     x28, x0                         // allocation continues in to-space
         ldp     d0, d1, [sp, #0]
         ldp     d2, d3, [sp, #16]
