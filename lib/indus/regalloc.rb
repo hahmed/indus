@@ -22,7 +22,10 @@ module Indus
     FCALLEE = (8..15).to_a
     FCALLER = (16..29).to_a  # d30, d31 scratch
 
-    Interval = Struct.new(:v, :start, :stop, :crosses_call, :hint, :gc_home, :gc_slot)
+    # ops whose code reads all operands before writing the destination (checked in codegen.rb)
+    REUSE_OK = %i[add sub mul and or xor shl shr].freeze
+
+    Interval = Struct.new(:v, :start, :stop, :crosses_call, :hint, :gc_home, :gc_slot, :shared)
 
     attr_reader :used, :fused, :nslots, :safepoint_live
 
@@ -42,8 +45,8 @@ module Indus
         bend[b] = n - 1
       end
       f.params.each { pos[_1] = -1 }
-      skip = ->(i) { i.term? || %i[const fconst puts_s puts_i puts_str eputs_str puts_bool puts_opt puts_nil puts_nil_word p_str print_i print_str putc gset fld_set seam rawst trap try_pop raise].include?(i.op) || (i.op == :cmp && fused?(i)) }
-      value = ->(x) { x.is_a?(Inst) && !skip.(x) && !%i[const fconst].include?(x.op) }
+      skip = ->(i) { i.term? || !i.hoisted && %i[const fconst puts_s puts_i puts_str eputs_str puts_bool puts_opt puts_nil puts_nil_word p_str print_i print_str putc gset fld_set seam rawst trap try_pop raise].include?(i.op) || (i.op == :cmp && fused?(i)) }
+      value = ->(x) { x.is_a?(Inst) && !skip.(x) && (x.hoisted || !%i[const fconst].include?(x.op)) }
 
       # ---- liveness
       use = Hash.new { |h, k| h[k] = {} }; dfn = Hash.new { |h, k| h[k] = {} }
@@ -139,7 +142,7 @@ module Indus
         # expire
         active.reject! do |a|
           if a.stop < it.start
-            free[pool_of.(a.v.reg, a.v.float?)].unshift(a.v.reg) if a.v.reg
+            free[pool_of.(a.v.reg, a.v.float?)].unshift(a.v.reg) if a.v.reg && !a.shared # a shared register is the phi's to free
             true
           end
         end
@@ -150,6 +153,20 @@ module Indus
         h = it.hint&.reg
         if h && pools.any? { |p| free[p].include?(h) }
           free[pool_of.(h, fl)].delete(h); take.(it, h); next
+        end
+        # the hint's last use is this very instruction (`i = i + 1` feeding the phi): for an op whose
+        # codegen reads every operand before writing the result, the register can be reused in place,
+        # and the latch copy disappears
+        if ENV["REUSE_LAST"] && h && REUSE_OK.include?(it.v.op) && (a = active.find { |x| x.v.reg == h && x.stop == it.start }) && pools.include?(pool_of.(h, fl))
+          active.delete(a); take.(it, h); next
+        end
+        # the hint is a loop phi read after the loop (`puts sum`): its interval spans the body although
+        # it is dead there from our definition to the back edge. Share its register when the phi is not
+        # live out of any block we live in and nothing in our span reads it; our value is what the phi
+        # becomes at the back edge, so after the loop the register holds the right thing.
+        if ENV["SHARE_PHI"] && h && REUSE_OK.include?(it.v.op) && (a = active.find { |x| x.v.reg == h && x.v.op == :phi }) && it.stop <= a.stop &&
+           pools.include?(pool_of.(h, fl)) && dead_across?(a.v, it, blocks, bstart, bend, live_out, pos)
+          it.v.reg = h; it.shared = true; active << it; next
         end
         pool = pools.find { free[_1].any? }
         if pool
@@ -168,6 +185,14 @@ module Indus
       end
       @used.sort!; @fused.sort!
       self
+    end
+
+    def dead_across?(p, it, blocks, bstart, bend, live_out, pos)
+      blocks.all? do |b|
+        next true if bend[b] < it.start || bstart[b] > it.stop
+        next false if live_out[b][p]
+        b.insts.none? { |i| pos[i] > it.start && pos[i] <= it.stop && i.args.include?(p) }
+      end
     end
 
     def fused?(c)

@@ -61,6 +61,36 @@ module Indus
       used
     end
 
+    # an integer constant used inside a loop that no instruction can take as an immediate (a compare
+    # or add/sub operand over 4095, a multiplier) is materialised on every iteration: two instructions
+    # for a large one. Move it to the loop's preheader; the allocator gives it a register (if it must
+    # spill, the reload costs the same as the materialisation did). Only loops: a straight-line const
+    # is cheaper where it is.
+    IMM_USES = { cmp: [1], add: [1], sub: [1], shl: [1], shr: [1], aget: [1], aset: [1], ssub: [1, 2] }.freeze
+    def self.hoist_consts(f)
+      f.blocks.each do |h|
+        next unless h.name.to_s.start_with?("head") && !h.phis.empty?
+        pre = h.phis.first.args[0][0]
+        latches = f.blocks.select { |b| b.succs.include?(h) && b != pre }
+        next if latches.empty? || pre.succs != [h]
+        body = Escape.loop_body(f, h, latches)
+        # constants defined in the body, and constants from outside whose every use is in this body
+        cands = body.keys.flat_map { |b| b.insts.select { |i| i.op == :const } }
+        f.blocks.each { |b| next if body[b]; b.insts.each { |i| cands << i if i.op == :const } }
+        cands.each do |i|
+          next unless i.args[0].is_a?(Integer) && !i.hoisted
+          next if (-65536..65535).cover?(i.args[0]) # one movz/movn where it is: hoisting would not pay for the register
+          users = f.all.select { |u| u.args.include?(i) }
+          next if users.empty? || users.any? { |u| !body[u.block] }
+          # every use must want a register: an immediate-encodable use is free as it is
+          next if users.any? { |u| (IMM_USES[u.op] || []).any? { |k| u.args[k] == i } && (0..4095).cover?(i.args[0]) }
+          next if users.any? { |u| %i[mod div].include?(u.op) && u.args[1] == i } # divmod_const takes the constant itself
+          next if users.any? { |u| %i[const puts_i print_i].include?(u.op) }
+          i.block.insts.delete(i); i.block = pre; pre.insts.insert(pre.insts.index(pre.term), i); i.hoisted = true
+        end
+      end
+    end
+
     def self.sink_returns(f)
       f.blocks.dup.each do |b|
         r = b.term

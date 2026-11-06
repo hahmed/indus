@@ -3,6 +3,7 @@ module Indus
   class Inst
     attr_accessor :bound_to # the generic instance a call last took its result type from
     attr_accessor :assumed # [operand, type] an irreversible by-type rewrite relied on; checked after typing
+    attr_accessor :hoisted # a const moved to a loop preheader: lives in a register across the loop
     attr_accessor :kind, :ngrown # aslot: type of the kept value; hrestore: how many grown handles precede the slots
     attr_accessor :routed # the method name a call was routed from by the receiver's builtin family
     attr_accessor :nocheck # an add/sub/mul whose range analysis proves it cannot overflow

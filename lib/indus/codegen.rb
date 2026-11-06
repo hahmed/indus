@@ -28,6 +28,7 @@ module Indus
       layout(f)
       f.count_uses!
       f.params.each_with_index { |p, k| p.ty = f.ptypes[k] || :int }
+      Passes.hoist_consts(f) unless ENV["NOHOIST"]
       ra = RegAlloc.new(f).run
       used, fused, nslots = ra.used.dup, ra.fused.dup, ra.nslots
       @safepoint_live = ra.safepoint_live
@@ -149,7 +150,7 @@ module Indus
         sp = GC.enabled? && GC.needs_safepoint?(i) && i.op != :aset && !@f.name.to_s.start_with?("__gc") # aset: on its grow path
         safepoint(i) if sp
         case i.op
-        when :const, :fconst then nil
+        when :const, :fconst then @asm.mov_imm(d, i.args[0]) if i.hoisted # spilled: d is the temp, spill! stores it
         when :add, :sub, :mul, :div
           l, r = i.args
           if i.float?
