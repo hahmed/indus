@@ -31,8 +31,7 @@ module Indus
     def self.trivial_phis(f)
       loop do
         all = f.all
-        used = {}
-        all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { used[_1] = true if _1.is_a?(Inst) } }
+        used = phi_liveness(all)
         subst = {}; removed = false
         f.blocks.each do |b|
           b.phis.reject! do |p|
@@ -47,6 +46,19 @@ module Indus
         resolve = ->(v) { v = subst[v] while subst.key?(v); v }
         f.all.each { |i| i.op == :phi ? i.args.map! { |(bb, v)| [bb, resolve.(v)] } : i.args.map! { |a| a.is_a?(Inst) ? resolve.(a) : a } }
       end
+    end
+
+    # values with a use outside phis, plus everything those uses' phis read, transitively: a cycle of
+    # phis that only feed each other (a loop variable nobody reads) is dead
+    def self.phi_liveness(all)
+      used = {}; work = []
+      all.each { |i| next if i.op == :phi; i.args.each { |a| next unless a.is_a?(Inst); (used[a] = true; work << a) unless used[a] } }
+      until work.empty?
+        v = work.pop
+        next unless v.op == :phi
+        v.args.each { |(_, a)| next unless a.is_a?(Inst); (used[a] = true; work << a) unless used[a] }
+      end
+      used
     end
 
     def self.sink_returns(f)

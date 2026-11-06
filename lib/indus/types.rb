@@ -1414,8 +1414,7 @@ module Indus
 
     def self.drop_dead_phis(f)
       loop do
-        used = {}
-        f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { |a| used[a] = true if a.is_a?(Inst) } }
+        used = Passes.phi_liveness(f.all)
         dead = f.blocks.flat_map { |b| b.phis.select { |p| !used[p] } }
         break if dead.empty?
         f.blocks.each { |b| b.phis.reject! { |p| dead.include?(p) } }

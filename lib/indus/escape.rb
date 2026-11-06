@@ -259,7 +259,7 @@ module Indus
       body
     end
 
-    OWN_ALLOC = %i[onew anew hnew sconst scat sappend itos ssub chr sdup salloc cell_new mkbuf box aset hset bufappend].freeze
+    OWN_ALLOC = %i[onew anew hnew sconst scat sjoin sappend itos ssub chr sdup salloc cell_new mkbuf box aset hset bufappend].freeze
     # Survivors (notes/65). A region may keep two kinds of value across the back edge:
     #   keeps: a fresh string / string cell stored once into a pre-existing array ("rows << line");
     #          copied down to the saved mark at the back edge, the slot patched.

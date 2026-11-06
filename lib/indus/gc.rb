@@ -29,7 +29,7 @@ module Indus
     def self.dyn_classes(classes) = classes.values.select(&:tagged)
 
     # ops that bump the heap themselves (calls are decided by their callee)
-    DIRECT_ALLOC = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos box chr sdup salloc cell_new mkbuf bufappend].freeze
+    DIRECT_ALLOC = %i[anew aset onew hnew hset hkeys sconst scat sjoin sappend ssub itos box chr sdup salloc cell_new mkbuf bufappend].freeze
 
     # Func#allocates: can running this function (transitively) allocate? A call
     # to a function that cannot needs no safepoint. Patchable methods may be

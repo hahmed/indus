@@ -9,14 +9,14 @@
 #    becomes an in-place append: O(n) instead of O(n^2) per build.
 module Indus
   module Peephole
-    FRESH = %i[sconst scat sappend ssub itos sdup salloc chr].freeze
+    FRESH = %i[sconst scat sjoin sappend ssub itos sdup salloc chr].freeze
 
     # a string literal only ever read -- the right side of an append or concat, compared, printed,
     # a hash key looked up, measured -- needs no fresh copy: it is the literal in the data section
     # (its [cap][len] header is there too; nothing writes through it, and the collector ignores
     # pointers outside the heap)
     READ_ONLY_USE = {
-      sappend: [1], bufappend: [1], scat: [0, 1], seq: [0, 1], sne: [0, 1], scmp: [0, 1], seq_char: [0],
+      sappend: [1], bufappend: [1], scat: [0, 1], sjoin: (0..31).to_a, seq: [0, 1], sne: [0, 1], scmp: [0, 1], seq_char: [0],
       puts_str: [0], print_str: [0], eputs_str: [0], p_str: [0], hget: [1], hkey: [1], alen: [0],
     }.freeze
     def self.static_literals(f)
@@ -28,13 +28,29 @@ module Indus
         i.op = :sconst_ro
       end
     end
-    READERS = %i[scat sappend seq seq_char alen ssub puts_str phi].freeze # uses that do not alias the string
+    READERS = %i[scat sjoin sappend seq seq_char alen ssub puts_str phi].freeze # uses that do not alias the string
 
     def self.run(f)
       static_literals(f) unless ENV["NOSTATIC"] || (ENV["NOSTATIC_FN"] && f.name.to_s =~ Regexp.new(ENV["NOSTATIC_FN"]))
       uses = Hash.new(0); users = Hash.new { |h, k| h[k] = [] }
       f.all.each { |i| (i.op == :phi ? i.args.map(&:last) : i.args).each { next unless _1.is_a?(Inst); uses[_1] += 1; users[_1] << i } }
       live_out = liveness(f)
+
+      # 3. scat(a, b) then sappend(_, c), sappend(_, d) ... each the only use of the previous: one
+      #    allocation of the final size, one copy per piece (an interpolation with n parts made n
+      #    strings, each copying everything before it)
+      f.blocks.each do |b|
+        b.insts.dup.each do |i|
+          next unless i.op == :scat && b.insts.include?(i)
+          pieces = i.args.dup; chain = [i]; cur = i
+          while uses[cur] == 1 && %i[sappend scat].include?((u = users[cur][0]).op) && u.args[0] == cur && u.block == b
+            pieces << u.args[1]; chain << u; cur = u
+          end
+          next if pieces.size < 3 || pieces.size > 31
+          cur.op = :sjoin; cur.args = pieces
+          chain[0...-1].each { |c| b.insts.delete(c) }
+        end
+      end
 
       f.blocks.each do |b|
         b.insts.dup.each do |i|

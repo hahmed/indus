@@ -3,7 +3,7 @@ module Indus
   class Codegen
     TMP = 8; FTMP = 30; FTMP2 = 31 # scratch; pools live in RegAlloc
     # ops that may bump the heap: a collection may run just before them
-    ALLOCATING = %i[anew aset onew hnew hset hkeys sconst scat sappend ssub itos call pcall sendsw].freeze
+    ALLOCATING = %i[anew aset onew hnew hset hkeys sconst scat sjoin sappend ssub itos call pcall sendsw].freeze
 
     def initialize(asm, classes = {}) = (@asm, @classes = asm, classes)
 
@@ -501,6 +501,14 @@ module Indus
           name = :"str#{i.id}"; @asm.str_data(name, i.args[0])
           @asm.adr(0, name); @asm.mov_imm(1, i.args[0].bytesize); @asm.bl(:rt_str_new); @asm.mov(d, 0)
         when :scat then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_cat); @asm.mov(d, 0)
+        when :sjoin # the pieces' handles go on the stack; rt_str_catn(n, ptr) sizes once and copies each
+          n = i.args.size; bytes = (n * 8 + 15) / 16 * 16
+          # spill slots are sp-relative: write the pieces below sp first (stur, negative offset), then move sp
+          i.args.each_with_index { |a, k| @asm.stur(reg(a, 9), 31, k * 8 - bytes) }
+          @asm.emit(0xD10003FF | (bytes << 10)) # sub sp, sp, #bytes
+          @asm.mov_imm(0, n); @asm.emit(0x910003E1); @asm.bl(:rt_str_catn) # add x1, sp, #0 (mov from sp is not an orr)
+          @asm.emit(0x910003FF | (bytes << 10)) # add sp, sp, #bytes
+          @asm.mov(d, 0)
         when :sappend then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_append); @asm.mov(d, 0)
         when :seq then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_eq); @asm.mov(d, 0)
         when :sne then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_str_eq); @asm.emit(0xD2400000 | d) # eor d, x0, #1

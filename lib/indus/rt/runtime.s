@@ -102,6 +102,39 @@ rt_str_cat:
         ldp     x29, x30, [sp], #48
         ret
 
+// rt_str_catn(x0 n, x1 ptr to n handles) -> handle: the concatenation, sized once
+rt_str_catn:
+        stp     x29, x30, [sp, #-48]!
+        stp     x19, x20, [sp, #16]
+        stp     x21, x22, [sp, #32]
+        mov     x19, x0                 // n
+        mov     x20, x1                 // handles
+        mov     x21, #0                 // total
+        mov     x2, #0
+0:      ldr     x3, [x20, x2, lsl #3]
+        ldur    x3, [x3, #-8]
+        add     x21, x21, x3
+        add     x2, x2, #1
+        cmp     x2, x19
+        b.lo    0b
+        mov     x0, x21
+        bl      rt_alloc
+        stur    x21, [x0, #-16]
+        stur    x21, [x0, #-8]
+        mov     x22, x0                 // the handle
+        mov     x21, #0                 // index
+1:      ldr     x1, [x20, x21, lsl #3]
+        ldur    x2, [x1, #-8]
+        bl      rt_memcpy               // x0 advances
+        add     x21, x21, #1
+        cmp     x21, x19
+        b.lo    1b
+        mov     x0, x22
+        ldp     x21, x22, [sp, #32]
+        ldp     x19, x20, [sp, #16]
+        ldp     x29, x30, [sp], #48
+        ret
+
 // rt_str_append(x0 a, x1 b) -> handle (a if it fits, else a grown copy)
 rt_str_append:
         stp     x29, x30, [sp, #-64]!
