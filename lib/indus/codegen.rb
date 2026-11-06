@@ -60,6 +60,7 @@ module Indus
         @asm.write_addr ? @asm.mov_imm(16, @asm.write_addr) : @asm.adr(16, :__write)
         @asm.str_off(16, Asm::GBASE, 0)
         @asm.adr(16, :__mmap_fn_entry); @asm.str_off(16, Asm::GBASE, @asm.global(:__mmap_fn))
+        @asm.adr(16, :__munmap_fn_entry); @asm.str_off(16, Asm::GBASE, @asm.global(:__munmap_fn))
         # patchable methods start out pointing at their static code
         @classes.each_value do |k|
           k.methods.each_value do |m|
@@ -307,6 +308,7 @@ module Indus
         when :wadd then @asm.add(d, reg(i.args[0]), reg(i.args[1], 9))
         when :wsub then @asm.sub(d, reg(i.args[0]), reg(i.args[1], 9))
         when :rawmmap then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_mmap); @asm.mov(d, 0)
+        when :rawmunmap then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_munmap); @asm.mov(d, 0)
         when :adrlbl then @asm.adr(d, i.args[0])
         when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer
         when :gcepoch then @asm.ldr_off(d, Asm::GBASE, @asm.global(:__gc_count)) # ...and the collection count it is valid for

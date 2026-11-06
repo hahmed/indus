@@ -26,6 +26,7 @@ def __gc_run(fp)
   text = __adr_text
   # the pair must match: after a growth the other space is still the old size
   if __ld(g + 40) - to < from_end - from
+    __munmap(to, __ld(g + 40) - to)
     to = __mmap(from_end - from)
     __st(g + 32, to)
     __st(g + 40, to + (from_end - from))
@@ -165,6 +166,8 @@ def __gc_run(fp)
     nto = __mmap(ncap)
     __st(g + 32, nto)
     __st(g + 40, nto + ncap)
+    __munmap(from, from_end - from) # the old from-space: back to the OS
+    __munmap(bitmap, (from_end - from) / 128 + 4096)
     __st(g + 48, __mmap(ncap / 128 + 4096))
   else
     __st(g + 32, from)

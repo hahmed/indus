@@ -1311,7 +1311,7 @@ module Indus
         l, r = of(f, a[0]), of(f, a[1])
         l && r ? join(narrow(l), narrow(r)) : nil # both sides known, or no guess: a str * n is not an int
       when :and, :or then (of(f, a[0]) == :bool && of(f, a[1]) == :bool) ? :bool : :int
-      when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub, :handle then :int
+      when :xor, :shl, :shr, :mod, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :rawmunmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub, :handle then :int
       when :cmp, :ucmp, :isa, :isa_dyn then :bool
       when :box then :dyn
       when :unbox then a[1]

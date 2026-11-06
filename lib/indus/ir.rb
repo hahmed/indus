@@ -12,7 +12,7 @@ module Indus
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
     def term? = %i[br condbr ret].include?(op)
-    def call? = %i[zcheck call mcall pcall dsend sendsw puts_i puts_s puts_str eputs_str clock sys try_push raise puts_bool puts_opt puts_nil puts_nil_word p_str print_i print_str putc anew aset onew ipow seam sconst scat sjoin sappend seq sne scmp itos stoi bool_to_s chr box sdup salloc cell_new mkbuf bufappend libm fpow hnew hget hset hkey hkeys ssub rawmmap].include?(op) || (op == :hrestore && args.size > 2 + (ngrown || 0)) # a restore with kept values calls rt_keep_*
+    def call? = %i[zcheck call mcall pcall dsend sendsw puts_i puts_s puts_str eputs_str clock sys try_push raise puts_bool puts_opt puts_nil puts_nil_word p_str print_i print_str putc anew aset onew ipow seam sconst scat sjoin sappend seq sne scmp itos stoi bool_to_s chr box sdup salloc cell_new mkbuf bufappend libm fpow hnew hget hset hkey hkeys ssub rawmmap rawmunmap].include?(op) || (op == :hrestore && args.size > 2 + (ngrown || 0)) # a restore with kept values calls rt_keep_*
     def float? = ty == :float
     def to_s = "v#{id}"
   end

@@ -1332,6 +1332,7 @@ module Indus
       when :__adr_text then emit(:adrlbl, [:__text_base])
       when :__dbg then emit(:puts_i, [expr(args[0])])
       when :__mmap then emit(:rawmmap, [expr(args[0])])
+      when :__munmap then emit(:rawmunmap, [expr(args[0]), expr(args[1])])
       when :__trap then emit(:trap, [])
       # unsigned / wrapping 64-bit arithmetic for the float printer
       when :__fbits then emit(:fbits, [expr(args[0])])

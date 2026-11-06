@@ -1026,6 +1026,14 @@ rt_mmap:
         ldp     x29, x30, [sp], #16
         ret
 
+// rt_munmap(x0 addr, x1 bytes): give a semispace back to the OS
+rt_munmap:
+        stp     x29, x30, [sp, #-16]!
+        ldr     x16, [x27, #128]
+        blr     x16
+        ldp     x29, x30, [sp], #16
+        ret
+
 // rt_str_cmp(x0 a, x1 b) -> -1 / 0 / 1 (bytewise, then by length; Ruby's <=>)
 rt_str_cmp:
         ldur    x2, [x0, #-8]
