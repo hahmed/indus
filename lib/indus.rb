@@ -18,7 +18,7 @@
 #   lib/indus/macho.rb    standalone Mach-O writer
 #   lib/indus/elf.rb      standalone Linux ELF writer
 #
-# test/check    every test/oracle/*.rb and bench/*.rb prints what CRuby prints
+# test/check    every test/programs/*.rb and bench/*.rb prints what CRuby prints
 # tools/sieve   pour programs through; see what compiles and what blocks the rest
 # See experiments/ for how it got here.
 gem "prism", "= 1.8.2" rescue nil

@@ -98,7 +98,7 @@ compiler cannot prove away. A Ruby that allocates like Rust is not Ruby.
 ## Open questions
 
 - How much of CRuby's object header is semantics (frozen, object_id, singleton class) and
-  how much is for the collector? Indus has none of it; 238 oracle programs have not needed
+  how much is for the collector? Indus has none of it; 238 test programs have not needed
   object_id or freeze.
 - How much of a Rails request's allocation is request-local? If most, regions matter more
   than a better collector. Measure on a real app.

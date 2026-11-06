@@ -18,7 +18,7 @@ compile without giving the speed back.
    latest. Read the last three before touching the compiler.
 
 ## Design rules that are not negotiable
-- Correctness over refusal over wrong answer. The oracle is CRuby's stdout.
+- Correctness over refusal over wrong answer. The reference is CRuby: every test is a program and its CRuby output.
 - Zero runtime boxes; objects are their fields; the collector is told the type of every
   slot (no headers, no conservative scanning). Dynamism (`:dyn` tags, cells, handler
   records, closures as objects) costs only where used.
@@ -34,7 +34,7 @@ compile without giving the speed back.
 
 ## Before every commit
 ```
-test/check                    # oracle programs, plain + INDUS_HEAP_MB=2
+test/check                    # test/programs, plain + INDUS_HEAP_MB=2
 test/check bench/*.rb         # the 78 benchmarks the same way
 bench/quick                   # fib / binary_trees / tree_walker timings
 ```
@@ -48,7 +48,7 @@ One program per command; `timeout -k 2 N`; `pgrep -fl 'bin/indus'` after a batch
 
 ## Where things are
 `lib/indus/{lower,types,escape,ranges,regalloc,codegen,asm}.rb` compiler ·
-`lib/indus/rt/*.rb` the runtime, in Ruby, compiled into every program · `test/oracle/`
+`lib/indus/rt/*.rb` the runtime, in Ruby, compiled into every program · `test/programs/`
 programs with CRuby as truth · `test/host/` prelude tests under CRuby · `test/fuzz` ·
 `bench/` + `bench/REPORT.md` · `tools/{dis,sieve,census}` · `DUMP=1` prints IR,
 `HEAP=1` prints collector stats, `INDUS_HEAP_MB=n` sets the semispace.

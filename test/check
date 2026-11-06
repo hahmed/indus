@@ -7,7 +7,7 @@
 # Prints failures only, then one summary line. Exit 1 on any failure.
 cd "$(dirname "$0")/.."
 trap 'pkill -9 -P $$ 2>/dev/null' EXIT INT TERM   # compiled programs ignore SIGTERM
-[ $# -gt 0 ] && files=("$@") || files=(test/oracle/*.rb)
+[ $# -gt 0 ] && files=("$@") || files=(test/programs/*.rb)
 pass=0; fail=0
 run() { timeout -k 2 60 env "$@" 2>/dev/null; }
 for f in "${files[@]}"; do
