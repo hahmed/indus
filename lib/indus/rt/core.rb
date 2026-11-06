@@ -429,20 +429,51 @@ def __str_space(c)
   c == 32 || c == 9 || c == 10 || c == 13
 end
 
+# gsub with a string pattern: count the matches, size the result exactly, write it once.
+# No match: a copy. (The old version concatenated per match: 260 bytes of garbage a call.)
 def __str_gsub(s, pat, rep)
-  out = ""
-  i = 0
-  start = 0
-  while i <= s.length - pat.length
-    if __str_match_at(s, pat, i)
-      out = out + s[start, i - start] + rep
-      i = i + pat.length
-      start = i
-    else
-      i = i + 1
+  if pat.length == 0 # the empty pattern matches before every character and at the end
+    out = __salloc(s.length + (s.length + 1) * rep.length)
+    w = 0
+    k = 0
+    while k < s.length
+      w = __str_copy_bytes(out, w, rep, 0, rep.length)
+      __st8(out, w, __ld8(s, k))
+      w = w + 1
+      k = k + 1
     end
+    __str_copy_bytes(out, w, rep, 0, rep.length)
+    return out
   end
-  out + s[start, s.length - start]
+  n = 0
+  i = __str_index(s, pat, 0)
+  while !i.nil?
+    n = n + 1
+    i = __str_index(s, pat, i + pat.length)
+  end
+  return __sdup(s) if n == 0
+  out = __salloc(s.length + n * (rep.length - pat.length))
+  w = 0
+  start = 0
+  i = __str_index(s, pat, 0)
+  while !i.nil?
+    w = __str_copy_bytes(out, w, s, start, i - start)
+    w = __str_copy_bytes(out, w, rep, 0, rep.length)
+    start = i + pat.length
+    i = __str_index(s, pat, start)
+  end
+  __str_copy_bytes(out, w, s, start, s.length - start)
+  out
+end
+
+# bytes src[from, n] into out at w; returns the new w
+def __str_copy_bytes(out, w, src, from, n)
+  k = 0
+  while k < n
+    __st8(out, w + k, __ld8(src, from + k))
+    k = k + 1
+  end
+  w + n
 end
 
 def __str_succ(s)

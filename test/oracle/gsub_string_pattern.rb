@@ -1,0 +1,6 @@
+puts "a\"b\"c".gsub("\"", "\"\"")
+puts "hello world".gsub("o", "0")
+puts "aaa".gsub("a", "")
+puts "abc".gsub("x", "y")
+puts "abc".gsub("", "-")
+puts "banana".gsub("an", "AN")

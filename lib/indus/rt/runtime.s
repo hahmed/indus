@@ -126,6 +126,9 @@ rt_str_append:
 2:      lsl     x0, x23, #1
         cmp     x0, x24
         csel    x0, x0, x24, hi
+        cmp     x0, #32                 // a string that grows starts at 32 bytes: exact fit from 0 reallocates every append
+        mov     x1, #32
+        csel    x0, x0, x1, hi
         mov     x23, x0                 // new cap
         bl      rt_alloc
         stur    x23, [x0, #-16]
