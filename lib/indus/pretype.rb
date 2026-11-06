@@ -115,6 +115,9 @@ module Indus
             v = expr(n.value, env, klass, fkey); set_ivar(klass, n.name, v) if klass; v
           when Prism::ConstantReadNode, Prism::ConstantPathNode then @classes[n.name] ? :"class:#{n.name}" : nil
           when Prism::ConstantWriteNode then expr(n.value, env, klass, fkey)
+          when Prism::ClassVariableWriteNode then (v = expr(n.value, env, klass, fkey); (@cvars ||= {})[n.name] = join(@cvars[n.name], v); v)
+          when Prism::ClassVariableReadNode then (@cvars ||= {})[n.name]
+          when Prism::ClassVariableOperatorWriteNode then (expr(n.value, env, klass, fkey); (@cvars ||= {})[n.name])
           when Prism::IfNode, Prism::UnlessNode
             expr(n.predicate, env, klass, fkey)
             a = n.statements&.body&.map { expr(_1, env, klass, fkey) }&.last

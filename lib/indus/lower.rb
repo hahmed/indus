@@ -30,6 +30,15 @@ module Indus
       if node.is_a?(Prism::DefNode) && node.body.is_a?(Prism::BeginNode)
         node = node.copy(body: Prism::StatementsNode.new(node.send(:source), 0, node.body.location, 0, [node.body]))
       end
+      # `{ it + 1 }` and `{ _1 * _2 }`: ordinary blocks with parameters named it / _1.._n
+      if node.is_a?(Prism::BlockNode) && (node.parameters.is_a?(Prism::ItParametersNode) || node.parameters.is_a?(Prism::NumberedParametersNode))
+        src = node.send(:source); loc = node.location
+        names = node.parameters.is_a?(Prism::ItParametersNode) ? [:it] : (1..node.parameters.maximum).map { :"_#{_1}" }
+        reqs = names.map { Prism::RequiredParameterNode.new(src, 0, loc, 0, _1) }
+        params = Prism::ParametersNode.new(src, 0, loc, 0, reqs, [], nil, [], [], nil, nil)
+        node = node.copy(parameters: Prism::BlockParametersNode.new(src, 0, loc, 0, params, [], nil, nil))
+      end
+      return Prism::LocalVariableReadNode.new(node.send(:source), 0, node.location, 0, :it, 0) if node.is_a?(Prism::ItLocalVariableReadNode)
       fields = node.class.instance_method(:initialize).parameters.map(&:last).reject { %i[source node_id location flags].include?(_1) }
       changes = {}
       fields.each do |fl|
@@ -50,15 +59,42 @@ module Indus
       @module_defs = mods.to_h { |m| [m.constant_path.name, (m.body&.body || []).grep(Prism::DefNode).reject { _1.receiver.is_a?(Prism::SelfNode) }] }
       mod_classes = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ClassNode) }
       mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
-      mod_ivars = mods.flat_map { |m| (m.body&.body || []).grep(Prism::InstanceVariableWriteNode).map { [m.constant_path.name, _1] } }
       defs = body.grep(Prism::DefNode)
       # top-level define_method(:name) { |params| body } with a literal symbol and block: a def
       dm = body.select { |st| st.is_a?(Prism::CallNode) && st.name == :define_method && st.receiver.nil? && st.block.is_a?(Prism::BlockNode) && st.arguments&.arguments&.first.is_a?(Prism::SymbolNode) }
       body = body - dm
       cdefs = body.grep(Prism::ClassNode) + mod_classes
+      mod_ivars = (mods + cdefs).flat_map { |m| (m.body&.body || []).grep(Prism::InstanceVariableWriteNode).map { [m.constant_path.name, _1] } } # `@x = v` in a module or class body: the class object's own ivar, set before the program runs
       # `def self.m` in a class or module body: a function named Owner.m, no self
       @modules = mods.map { _1.constant_path.name }
       sdefs = (cdefs + mods).flat_map { |c| (c.body&.body || []).grep(Prism::DefNode).select { _1.receiver.is_a?(Prism::SelfNode) }.map { [c.constant_path.name, _1] } }
+      # class << self ... end: defs inside are class methods; attr_accessor inside reads/writes the class object's ivars
+      (cdefs + mods).each do |c|
+        (c.body&.body || []).grep(Prism::SingletonClassNode).each do |sc|
+          raise "class << x: only self" unless sc.expression.is_a?(Prism::SelfNode)
+          (sc.body&.body || []).each do |st|
+            case st
+            when Prism::DefNode then sdefs << [c.constant_path.name, st]
+            when Prism::CallNode
+              raise "unsupported in class << self: #{st.name}" unless %i[attr_accessor attr_reader attr_writer].include?(st.name)
+              (st.arguments&.arguments || []).each do |sym|
+                nm = sym.unescaped.to_sym; src = sym.send(:source); loc = sym.location
+                ivar = Prism::InstanceVariableReadNode.new(src, 0, loc, 0, :"@#{nm}")
+                if %i[attr_accessor attr_reader].include?(st.name)
+                  sdefs << [c.constant_path.name, Prism::DefNode.new(src, 0, loc, 0, nm, loc, Prism::SelfNode.new(src, 0, loc, 0), nil, Prism::StatementsNode.new(src, 0, loc, 0, [ivar]), [], loc, nil, nil, nil, nil, nil)]
+                end
+                if %i[attr_accessor attr_writer].include?(st.name)
+                  prm = Prism::RequiredParameterNode.new(src, 0, loc, 0, :v)
+                  ps = Prism::ParametersNode.new(src, 0, loc, 0, [prm], [], nil, [], [], nil, nil)
+                  w = Prism::InstanceVariableWriteNode.new(src, 0, loc, 0, :"@#{nm}", loc, Prism::LocalVariableReadNode.new(src, 0, loc, 0, :v, 0), loc)
+                  sdefs << [c.constant_path.name, Prism::DefNode.new(src, 0, loc, 0, :"#{nm}=", loc, Prism::SelfNode.new(src, 0, loc, 0), ps, Prism::StatementsNode.new(src, 0, loc, 0, [w]), [:v], loc, nil, nil, nil, nil, nil)]
+                end
+              end
+            else raise "unsupported in class << self: #{st.class}"
+            end
+          end
+        end
+      end
       # module_function :m (or bare, covering the defs below it): the instance method is also Module.m
       mods.each do |m|
         stmts = m.body&.body || []
@@ -74,7 +110,11 @@ module Indus
         end
       end
       # constants written inside class bodies run before everything else
-      class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode) }
+      # a class's constants are its own (Base::PREFIX and Child::PREFIX are two globals, "Base::PREFIX" and
+      # "Child::PREFIX"); bare X inside a class resolves lexically through the ancestors (see const_owner)
+      @class_const_owners = Hash.new { |h, k| h[k] = [] } # const name -> classes that define it
+      cdefs.each { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).each { |w| @class_const_owners[w.name] << c.constant_path.name } }
+      class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).map { |w| w.copy(name: :"#{c.constant_path.name}::#{w.name}") } + (c.body&.body || []).grep(Prism::ClassVariableWriteNode) } # @@x = v in a class body: run first, like a constant
       # Name = Struct.new(:a, :b) defines a class with accessors and an initialize
       structs = body.select { |st| st.is_a?(Prism::ConstantWriteNode) && struct_new?(st.value) }
       top = (body - defs - cdefs - mods - structs)
@@ -94,7 +134,8 @@ module Indus
       end
       sdefs.each do |owner, d|
         ps = d.parameters
-        f = @funcs[:"#{owner}.#{d.name}"] = Func.new(:"#{owner}.#{d.name}", (ps&.requireds&.size || 0) + (ps&.optionals&.size || 0) + (ps&.keywords&.size || 0))
+        f = @funcs[:"#{owner}.#{d.name}"] = Func.new(:"#{owner}.#{d.name}", def_param_names(d).size)
+        f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
         @defs_by_func[f] = d
       end
       @lazy = {} # prelude functions (__name): lowered on first demand, see `demand`
@@ -124,7 +165,12 @@ module Indus
         k.id = @classes.size
         # every @ivar this class body writes, registered now: a subclass declared below copies
         # the parent's layout at declaration, before the parent's methods are lowered
-        register_class_body(k, c.body&.body || [], methods)
+        has = ->(cn) { kk = k; (return true if @class_const_owners[cn].include?(kk.name); kk = kk.superclass && @classes[kk.superclass]) while kk; false }
+        readers = @class_const_owners.keys.select { has.(_1) }.map do |cn| # def __const_X = X, so self.class::X can dispatch
+          src = c.send(:source); loc = c.location
+          Prism::DefNode.new(src, 0, loc, 0, :"__const_#{cn}", loc, nil, nil, Prism::StatementsNode.new(src, 0, loc, 0, [Prism::ConstantReadNode.new(src, 0, loc, 0, cn)]), [], loc, nil, nil, nil, nil, nil)
+        end
+        register_class_body(k, (c.body&.body || []) + readers, methods)
       end
       @pre = Pretype.new(@ast, @classes) # receiver kinds for the structural decisions below
       main = Func.new(:main, 0)
@@ -135,7 +181,7 @@ module Indus
       @dm_bodies.each { |f, (params, stmts)| lower_body(f, params, stmts) }
       sdefs.each do |owner, d|
         @owner = owner
-        lower_body(@funcs[:"#{owner}.#{d.name}"], (d.parameters&.requireds&.map(&:name) || []) + (d.parameters&.optionals&.map(&:name) || []) + (d.parameters&.keywords&.map(&:name) || []), d.body&.body || [])
+        lower_body(@funcs[:"#{owner}.#{d.name}"], def_param_names(d), d.body&.body || [])
         @owner = nil
       end
       methods.each do |k, d, f, names, body, ct|
@@ -287,10 +333,28 @@ module Indus
     def call_args_raw(f, args, skip)
       args = args.dup
       kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
+      d = @defs_by_func[f]
+      nfixed = d ? (d.parameters&.requireds&.size || 0) + (d.parameters&.optionals&.size || 0) : f.params.size - skip
+      if (si = args.index { _1.is_a?(Prism::SplatNode) }) # m(*arr): the array's elements by index, up to the callee's fixed arity; a rest callee takes the array itself
+        before = args[0...si].map { expr(_1) }; sp = expr(args[si].expression); after = (args[(si + 1)..] || []).map { expr(_1) }
+        if f.rest # the rest array is everything past the fixed parameters: pieces of before, the splat, after
+          fixed_from_splat = [nfixed - before.size, 0].max
+          taken = (0...fixed_from_splat).map { |k| emit(:idx, [sp, const(k)]) }
+          tail = fixed_from_splat.zero? ? sp : emit(:call, [demand(:__arr_drop), sp, const(fixed_from_splat)])
+          lead = before[nfixed..] || []
+          rest = lead.empty? ? tail : emit(:call, [demand(:__arr_plus), pack_values(lead), tail])
+          rest = emit(:call, [demand(:__arr_plus), rest, pack_values(after)]) unless after.empty?
+          return (before[0, nfixed] + taken + [rest]) # keywords with a splat: unsupported, fall through would mis-place them
+        end
+        need = nfixed - before.size - after.size
+        raise "#{f.name}: splat arguments cannot fill #{need} parameters" if need < 0
+        vals = before + (0...need).map { |k| emit(:idx, [sp, const(k)]) } + after
+        return vals unless d && (d.parameters&.optionals&.any? || d.parameters&.keywords&.any?)
+        return fill_defaults(f, vals, kw)
+      end
       vals = args.map { expr(_1) }
-      if f.rest && (d = @defs_by_func[f]) # the extra positionals become the *rest array
+      if f.rest && d # the extra positionals become the *rest array
         ps = d.parameters
-        nfixed = ps.requireds.size + ps.optionals.size
         fixed, extra = vals[0, nfixed], vals[nfixed..] || []
         vals = fixed + [pack_values(extra)]
       elsif f.rest
@@ -327,6 +391,8 @@ module Indus
       when Prism::CallNode
         return r if r.arguments.nil? && r.block.nil? && r.receiver # `obj.attr << v`: the slot becomes a cell (Types)
         return r if r.name == :[] && r.receiver && r.arguments&.arguments&.size == 1 && r.block.nil? # `h[k] << v`: the slot is written back
+        return r if r.arguments.nil? && r.block.nil? && r.receiver.nil? && @owner && @funcs[:"#{@owner}.#{r.name}"] # `registry << o` in a class method: the class object's ivar, through its reader
+      when Prism::ConstantReadNode, Prism::GlobalVariableReadNode, Prism::ClassVariableReadNode then r # LIST << v: the global is rebound
       end
     end
 
@@ -429,6 +495,7 @@ module Indus
       (k.mixins ||= []).concat(included + prepended)
       mixed_in, prepended_defs = included.flat_map(&mod_defs), prepended.flat_map(&mod_defs)
       (mixed_in + prepended_defs).each { |d| assigned_ivars(d).each { k.ivar(_1) } }
+      @visibility = nil
       (mixed_in + stmts + prepended_defs).each do |st|
         case st
         when Prism::DefNode
@@ -439,10 +506,24 @@ module Indus
           f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
           f.shadowed = k.methods[st.name] if k.methods[st.name]&.cls == k
           f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
+          (k.hidden ||= {})[st.name] = true if @visibility && @visibility != :public
         when Prism::CallNode
           next if st.name == :include || st.name == :prepend # mixed in above
+          if %i[private public protected].include?(st.name) && st.receiver.nil?
+            if st.arguments.nil? then @visibility = st.name # a bare `private`: the defs below are not public
+            else (st.arguments.arguments).each { |a| nm = a.unescaped.to_sym; (k.methods[nm] || k.readers[nm]) && (k.hidden ||= {})[nm] = st.name != :public } end # private :m
+            next
+          end
+          next if %i[private_constant module_function freeze].include?(st.name) && st.receiver.nil? # visibility is not enforced (every call is resolved at compile time)
           class_body_call(k, st, {}, methods)
         when Prism::ConstantWriteNode then nil # hoisted above
+        when Prism::AliasMethodNode # alias new old: the same Func under a second name (a yielder: a second inline site)
+          new_name = st.new_name.unescaped.to_sym; old_name = st.old_name.unescaped.to_sym
+          if (y = @yielders[old_name]) then @yielders[new_name] = y
+          elsif (m = k.methods[old_name]) then k.methods[new_name] = m
+          elsif k.readers[old_name] then k.readers[new_name] = k.readers[old_name]
+          else raise "alias #{new_name} #{old_name}: no such method in #{k.name}" end
+        when Prism::ClassVariableWriteNode, Prism::InstanceVariableWriteNode, Prism::SingletonClassNode then nil # hoisted above
         else raise "unsupported in class body: #{st.class}"
         end
       end
@@ -700,6 +781,7 @@ module Indus
         emit(:fld_set, [me_val, @klass.ivar(n.name), v]); v
       when Prism::ConstantReadNode
         if n.name == :ARGV then (c = const(0); c.ty = :nil; c) # no arguments: every ARGV[k] is nil
+        elsif (o = const_owner(n.name)) then emit(:gget, [:"#{o}::#{n.name}"]) # a class's constant, found lexically
         else emit(:gget, [n.name]) end
       when Prism::ConstantWriteNode
         v = expr(n.value); emit(:gset, [n.name, v]); v
@@ -707,8 +789,11 @@ module Indus
       when Prism::NumberedReferenceReadNode then emit(:call, [demand(:__re_group), const(n.number)]) # $1..$9 after the last match
       when Prism::RegularExpressionNode, Prism::InterpolatedRegularExpressionNode then regexp_value(n)
       when Prism::MatchWriteNode then expr(n.call) # /(?<x>..)/ =~ s with named captures: the match itself (names unsupported, parser refuses)
-      when Prism::GlobalVariableWriteNode
+      when Prism::GlobalVariableWriteNode, Prism::ClassVariableWriteNode # @@x: one global per name (a hierarchy shares it in Ruby too)
         v = expr(n.value); emit(:gset, [n.name, v]); v
+      when Prism::ClassVariableReadNode then emit(:gget, [n.name])
+      when Prism::ClassVariableOperatorWriteNode # @@count += 1
+        v = emit(ARITH.fetch(n.binary_operator), [emit(:gget, [n.name]), expr(n.value)]); emit(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode
         if @in_safe_nav && @in_safe_nav_node.equal?(n) then @in_safe_nav
         elsif @ct&.key?(n.name) then (c = const(sym_id(@ct[n.name])); c.ty = :sym; c) # compile-time symbol
@@ -953,7 +1038,10 @@ module Indus
         when Prism::CallNode
           if root.name == :[] # h[k] << v / a[i] << v: the element slot takes the grown handle
             idx_set_value(root.receiver, root.arguments.arguments[0], r)
+          elsif root.receiver.nil? && @owner # the class object's ivar behind a class-level reader
+            emit(:gset, [:"#{@owner}@#{root.name}", r])
           end
+        when Prism::ConstantReadNode, Prism::GlobalVariableReadNode, Prism::ClassVariableReadNode then emit(:gset, [root.name, r])
         end
         return r
       end
@@ -1010,8 +1098,9 @@ module Indus
               else emit(:puts_v, [expr(a)]) end # Types picks puts_i / puts_str
         end
         r
-      elsif n.name == :p && n.receiver.nil? && args.size > 1
-        args.each { |a| p_one(a) }; return const(0)   # p a, b: one line each
+      elsif n.name == :p && n.receiver.nil? && args.size > 1 # p a, b: every argument evaluated, then one line each
+        vals = args.map { |a| kind_of(a) == :array ? [:str, inspect_str(a)] : a.is_a?(Prism::CallNode) && a.name == :class && a.arguments.nil? && a.receiver ? [:puts, expr(a)] : [:p, expr(a)] }
+        vals.each { |(k, v)| emit(k == :str ? :puts_str : k == :puts ? :puts_v : :p_v, [v]) }; return const(0)
       elsif n.name == :p && n.receiver.nil? && args.size == 1 then p_one(args[0])
       elsif n.name == :inspect && args.empty? && n.receiver then inspect_str(n.receiver)
       elsif n.name == :print && n.receiver.nil? && args.size > 1
@@ -1041,7 +1130,7 @@ module Indus
         raise "respond_to?: the receiver's class is not known at compile time" unless k
         if nm # a literal name: a compile-time fact
           expr(n.receiver) if n.receiver # the receiver is still evaluated
-          c = const(k.find_method(nm) || k.find_reader(nm) || k.find_writer(nm) ? 1 : 0); c.ty = :bool; c
+          c = const((k.find_method(nm) || k.find_reader(nm) || k.find_writer(nm)) && !k.hidden&.[](nm) ? 1 : 0); c.ty = :bool; c # a private method does not respond
         else # a computed name: its symbol against the class's own, at run time
           nv = expr(args[0])
           nv = emit(:call, [demand(:__str_to_sym_q), nv]) unless args[0].is_a?(Prism::SymbolNode)
@@ -1054,14 +1143,23 @@ module Indus
         end
       elsif n.name == :include? && args.size == 1 && n.receiver.is_a?(Prism::ConstantReadNode) && (k = @classes[n.receiver.name]) && args[0].is_a?(Prism::ConstantReadNode)
         c = const(Types.ancestor?(k, args[0].name) ? 1 : 0); c.ty = :bool; c # Klass.include?(M): a compile-time fact
-      elsif n.name == :name && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
+      elsif %i[name to_s inspect].include?(n.name) && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name))
         emit(:sconst, [n.receiver.name.to_s]) # Klass.name
+      elsif n.name == :class && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name))
+        emit(:sconst, [@modules.include?(n.receiver.name) ? "Module" : "Class"])
+      elsif n.name == :superclass && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
+        emit(:sconst, [(@classes[n.receiver.name].superclass || :Object).to_s])
+      elsif n.name == :frozen? && args.empty? && n.receiver # no frozen bit: literals and objects report false, symbols/numbers/nil true
+        k = n.receiver
+        emit(:const, [k.is_a?(Prism::SymbolNode) || k.is_a?(Prism::IntegerNode) || k.is_a?(Prism::FloatNode) || k.is_a?(Prism::NilNode) || k.is_a?(Prism::TrueNode) || k.is_a?(Prism::FalseNode) ? 1 : 0]).tap { _1.ty = :bool }
       elsif n.name == :name && args.empty? && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :class && n.receiver.arguments.nil? && n.receiver.receiver
         expr(n.receiver) # obj.class.name: the class is already its name (no class objects)
       elsif n.name == :ancestors && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) then raise "ancestors: no class objects at run time"
       elsif n.name == :extend && args.size == 1 && n.receiver then raise "extend on an instance: singleton methods are not supported (every object of a class shares its methods)"
       elsif %i[is_a? kind_of? instance_of?].include?(n.name) && args.size == 1 && n.receiver && args[0].is_a?(Prism::ConstantReadNode)
         emit(:isa, [expr(n.receiver), args[0].name])
+      elsif n.name == :=== && args.size == 1 && n.receiver.is_a?(Prism::ConstantReadNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name) || %i[Integer Float String Array Hash Symbol NilClass Numeric Comparable].include?(n.receiver.name))
+        emit(:isa, [expr(args[0]), n.receiver.name]) # Klass === x
       elsif n.name == :class && args.empty? && n.receiver && (bk = builtin_kind(n.receiver))
         emit(:sconst, [{ int: "Integer", float: "Float", str: "String", array: "Array", hash: "Hash", range: "Range", sym: "Symbol", bool: n.receiver.is_a?(Prism::TrueNode) ? "TrueClass" : "FalseClass", nil: "NilClass" }[bk]]) # a builtin's class: its name (no class objects at run time)
       elsif n.name == :nil? && args.empty? && n.receiver
@@ -1418,6 +1516,21 @@ module Indus
     # under prefixed keys, so loop phis cover both scopes uniformly.
     def block_call(n, args)
       blk = n.block
+      # x.then { |v| body } / x.tap { |v| body }: the block inlined with v bound to x
+      if %i[then yield_self].include?(n.name) && n.receiver && blk.is_a?(Prism::BlockArgumentNode) && blk.expression.is_a?(Prism::SymbolNode) && args.empty?
+        return expr(Prism::CallNode.new(n.send(:source), 0, n.location, 0, n.receiver, nil, blk.expression.unescaped.to_sym, nil, nil, nil, nil, nil, nil)) # x.then(&:m) is x.m
+      end
+      if %i[then yield_self tap].include?(n.name) && n.receiver && blk.is_a?(Prism::BlockNode) && args.empty?
+        v = expr(n.receiver)
+        params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+        pfx = :"thn#{@f.blocks.size}:"
+        @locals[:"#{pfx}#{params[0]}"] = v if params[0]
+        @blk_pfx = (@blk_pfx || []) << pfx
+        r = (blk.body&.body || []).map { expr(_1) }.last
+        @blk_pfx.pop
+        @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
+        return n.name == :tap ? v : (r || v)
+      end
       if %i[map! collect! select! reject! sort_by!].include?(n.name) && n.receiver && !@recv_value # in place: compute, then write back into the same handle
         fresh = block_call(n.copy(name: n.name.to_s.chomp("!").to_sym), args)
         return emit(:call, [demand(:__arr_replace), expr(n.receiver), fresh])
@@ -2379,8 +2492,30 @@ module Indus
     MATH_CONSTS = { PI: Math::PI, E: Math::E }.freeze
     FLOAT_CONSTS = { INFINITY: Float::INFINITY, NAN: Float::NAN, MAX: Float::MAX, MIN: Float::MIN, EPSILON: Float::EPSILON }.freeze
     FLOAT_INT_CONSTS = { DIG: Float::DIG, MAX_EXP: Float::MAX_EXP, MIN_EXP: Float::MIN_EXP, MANT_DIG: Float::MANT_DIG }.freeze
+    # the class whose constant a bare name means here: the current class (or class-method owner), then its ancestors
+    def const_owner(name)
+      return nil unless @class_const_owners && !@class_const_owners[name].empty?
+      k = @owner ? @classes[@owner] : @klass
+      k = k.outer if k&.closure && k.outer
+      while k
+        return k.name if @class_const_owners[name].include?(k.name)
+        k = k.superclass && @classes[k.superclass]
+      end
+      nil
+    end
+
     def expr_const_path(n)
       # Mod::NAME -> the constant; Mod::Klass handled by callers (Klass.new)
+      if n.parent.is_a?(Prism::ConstantReadNode) && @classes[n.parent.name] && @class_const_owners && !@class_const_owners[n.name].empty? # Base::PREFIX: through the ancestors
+        k = @classes[n.parent.name]
+        while k
+          return emit(:gget, [:"#{k.name}::#{n.name}"]) if @class_const_owners[n.name].include?(k.name)
+          k = k.superclass && @classes[k.superclass]
+        end
+      end
+      if n.parent.is_a?(Prism::CallNode) && n.parent.name == :class && n.parent.arguments.nil? && n.parent.receiver && @class_const_owners && !@class_const_owners[n.name].empty?
+        return emit(:mcall, [:"__const_#{n.name}", expr(n.parent.receiver)]) # self.class::X: the receiver's class decides at run time (a synthesized reader per class)
+      end
       return fconst(MATH_CONSTS.fetch(n.name)) if n.parent.is_a?(Prism::ConstantReadNode) && n.parent.name == :Math
       if n.parent.is_a?(Prism::ConstantReadNode) && n.parent.name == :Float
         return fconst(FLOAT_CONSTS[n.name]) if FLOAT_CONSTS.key?(n.name)

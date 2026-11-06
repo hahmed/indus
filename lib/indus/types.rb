@@ -77,12 +77,14 @@ module Indus
       @ivars ||= Hash.new { |h, k| h[k] = {} } # class name -> ivar index -> type
       @consts ||= {}
       @funcs_live = funcs
-      funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = f.cls.name if f.cls }
+      funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = self_type(f.cls) if f.cls }
       @exc_type = nil # the type of a rescued value: whatever any raise in the program raises
       @no_defer = false
       @seams = funcs.any? { |f| f.all.any? { _1.op == :seam } }
+      rounds = 0
       loop do
         changed = false
+        raise "type inference does not converge (#{rounds} rounds): a rewrite keeps undoing another's work; refusing rather than looping" if (rounds += 1) > 400
         mark_unused_results(funcs) if funcs.any? { _1.name == :main } # a whole-program fact; the resident compiler sees one function
         set = ->(cur, nt, &w) { (w.call(join(cur, nt)); changed = true) if nt && join(cur, nt) != cur }
         funcs.each do |f|
@@ -132,9 +134,12 @@ module Indus
             end
             if i.op == :raise && (t = of(f, i.args[0])) && join(@exc_type, t) != @exc_type then @exc_type = join(@exc_type, t); changed = true end
             bind(f, i) if i.op == :mcall
-            if i.op == :call && (c = i.args[0]).cls && poly?(of(f, i.args[1])) && !c.name.to_s.end_with?("#initialize")
-              # bound to one class while the receiver was that class; it has since widened to a set
-              i.op = :mcall; i.args = [c.name.to_s.split("#").last.to_sym, *i.args[1..]]; bind(f, i); changed = true
+            if i.op == :call && (c = i.args[0]).cls && poly?(pt = of(f, i.args[1])) && !c.name.to_s.end_with?("#initialize")
+              # bound to one class while the receiver was that class; it has since widened to a set --
+              # unless every class in the set resolves to this very function (then the call stands)
+              mn = c.name.to_s.split("#").last.sub(/'+\z/, "").to_sym
+              same = pt[1].all? { |cn| @classes[cn] && (kind, payload = resolve(@classes[cn], mn, i.args.size - 2, allow_missing: true); kind == :call && payload.equal?(c)) }
+              unless same then i.op = :mcall; i.args = [mn, *i.args[1..]]; bind(f, i); changed = true end
             end
             if i.op == :call && i.args[0].name == :__arr_inspect && of(f, i.args[1]) == :dyn # the array became a tagged value: inspect by tag
               i.args[0] = fn(:__dyn_inspect); changed = true
@@ -279,8 +284,9 @@ module Indus
               end
               if @settled && %i[puts_v p_v print_v].include?(i.op) && (t = of(f, i.args[0])) && (classes_of(t)) # puts obj: its to_s (or "#<Klass>")
                 cs = classes_of(t)
-                if cs.any? { @classes[_1].find_method(:to_s) }
-                  c = Inst.new(:mcall, [:to_s, i.args[0]]); c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); bind(f, c)
+                want = i.op == :p_v && cs.any? { @classes[_1].find_method(:inspect) } ? :inspect : :to_s # p obj: its inspect when it has one
+                if cs.any? { @classes[_1].find_method(want) }
+                  c = Inst.new(:mcall, [want, i.args[0]]); c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); bind(f, c)
                 else
                   c = Inst.new(:sconst, ["#<#{cs.first}>"]); c.ty = :str; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
                 end
@@ -482,6 +488,7 @@ module Indus
               end
             when :fld_set
               o, ix, v = i.args; k = of(f, o)
+              k = k[1][0] if poly?(k) # self as a set {class, descendants}: the field is recorded on the class whose method writes it (ivar_type joins the hierarchy)
               set.(@ivars[k][ix], of(f, v)) { @ivars[k][ix] = _1 } if k
               # a cell stored into a field: what the field's other writers put in it comes back to the cell (shared growth)
               if k && (vt = of(f, v)) && cell?(vt) && (it = @ivars[k][ix]) && cell?(it) && join(vt, it) != vt
@@ -1097,6 +1104,10 @@ module Indus
       if poly?(t) # one arm per class: [klass, kind, payload]; a class without the method traps if reached
         arms = t[1].map { |c| [@classes[c], *resolve(@classes[c], name, args.size, trap_missing: true)] }
         raise "no method #{name} on any of #{t[1].join(', ')}" if arms.all? { |(_, kind, _)| kind == :trap }
+        if arms.all? { |(_, kind, payload)| kind == :call && payload.equal?(arms[0][2]) } # one function for the whole set: no dispatch needed
+          i.op = :call; i.args = [arms[0][2], recv, *args]; return
+        end
+        if arms.all? { |(_, kind, payload)| kind == :fld_get && payload == arms[0][2] } then i.op = :fld_get; i.args = [recv, arms[0][2]]; return end # one layout for the field
         i.op = :pcall; i.args = [arms, recv, *args]
         return
       end
@@ -1314,6 +1325,14 @@ module Indus
     end
 
     # a class with its ancestors and descendants: one layout
+    # the type of self inside klass's methods: the class alone, or with every descendant (an inherited
+    # method runs on subclass instances too; a call on self then dispatches on the real class)
+    def self.self_type(klass)
+      return klass.name if klass.closure
+      descendants = @classes.values.select { |c| c != klass && !c.closure && ancestor?(c, klass.name) && !c.mixins&.include?(klass.name) }
+      descendants.empty? ? klass.name : [:poly, [klass.name, *descendants.map(&:name)]]
+    end
+
     def self.related(klass)
       ups = []; c = klass.superclass; (ups << c; c = c.superclass) while c
       [klass, *ups, *@classes.values.select { |c| ancestor?(c, klass.name) && c != klass }]

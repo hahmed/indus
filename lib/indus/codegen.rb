@@ -425,7 +425,8 @@ module Indus
           off = @classes.fetch(kt) { raise "fld_get on #{o} (#{o.op}) typed #{o.ty.inspect} in #{@f.name}" }.base + ix * 8
           i.float? ? @asm.fldr_off(d, reg(o), off) : @asm.ldr_off(d, reg(o), off)
         when :fld_set
-          o, ix, v = i.args; ro = reg(o); off = @classes[o.ty].base + ix * 8
+          o, ix, v = i.args; ro = reg(o); kt = o.ty.is_a?(Array) && o.ty[0] == :poly ? o.ty[1][0] : o.ty # a poly set shares the field layout
+          off = @classes.fetch(kt) { raise "fld_set on #{o} typed #{o.ty.inspect} in #{@f.name}" }.base + ix * 8
           v.float? ? @asm.fstr_off(freg(v), ro, off) : @asm.str_off(reg(v, 9), ro, off)
         when :gget
           off = @asm.global(i.args[0])
@@ -555,6 +556,12 @@ module Indus
         when :hnew then @asm.mov_imm(0, 8); @asm.bl(:rt_hash_new); @asm.mov(d, 0)
         when :hget, :hkey, :hset
           kt = i.args[0].ty&.[](1) or raise "hash #{i.args[0]} has no key type in #{@f.name}"
+          # an object key is looked up by identity (its word). A class that defines hash / eql? / == expects
+          # value semantics: refuse rather than miss its keys
+          [*(kt.is_a?(Symbol) && @classes[kt] ? [kt] : []), *(kt.is_a?(Array) && kt[0] == :poly ? kt[1] : [])].each do |c|
+            m = %i[hash eql? ==].find { @classes[c].find_method(_1) }
+            raise "#{c} defines #{m} and is used as a Hash key: value-equal keys are not supported yet (keys compare by identity)" if m
+          end
           kind = kt == :str ? "s" : kt == :dyn ? "d" : "i" # strings by content, tagged keys by tag, the rest by word
           i.args[1..].each_with_index { |v, n| @asm.mov(n + 1, reg(v, n + 1)) }
           @asm.emit(0xD2F00010); @asm.emit(0xCA100021) if kind == "i" # mov x16, #1<<63; eor x1, x1, x16: a word key is stored with its sign bit flipped, so 0 (false, 0.0, the int 0) is never the empty-slot marker

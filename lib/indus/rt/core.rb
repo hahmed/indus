@@ -787,6 +787,10 @@ class StandardError
   def initialize(message = "unhandled exception")
     @message = message
   end
+  def to_s = @message
+  def inspect = "#<" + self.class + ": " + @message + ">"
+  def full_message = self.class + ": " + @message
+  def backtrace = []
 end
 class RuntimeError < StandardError
 end

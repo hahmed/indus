@@ -39,6 +39,7 @@ module Indus
   # a user class: ivar layout (8 bytes each, no header), methods, attrs
   class Klass
     attr_reader :name, :ivars, :methods, :readers, :writers
+    attr_accessor :hidden # method name -> true when private/protected (respond_to? is false; calls still resolve)
     attr_accessor :superclass, :tagged, :boxed, :id, :closure, :mixins, :enumerable, :outer # outer: the class a closure's self belongs to # closure: a lambda literal's anonymous class; mixins: modules included/prepended here
     def initialize(name, superclass = nil)
       @name, @methods, @readers, @writers = name, {}, {}, {}
