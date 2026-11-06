@@ -6,17 +6,6 @@ lifetimes and types are provable (7 of 8 shared benchmarks faster than Rust, 8 o
 everything measured faster than Spinel). Now in the breadth phase: make ordinary Ruby
 compile without giving the speed back.
 
-## Read first, in this order
-1. `~/src/github.com/Shopify/second-brain/my-notes/Resources/Ruby-Native-Performance/What-We-Learned.md`
-   — the design and every lesson, cumulative.
-2. `.../Memory-Without-A-Generational-GC.md` — the memory story and its honest limits.
-3. `.../Two-Days-Of-Breadth-Log.md` — recent commits annotated with their numbers.
-4. `~/src/github.com/Shopify/second-brain/my-notes/Resources/Unix-Philosophy.md` — how the
-   user wants code and prose: parsimony, separation, repair (fail noisily; never return a
-   value that means something else), clarity, measure before tuning.
-5. `notes/` in this repo (git-ignored): one file per experiment, numbered. `notes/64` is the
-   latest. Read the last three before touching the compiler.
-
 ## Design rules that are not negotiable
 - Correctness over refusal over wrong answer. The reference is CRuby: every test is a program and its CRuby output.
 - Zero runtime boxes; objects are their fields; the collector is told the type of every
@@ -52,13 +41,3 @@ One program per command; `timeout -k 2 N`; `pgrep -fl 'bin/indus'` after a batch
 programs with CRuby as truth · `test/host/` prelude tests under CRuby · `test/fuzz` ·
 `bench/` + `bench/REPORT.md` · `tools/{dis,sieve,census}` · `DUMP=1` prints IR,
 `HEAP=1` prints collector stats, `INDUS_HEAP_MB=n` sets the semispace.
-
-## The ordered list (next work)
-1. Loop regions with named survivors (escape.rb tier 1): csv_build 262 → ~185 ms floor.
-2. Probe rounds (three realistic programs, diff, fix) and `test/fuzz` — still finding one
-   or two real bugs per round at falling cost.
-3. Codegen: expand div/mod-by-constant into IR so invariants hoist; coalesce phi copies.
-4. World-age / OSR (parked; the only item that could still change the design).
-Open known gaps: `frozen?`/`freeze` have no bit; singleton methods and `extend` on an
-instance refuse; no finalizers/ObjectSpace/WeakRef by design; pauses ∝ live set (no
-barrier); memory not returned to the OS on shrink.
