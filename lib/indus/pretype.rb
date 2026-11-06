@@ -187,6 +187,7 @@ module Indus
       when :new
         cname = n.receiver.is_a?(Prism::ConstantReadNode) || n.receiver.is_a?(Prism::ConstantPathNode) ? n.receiver.name : nil
         return [:array, akinds[1]] if cname == :Array
+        return [:hash, nil, akinds[0]] if cname == :Hash # Hash.new / Hash.new(default) / Hash.new { }
         if cname && @classes[cname]
           k = key(cname, :initialize)
           akinds.each_with_index { |ak, i| set_param(k, i, ak) } if @defs[k]

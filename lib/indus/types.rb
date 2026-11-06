@@ -42,6 +42,7 @@ module Indus
       [t] if t.is_a?(Symbol) && @classes[t]
     end
     def self.poly?(t) = t.is_a?(Array) && t[0] == :poly
+    def self.prelude?(f) = f.name.to_s.start_with?("__") && !f.name.to_s.start_with?("__lambda") # the runtime's functions (not a user's closure)
     def self.of(f, v) = v.op == :param ? f.ptypes[f.params.index(v)] : v.ty
     def self.arr(t) = t.is_a?(Array) && t[0] == :arr
     # Bignum: an int array ([sign, limbs...], lib/indus/rt/big.rb) marked so that operators
@@ -166,7 +167,7 @@ module Indus
             # growth of an array through a parameter (push, insert at the end) must be seen by the
             # caller: the parameter becomes a cell holding the array (notes/53), the caller wraps
             # its array in a cell at the origin, and both sides read and write through it
-            if (i.op == :aset && arr(of(f, i.args[0])) && i.args[1].op == :alen || i.op == :lshift_or_append && arr(of(f, i.args[0])) || i.op == :hset && hsh(of(f, i.args[0]))) && !f.name.to_s.start_with?("__") && (p = param_origin(f, i.args[0]))
+            if (i.op == :aset && arr(of(f, i.args[0])) && i.args[1].op == :alen || i.op == :lshift_or_append && arr(of(f, i.args[0])) || i.op == :hset && hsh(of(f, i.args[0]))) && !prelude?(f) && (p = param_origin(f, i.args[0]))
               arr_cell_param(f, p); changed = true # a hash store may rehash into a new handle: the same treatment
             end
             if i.op == :call && !generic?(i.args[0]) # an argument flowing into an array-cell parameter is made a cell at its origin
@@ -218,6 +219,7 @@ module Indus
               # comparing objects: an ordering is the class's own operator (Comparable from the prelude,
               # or user-defined); == / != too when the class defines ==, else identity
               has_eq = (classes_of(t0) || []).any? { @classes[_1].find_method(:==) }
+              has_eq = false if i.args[1].op == :const && i.args[1].ty == :nil # x == nil / x.nil?: identity against nil, never the class's ==
               if %i[lt le gt ge].include?(i.cond) || has_eq && %i[eq ne].include?(i.cond)
                 neg = i.cond == :ne
                 i.op = :mcall; i.args = [{ lt: :<, le: :<=, gt: :>, ge: :>=, eq: :==, ne: :== }.fetch(i.cond), *i.args]; i.cond = nil; bind(f, i); changed = true
@@ -328,6 +330,7 @@ module Indus
                 c = Inst.new(:call, [fn(:__dyn_arr), i.args[0]]); c.ty = [:arr, :dyn]; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
                 i.args[0] = c; changed = true
               end
+              if i.op == :alen && hsh(of(f, i.args[0])) then i.op = :hcap; changed = true end # h.size guessed as an array length (hcap: the entry count)
               if %i[aget alen].include?(i.op) && hsh(of(f, i.args[0])) # a hash iterated as an array (the lowering could not tell): its pairs
                 h = i.args[0]
                 pairs = (@pairs_of ||= {})[h] ||= begin
@@ -393,14 +396,14 @@ module Indus
               end
               # a builtin family method bound while the receiver's type was provisional: if the receiver is now
               # another kind (a tagged value, a string where an array was guessed), undo the binding and rebind
-              if !ENV["NOREBIND"] && !@settled && callee.name == :__str_set_at && of(f, i.args[1]) == :dyn && !f.name.to_s.start_with?("__") # s[i] = v bound as a string store while s was provisionally a string
+              if !ENV["NOREBIND"] && !@settled && callee.name == :__str_set_at && of(f, i.args[1]) == :dyn && !prelude?(f) # s[i] = v bound as a string store while s was provisionally a string
                 i.op = :idx_set; i.args = i.args[1..]; i.ty = nil; i.bound_to = nil; changed = true
                 forget_params(callee, funcs); next
               end
               if !@settled && i.routed && %i[sort min max].include?(i.routed) && callee.name.to_s =~ /\A__arr_(sort|min|max)(\$\d+)?\z/ && (rt = of(f, i.args[1])) && arr(rt) && rt[1] == :sym
                 i.args[0] = fn(:"__arr_#{i.routed}_sym"); i.ty = nil; i.bound_to = nil; changed = true; next # symbols order by name, bound while the element type was unknown
               end
-              if !@settled && i.routed && (fm = callee.name.to_s[/\A__(str|arr|hash|num)_/, 1]) && (rt = of(f, i.args[1])) && !f.name.to_s.start_with?("__")
+              if !@settled && i.routed && (fm = callee.name.to_s[/\A__(str|arr|hash|num)_/, 1]) && (rt = of(f, i.args[1])) && !prelude?(f)
                 kind_now = rt == :str ? "str" : arr(rt) ? "arr" : hsh(rt) ? "hash" : %i[int int? float].include?(rt) ? "num" : nil
                 if kind_now != fm && (rt == :dyn || kind_now)
                   mn = i.routed
@@ -696,7 +699,7 @@ module Indus
       end
       funcs.each do |f|
         base = f.name.to_s.split("#").last.to_sym
-        unused = !read[f] && !read_name[base] && f.name != :main && !f.patchable && !f.name.to_s.start_with?("__")
+        unused = !read[f] && !read_name[base] && f.name != :main && !f.patchable && !prelude?(f)
         f.result_unused = unused
         # Once the types have settled (mcalls bound), a dead result is made to return a
         # constant, so the value -- and any phi only it kept alive -- stops existing instead of
@@ -988,7 +991,7 @@ module Indus
     def self.promote_geometric(funcs)
       promoted = false
       funcs.each do |f|
-        next if f.name.to_s.start_with?("__") # the preludes are written to fit
+        next if prelude?(f) # the preludes are written to fit
         f.blocks.each do |h|
           next unless h.name.to_s.start_with?("head")
           phis = h.phis.select { _1.ty == :int }
@@ -1172,6 +1175,9 @@ module Indus
         i.block.insts.insert(i.block.insts.index(i), un)
         cands.each { |k| related(k).each { _1.tagged = true; _1.boxed = true } }
         i.args[1] = un; return bind(f, i)
+      end
+      if t == :dyn && args.size == 1 && %i[include? join first last].include?(name) && (dh = fnq(:"__dyn_#{name.to_s.sub('?', '_p')}#{%i[first last].include?(name) ? 1 : ''}"))
+        i.op = :call; i.args = [dh, recv, args[0]]; return # the tag picks the family at run time
       end
       if t == :dyn && %i[sum min max sort uniq join length size first last reverse flatten compact each map select reject include? empty? count keys values].include?(name)
         # a container method on a tagged value: the container families both define it, so the

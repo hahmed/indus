@@ -220,8 +220,20 @@ module Indus
     def stp_pre(t1, t2, sz) = emit(0xA9800000 | (((-sz / 8) & 0x7F) << 15) | (t2 << 10) | (31 << 5) | t1)
     def ldp_post(t1, t2, sz) = emit(0xA8C00000 | ((sz / 8) << 15) | (t2 << 10) | (31 << 5) | t1)
     def mov_fp_sp = emit(0x910003FD)
-    def sub_sp(n) = emit(0xD10003FF | (n << 10))   # sub sp, sp, #n   (n < 4096, multiple of 16)
-    def add_sp(n) = emit(0x910003FF | (n << 10))
+    # sub/add sp, #n: one instruction under 4096; a second with the high part (lsl #12) up to 16 MB
+    def sub_sp(n)
+      emit(0xD10003FF | ((n & 0xFFF) << 10)) if (n & 0xFFF) != 0 || n == 0
+      emit(0xD14003FF | ((n >> 12) << 10)) if n >= 4096
+    end
+    def add_sp(n)
+      emit(0x910003FF | ((n & 0xFFF) << 10)) if (n & 0xFFF) != 0 || n == 0
+      emit(0x914003FF | ((n >> 12) << 10)) if n >= 4096
+    end
+    # add rd, sp, #off for any frame offset (two instructions past 4095)
+    def add_sp_off(rd, off)
+      if off < 4096 then addi(rd, 31, off)
+      else emit(0x91400000 | ((off >> 12) << 10) | (31 << 5) | rd); emit(0x91000000 | ((off & 0xFFF) << 10) | (rd << 5) | rd) end
+    end
 
     # data: bytes placed after the code, addressed with adr
     def data(name, bytes) = @data << [name, bytes]

@@ -392,3 +392,18 @@ def __re_gsub_blk(prog, ncap, s, blk)
   out
 end
 def __str_gsub_blk_re(s, re, blk) = __re_gsub_blk(re.prog, re.ncap, s, blk)
+def __re_sub_blk(prog, ncap, s, blk)
+  caps = __re_caps(ncap)
+  at = __re_search(prog, s, 0, caps, ncap)
+  return __sdup(s) if at < 0
+  me = caps[1]
+  $__re_last_caps = caps
+  $__re_last_str = s
+  s[0, at] + blk.call(s[at, me - at]) + s[me, s.length - me]
+end
+def __str_sub_blk_re(s, re, blk) = __re_sub_blk(re.prog, re.ncap, s, blk)
+def __re_groups_array
+  caps = $__re_last_caps
+  return nil if caps.nil?
+  __re_groups($__re_last_str, caps, caps.length)
+end

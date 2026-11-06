@@ -44,7 +44,7 @@ module Indus
       @try_recs = {}
       f.all.each { |i| next unless i.op == :try_push; @try_recs[i] = obj_base; obj_base += 96 }
       frame = obj_base
-      raise "frame too large (#{frame})" if frame > 4080
+      raise "frame too large (#{frame}): more than 32 KB of locals" if frame > 32752 # ldr/str [sp, #imm] reach 32760
       @asm.label(f.name)
       @asm.sub_sp(frame); @asm.stp(29, 30, 0); @asm.mov_fp_sp
       if GC.enabled? # pointer slots are roots: zero them, and describe this frame
@@ -197,7 +197,7 @@ module Indus
           k = i.args[0]
           if i.stack # tier 0: in the frame, zeroed here, gone at ret
             off = @stack_objs.fetch(i)
-            @asm.addi(d, 31, off)
+            @asm.add_sp_off(d, off)
             (k.size / 8).times { |w| @asm.str_off(31, d, w * 8) }
             (@asm.mov_imm(TMP, k.id); @asm.str_off(TMP, d, 0)) if k.tagged
           else
@@ -252,7 +252,7 @@ module Indus
           @asm.emit(0x910003F0); @asm.str(16, off + 8); @asm.str(29, off + 16)             # mov x16, sp ; sp, fp
           (19..26).each_with_index { |r, k| @asm.str(r, off + 24 + 8 * k) }
           @asm.adr(16, lbl(hb)); @asm.str(16, off + 88)                                    # resume address
-          @asm.addi(16, 31, off); @asm.str_off(16, Asm::GBASE, @asm.global(:__try_top))  # top = this record
+          @asm.add_sp_off(16, off); @asm.str_off(16, Asm::GBASE, @asm.global(:__try_top))  # top = this record
         when :try_pop
           off = @try_recs.fetch(i.args[0])
           @asm.ldr(16, off); @asm.str_off(16, Asm::GBASE, @asm.global(:__try_top))

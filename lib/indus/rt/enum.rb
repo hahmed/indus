@@ -1678,3 +1678,41 @@ def __num_size(n) = 8
 def __arr_sort_sym(a) = __arr_sort_by(a, __arr_sym_names(a))
 def __arr_min_sym(a) = __arr_min_by(a, __arr_sym_names(a))
 def __arr_max_sym(a) = __arr_max_by(a, __arr_sym_names(a))
+def __arr_flatten1(a, depth) # tagged elements, one level per depth
+  return __arr_dup(a) if depth == 0
+  out = []
+  i = 0
+  while i < a.length
+    e = a[i]
+    if __dyn_arr_p(e)
+      inner = __arr_flatten1(__dyn_arr(e), depth - 1)
+      j = 0
+      while j < inner.length
+        out.push(inner[j])
+        j = j + 1
+      end
+    else
+      out.push(e)
+    end
+    i = i + 1
+  end
+  out
+end
+def __arr_zip2(a, b, c)
+  out = []
+  i = 0
+  while i < a.length
+    out.push([a[i], b[i], c[i]])
+    i = i + 1
+  end
+  out
+end
+# tagged receivers with one argument: the tag decides between the array and string families
+def __dyn_include_p(v, x)
+  return __arr_include_p(__dyn_arr(v), x) if __tag(v) == 4
+  return __str_include_p(__dyn_str(v), __dyn_str(x)) if __tag(v) == 2
+  __hkey_p(__dyn_hash(v), x) if __tag(v) == 6
+end
+def __dyn_join(v, sep) = __arr_join(__dyn_arr(v), sep)
+def __dyn_first1(v, n) = __arr_first1(__dyn_arr(v), n)
+def __dyn_last1(v, n) = __arr_last1(__dyn_arr(v), n)
