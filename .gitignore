@@ -5,3 +5,4 @@ notes/
 !AGENTS.md
 !docs/*.md
 !docs/notes/*.md
+!docs/notes/*.tsv
