@@ -15,21 +15,22 @@ files = Dir["#{SP}/*.rb"].select { File.exist?(_1.sub(/\.rb\z/, ".rb.expected"))
 files = files.grep(filter) if filter
 files = files.shuffle(random: Random.new(seed)).first(n) unless all
 puts "#{files.size} programs, #{jobs} jobs"
-results = Queue.new
+results = Queue.new; log = File.open(ENV["SPINEL_LOG"] || "/tmp/spinel_results.tsv", "w")
 work = Queue.new; files.each { work << _1 }; jobs.times { work << nil }
 threads = jobs.times.map do
   Thread.new do
     while (f = work.pop)
-      want = File.read(f.sub(/\.rb\z/, ".rb.expected"))
+      begin
+      want = File.binread(f.sub(/\.rb\z/, ".rb.expected")).force_encoding("BINARY")
       got, _st = Open3.capture2e("timeout", "-k", "1", "30", "env", "INDUS_HEAP_MB=64", "#{ROOT}/bin/indus", f)
-      got = got.scrub.lines.reject { _1.start_with?("indus:") || _1.start_with?("\tfrom ") || _1.include?("prism.rb:") }.join
-      if got == want then results << [f, :pass, nil]
+      got = got.force_encoding("BINARY").lines.reject { _1.start_with?("indus:") || _1.start_with?("\tfrom ") || _1.include?("prism.rb:") }.join
+      if got == want then results << [f, :pass, nil]; log.puts("#{File.basename(f)}\tpass"); log.flush
       else
-        err = got.scrub.lines.find { _1 =~ /Error\b|\[BUG\]|Trace\/BPT|Segmentation|unsupported|unknown|not supported/ }
+        err = got.dup.force_encoding("UTF-8").scrub.lines.find { _1 =~ /Error\b|\[BUG\]|Trace\/BPT|Segmentation|unsupported|unknown|not supported/ }
         msg = if err then err.scrub.sub(/\A.*?: /, "").gsub(/\d+/, "N")[0, 90].strip
               elsif got.strip.empty? then "(no output: trapped or exited)"
               else # the first differing line, so wrong answers group by shape
-                gl, wl = got.lines, want.lines
+                gl, wl = got.scrub.lines, want.dup.force_encoding("UTF-8").scrub.lines
                 k = (0...[gl.size, wl.size].max).find { gl[_1] != wl[_1] } || 0
                 "(wrong output) line #{k + 1}: got #{gl[k].to_s.strip[0, 30].inspect} want #{wl[k].to_s.strip[0, 30].inspect}".gsub(/\d+/, "N")
               end
@@ -39,7 +40,10 @@ threads = jobs.times.map do
           nm = dump.scrub[/= mcall (\S+)/, 1]
           msg = "mcall #{nm}" if nm
         end
-        results << [f, :fail, msg]
+        results << [f, :fail, msg]; log.puts("#{File.basename(f)}\tfail\t#{msg}"); log.flush
+      end
+      rescue => e
+        results << [f, :fail, "(runner error: #{e.class})"]
       end
     end
   end

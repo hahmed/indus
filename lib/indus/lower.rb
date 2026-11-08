@@ -1264,7 +1264,7 @@ module Indus
       elsif n.name == :members && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @struct_fields&.[](n.receiver.name)
         pack_values(@struct_fields[n.receiver.name].map { |fl| c = const(sym_id(fl.to_s)); c.ty = :sym; c })
       elsif n.name == :superclass && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
-        emit(:sconst, [(@classes[n.receiver.name].superclass || :Object).to_s])
+        emit(:sconst, [(@classes[n.receiver.name].superclass&.name || :Object).to_s])
       elsif n.name == :frozen? && args.empty? && n.receiver # no frozen bit: literals and objects report false, symbols/numbers/nil true
         k = n.receiver
         emit(:const, [k.is_a?(Prism::SymbolNode) || k.is_a?(Prism::IntegerNode) || k.is_a?(Prism::FloatNode) || k.is_a?(Prism::NilNode) || k.is_a?(Prism::TrueNode) || k.is_a?(Prism::FalseNode) ? 1 : 0]).tap { _1.ty = :bool }
@@ -1409,8 +1409,14 @@ module Indus
         exc = if args.empty? then new_exception(:RuntimeError, [])
               elsif args[0].is_a?(Prism::ConstantReadNode) && @classes[args[0].name] then new_exception(args[0].name, args[1..])
               elsif (k = kind_of(args[0])).is_a?(Symbol) && @classes[k] then expr(args[0]) # raise exc_object
-              else new_exception(:RuntimeError, [args[0]]) end # raise "message" (any String expression)
-        emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc]) # rt_raise returns only when nothing catches (then exit)
+              elsif k == :str || args[0].is_a?(Prism::StringNode) || args[0].is_a?(Prism::InterpolatedStringNode) then new_exception(:RuntimeError, [args[0]]) # raise "message"
+              else expr(args[0]) end # raise x where x is a String or an exception object: decided by type (Types turns raise_any into raise of an object)
+        if exc.op != :raise_any && !(args.size == 1 && !args[0].is_a?(Prism::ConstantReadNode) && !((k = kind_of(args[0])).is_a?(Symbol) && @classes[k]) && k != :str && !args[0].is_a?(Prism::StringNode) && !args[0].is_a?(Prism::InterpolatedStringNode))
+          emit(:raise, [exc])
+        else
+          emit(:raise_any, [exc]) # Types wraps a String in RuntimeError, then it is a plain raise
+        end
+        emit(:call, [demand(:__uncaught), exc]) # rt_raise returns only when nothing catches (then exit)
         emit(:ret, [nil_const]) unless @cur.term # never reached (rt_raise does not return): what follows a raise is dead and contributes no type
         @cur = @f.new_block(:dead)
         return nil_const
@@ -1474,6 +1480,10 @@ module Indus
         return (c = const(0); c.ty = :nil; c) if r.ty == :nil # nil[k] (ARGV) is nil at compile time
         return hash_read_with_default(r, args[0], n.receiver) if (dn = hash_default_of(n.receiver))
         emit(:idx, [r, *args.map { expr(_1) }])
+      elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :String && args.size <= 1
+        args.empty? ? emit(:sconst, [""]) : emit(:mcall, [:dup, expr(args[0])]) # String.new / String.new(s): a fresh mutable copy
+      elsif n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :GC && %i[start compact stat count disable enable].include?(n.name)
+        n.name == :start ? emit(:gc_now, []) : const(0) # GC.start: a collection now; the rest: no-ops
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash
         emit(:hnew, []) # a default (value or block), if any, is recorded by the assignment (hash_default_of)
       elsif n.name == :[]=

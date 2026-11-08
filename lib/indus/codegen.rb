@@ -318,6 +318,7 @@ module Indus
         when :rawmunmap then @asm.mov(0, reg(i.args[0], 0)); @asm.mov(1, reg(i.args[1], 1)); @asm.bl(:rt_munmap); @asm.mov(d, 0)
         when :adrlbl then @asm.adr(d, i.args[0])
         when :hsave then @asm.mov(d, Asm::HEAP)        # tier 1: remember the bump pointer
+        when :gc_now then (GC.enabled? && !@f.name.to_s.start_with?("__gc")) ? @asm.bl(:rt_gc) : nil # GC.start: the safepoint before this instruction stored the live pointers; collect unconditionally
         when :gcepoch then @asm.ldr_off(d, Asm::GBASE, @asm.global(:__gc_count)) # ...and the collection count it is valid for
         when :aslot then @asm.emit(0x8B000C00 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d) # add d, base, k, lsl #3: the element's address
         when :hrestore # ...and drop the iteration's garbage; d = the mark for the next iteration

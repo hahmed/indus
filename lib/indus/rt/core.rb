@@ -782,8 +782,23 @@ end
 class Object
 end
 
-class StandardError
+class Exception
   attr_reader :message
+  def initialize(message = "unhandled exception")
+    @message = message
+  end
+  def to_s = @message
+  def inspect = "#<" + self.class + ": " + @message + ">"
+  def full_message = self.class + ": " + @message
+  def backtrace = []
+end
+class ScriptError < Exception
+end
+class NotImplementedError < ScriptError
+end
+class NoMemoryError < Exception
+end
+class StandardError < Exception
   def initialize(message = "unhandled exception")
     @message = message
   end
@@ -824,8 +839,6 @@ end
 class FrozenError < RuntimeError
 end
 class IOError < StandardError
-end
-class NotImplementedError < StandardError
 end
 class NoMethodError < NameError
 end

@@ -294,6 +294,16 @@ module Indus
                 end
                 i.args = [c]; i.op = i.op == :print_v ? :print_str : :puts_str; changed = true
               end
+              if i.op == :raise_any && (t = of(f, i.args[0])) && (t == :str || classes_of(t) || t == :dyn)
+                raise "#{f.name}: raise of a value that may be a String or an exception object (tagged): not supported" if t == :dyn
+                if t == :str # raise "message": a RuntimeError around it
+                  k = @classes[:RuntimeError]; o = Inst.new(:onew, [k]); o.ty = :RuntimeError; o.block = i.block; i.block.insts.insert(i.block.insts.index(i), o)
+                  c = Inst.new(:call, [k.find_method(:initialize), o, i.args[0]]); c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+                  old = i.args[0]; i.args = [o]
+                  i.block.insts.each { |u| u.args[1] = o if u.op == :call && u.args[0].name == :__uncaught && u.args[1].equal?(old) } # the fall-through report takes the object too
+                end
+                i.op = :raise; changed = true
+              end
               if @settled && %i[add sub mul div mod].include?(i.op) && coerce_error(f, i) then changed = true end # 1.5 + "s": TypeError at run time
               if @settled && %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :sym # puts :a -> "a"; p :a -> ":a"
                 c = Inst.new(:call, [fn(i.op == :p_v ? :__sym_inspect : :__sym_name), i.args[0]]); c.ty = :str; c.block = i.block
@@ -1434,6 +1444,7 @@ module Indus
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
       when :dsend then nil
+      when :gc_now, :raise_any then :int
       when :to_f, :fsqrt, :libm, :clock then :float
       when :eputs_v, :eputs_str then :int
       when :pow then (l = of(f, a[0])) && (r = of(f, a[1])) ? (join(narrow(l), narrow(r)) == :float ? :float : :int) : nil # both sides known first
