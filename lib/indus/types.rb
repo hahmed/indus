@@ -312,7 +312,7 @@ module Indus
               if @settled && i.op == :to_s && (t = of(f, i.args[0])) # to_s by type; a prelude call must be made here, so it gets typed
                 case t
                 when :sym then i.op = :call; i.args = [fn(:__sym_name), i.args[0]]; i.ty = :str; changed = true
-                when :str then i.op = :nop; changed = true
+                when :str then i.op = :str_or_empty; i.ty = :str; changed = true # a nil in a String slot (the 0 word) has to_s ""
                 when :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]; i.ty = :str; changed = true
                 when :bool then i.op = :bool_to_s; changed = true
                 when :dyn then i.op = :call; i.args = [fn(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true
@@ -615,12 +615,13 @@ module Indus
         when :to_s # (by type, resolved in the fixpoint's settled round; anything left is an int)
           t = of(f, i.args[0])
           if t == :int? then i.op = :call; i.args = [fn(:__opt_to_s), i.args[0]]
-          elsif t == :nil && (i.args[0].op == :const || i.args[0].op == :phi && i.args[0].args.all? { |(_, v)| v.op == :const && v.ty == :nil }) then i.op = :sconst; i.args = [""] # nil.to_s: "" (a literal nil only; a joined nil may still widen)
+          elsif t == :nil then i.op = :sconst; i.args = [""] # nil.to_s: "" (after the fixpoint a nil is final)
           elsif t == :bool then i.op = :bool_to_s
           elsif t == :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]
           elsif (cs = classes_of(t)) # an object in a string: its to_s, or #<Klass>
             if cs.any? { @classes[_1].find_method(:to_s) } then i.op = :mcall; i.args = [:to_s, i.args[0]]; bind(f, i); i.ty = :str; changed = true
             else i.op = :sconst; i.args = ["#<#{cs.first}>"] end
+          elsif t == :str then i.op = :str_or_empty
           else i.op = :itos end
         when :to_i
           if of(f, i.args[0]) == :str then i.op = :stoi
@@ -1175,12 +1176,12 @@ module Indus
         in [:nil, :to_a] then i.op = :anew; i.args = [(z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z); z), z]; i.ty = [:arr, :dyn]; return
         in [:nil, :to_i] then i.op = :const; i.args = [0]; i.ty = :int; return
         in [:nil, :to_f] then i.op = :fconst; i.args = [0.0]; i.ty = :float; return
-        in [:nil, :to_s | :inspect] then i.op = :sconst; i.args = [name == :to_s ? "" : "nil"]; i.ty = :str; return
+        in [:nil, :to_s | :inspect] if recv.op == :const then i.op = :sconst; i.args = [name == :to_s ? "" : "nil"]; i.ty = :str; return # a literal nil only: a parameter's nil may still widen
         in [:int, :to_f] then i.op = :itof; i.args = [recv]; i.ty = :float; return
         in [:float, :to_i] then i.op = :to_i; i.args = [recv]; i.ty = :int; return
         in [:float, :to_f] then i.op = :nop; i.args = [recv]; i.ty = :float; return
         in [:str, :to_i] then i.op = :stoi; i.args = [recv]; i.ty = :int; return
-        in [:str, :to_s] then i.op = :nop; i.args = [recv]; i.ty = :str; return
+        in [:str, :to_s] then i.op = :str_or_empty; i.args = [recv]; i.ty = :str; return # a nil in a String slot is the 0 word: its to_s is ""
         in [:float, :to_s] then i.op = :call; i.args = [fn(:__float_to_s), recv]; i.ty = :str; return
         in [:int, :chr] then i.op = :chr; i.args = [recv]; i.ty = :str; return
         in [[:arr, *], :pop] then i.op = :apop; i.args = [recv]; return
@@ -1445,6 +1446,7 @@ module Indus
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
       when :dsend then nil
       when :gc_now, :raise_any then :int
+      when :str_or_empty then :str
       when :to_f, :fsqrt, :libm, :clock then :float
       when :eputs_v, :eputs_str then :int
       when :pow then (l = of(f, a[0])) && (r = of(f, a[1])) ? (join(narrow(l), narrow(r)) == :float ? :float : :int) : nil # both sides known first

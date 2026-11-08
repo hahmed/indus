@@ -227,6 +227,8 @@ module Indus
           @asm.bl(:rt_str_append)
           @asm.emit(0xF84107F0); @asm.str_off(0, 16, 0); @asm.mov(d, 16)
         when :nop then @asm.mov(d, reg(i.args[0]))
+        when :str_or_empty # s.to_s where s may be the nil word: "" then
+          r = reg(i.args[0]); @asm.adr(16, :rt_empty_str); @asm.cmpi(r, 0); @asm.emit(0x9A801000 | (16 << 16) | (r << 5) | d) # csel d, r, x16, ne
         when :rawld then @asm.ldr_off(d, reg(i.args[0]), 0)
         when :rawld8 then @asm.emit(0x38606800 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | d)   # ldrb wd, [s, i]
         when :rawst8 then @asm.emit(0x38206800 | (reg(i.args[1], 9) << 16) | (reg(i.args[0]) << 5) | reg(i.args[2], 10)) # strb
