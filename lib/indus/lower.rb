@@ -27,8 +27,8 @@ module Indus
     def self.normalize(node)
       return node.map { normalize(_1) } if node.is_a?(Array)
       return node unless node.is_a?(Prism::Node)
-      if node.is_a?(Prism::DefNode) && node.body.is_a?(Prism::BeginNode)
-        node = node.copy(body: Prism::StatementsNode.new(node.send(:source), 0, node.body.location, 0, [node.body]))
+      if (node.is_a?(Prism::DefNode) || node.is_a?(Prism::BlockNode) || node.is_a?(Prism::LambdaNode)) && node.body.is_a?(Prism::BeginNode)
+        node = node.copy(body: Prism::StatementsNode.new(node.send(:source), 0, node.body.location, 0, [node.body])) # `do ... rescue ... end`: a statements body holding the begin
       end
       # `{ it + 1 }` and `{ _1 * _2 }`: ordinary blocks with parameters named it / _1.._n
       if node.is_a?(Prism::BlockNode) && (node.parameters.is_a?(Prism::ItParametersNode) || node.parameters.is_a?(Prism::NumberedParametersNode))
@@ -64,6 +64,12 @@ module Indus
       dm = body.select { |st| st.is_a?(Prism::CallNode) && st.name == :define_method && st.receiver.nil? && st.block.is_a?(Prism::BlockNode) && st.arguments&.arguments&.first.is_a?(Prism::SymbolNode) }
       body = body - dm
       cdefs = body.grep(Prism::ClassNode) + mod_classes
+      # classes nested in class bodies (class Outer; class Inner; end; end) are hoisted like module-nested ones;
+      # Outer::Inner resolves by the inner name. Declared after their outer class so a superclass reference works.
+      nested = []
+      walk = ->(c) { (c.body&.body || []).grep(Prism::ClassNode).each { |inner| nested << inner; walk.(inner) } }
+      cdefs.each { walk.(_1) }
+      cdefs += nested
       mod_ivars = (mods + cdefs).flat_map { |m| (m.body&.body || []).grep(Prism::InstanceVariableWriteNode).map { [m.constant_path.name, _1] } } # `@x = v` in a module or class body: the class object's own ivar, set before the program runs
       # `def self.m` in a class or module body: a function named Owner.m, no self
       @modules = mods.map { _1.constant_path.name }
@@ -552,7 +558,7 @@ module Indus
       end
       (k.mixins ||= []).concat(included + prepended)
       mixed_in, prepended_defs = included.flat_map(&mod_defs), prepended.flat_map(&mod_defs)
-      (mixed_in + prepended_defs).each { |d| assigned_ivars(d).each { k.ivar(_1) } }
+      (mixed_in + stmts.grep(Prism::DefNode) + prepended_defs).each { |d| assigned_ivars(d).each { k.ivar(_1) } } # every field known before any method is lowered
       @visibility = nil
       (mixed_in + stmts + prepended_defs).each do |st|
         case st
@@ -587,7 +593,7 @@ module Indus
           elsif (m = k.methods[old_name]) then k.methods[new_name] = m
           elsif k.readers[old_name] then k.readers[new_name] = k.readers[old_name]
           else raise "alias #{new_name} #{old_name}: no such method in #{k.name}" end
-        when Prism::ClassVariableWriteNode, Prism::InstanceVariableWriteNode, Prism::SingletonClassNode then nil # hoisted above
+        when Prism::ClassVariableWriteNode, Prism::InstanceVariableWriteNode, Prism::SingletonClassNode, Prism::ClassNode, Prism::ModuleNode then nil # hoisted above
         else raise "unsupported in class body: #{st.class}"
         end
       end
@@ -761,6 +767,7 @@ module Indus
       when Prism::UntilNode then while_stmt(n, negate: true)
       when Prism::CaseNode then case_expr(n)
       when Prism::CaseMatchNode then case_match_expr(n)
+      when Prism::DefinedNode then defined_expr(n.value)
       when Prism::BeginNode then begin_expr(n)
       when Prism::RescueModifierNode then rescue_modifier(n) # expr rescue fallback
       when Prism::SuperNode, Prism::ForwardingSuperNode # super(args) / super: the superclass's version of this method
@@ -797,12 +804,16 @@ module Indus
         cur = call(read)
         v = emit(ARITH.fetch(n.binary_operator), [cur, expr(n.value)])
         attr_assign(recv, rv, n.write_name, v)
-      when Prism::CallOrWriteNode # obj.x ||= v
+      when Prism::CallOrWriteNode, Prism::CallAndWriteNode # obj.x ||= v / obj.x &&= v
         recv = n.receiver
         read = Prism::CallNode.new(n.send(:source), 0, n.location, 0, recv, nil, n.read_name, nil, nil, nil, nil, nil, nil)
         rv = expr(recv)
         cur = call(read)
-        cond_assign(cur, false, -> { expr(n.value) }, ->(v) { attr_assign(recv, rv, n.write_name, v) })
+        cond_assign(cur, n.is_a?(Prism::CallAndWriteNode), -> { expr(n.value) }, ->(v) { attr_assign(recv, rv, n.write_name, v) })
+      when Prism::GlobalVariableOperatorWriteNode # $x += v
+        v = emit(ARITH.fetch(n.binary_operator), [emit(:gget, [n.name]), expr(n.value)]); emit(:gset, [n.name, v]); v
+      when Prism::GlobalVariableOrWriteNode then cond_assign(emit(:gget, [n.name]), false, -> { expr(n.value) }, ->(v) { emit(:gset, [n.name, v]) })
+      when Prism::GlobalVariableAndWriteNode then cond_assign(emit(:gget, [n.name]), true, -> { expr(n.value) }, ->(v) { emit(:gset, [n.name, v]) })
       when Prism::IndexOrWriteNode # h[k] ||= v
         recv = expr(n.receiver); k = expr(n.arguments.arguments[0])
         cur = emit(:idx, [recv, k])
@@ -980,6 +991,15 @@ module Indus
         parts.reduce { |a, b| emit(:scat, [a, b]) }
       when Prism::IfNode then if_expr(n)
       when Prism::WhileNode then while_stmt(n)
+      when Prism::ForNode # for x in coll: each over the collection; the variable is an ordinary local
+        src = n.send(:source); loc = n.location
+        names = n.index.is_a?(Prism::MultiTargetNode) ? n.index.lefts.map(&:name) : [n.index.name]
+        reqs = names.map { Prism::RequiredParameterNode.new(src, 0, loc, 0, _1) }
+        params = Prism::BlockParametersNode.new(src, 0, loc, 0, Prism::ParametersNode.new(src, 0, loc, 0, reqs, [], nil, [], [], nil, nil), [], nil, nil)
+        blk = Prism::BlockNode.new(src, 0, loc, 0, [], params, n.statements, loc, loc)
+        names.each { |nm| @locals[lname(nm)] ||= nil_const } # visible after the loop
+        each = Prism::CallNode.new(src, 0, loc, 0, n.collection, nil, :each, loc, nil, nil, nil, nil, blk)
+        expr(each)
       when Prism::CallNode then call(n)
       when Prism::OrNode
         l = expr(n.left)
@@ -1499,6 +1519,7 @@ module Indus
         when Prism::LocalVariableReadNode then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
         when Prism::InstanceVariableReadNode then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
         when Prism::CallNode then nil # a[i][j] = v, obj.attr[i] = v: the element store is in place; growth would need the cell design
+        when Prism::ConstantReadNode, Prism::GlobalVariableReadNode, Prism::ClassVariableReadNode then emit(:gset, [n.receiver.name, r]) # TABLE[k] = v: the global takes the grown handle
         else raise "[]= on #{n.receiver.class}"
         end
         v
@@ -2331,6 +2352,36 @@ module Indus
         [w.conditions.map { |c| when_test(subj, c) }, w.statements&.body || [], arm_facts]
       end
       lower_chain(tests, n.else_clause&.statements&.body || [])
+    end
+
+    # defined?(x): decided at compile time wherever the answer is static
+    def defined_expr(v)
+      str = ->(s) { s ? emit(:sconst, [s]) : nil_const }
+      case v
+      when Prism::LocalVariableReadNode then str.(@locals.key?(lname(v.name)) ? "local-variable" : nil)
+      when Prism::InstanceVariableReadNode # set iff assigned (a never-written field reads as its zero: nil / 0 / false all count as unset)
+        cur = if (ow = ivar_owner) then emit(:gget, [:"#{ow}#{v.name}"])
+              elsif @klass&.ivars&.include?(v.name) then emit(:fld_get, [me_val, @klass.ivar(v.name)])
+              else return str.(nil) end
+        or_value(and_value(emit(:cmp, [cur, const(0)], :ne)) { emit(:sconst, ["instance-variable"]) }) { nil_const }
+      when Prism::GlobalVariableReadNode then str.("global-variable")
+      when Prism::ConstantReadNode then str.(@classes[v.name] || @modules.include?(v.name) || @class_const_owners&.key?(v.name) || %i[Integer Float String Array Hash Symbol NilClass Comparable Kernel Object Math].include?(v.name) ? "constant" : nil)
+      when Prism::ConstantPathNode then str.("constant")
+      when Prism::CallNode
+        if v.receiver.nil? && v.arguments.nil?
+          known = @funcs.key?(v.name) || @yielders.key?(v.name) || (@klass && (@klass.find_method(v.name) || @klass.find_reader(v.name))) || %i[puts p print require require_relative raise loop lambda proc format sprintf rand gets].include?(v.name)
+          str.(known ? "method" : nil)
+        elsif v.receiver && (kd = kind_of(v.receiver)).is_a?(Symbol) && @classes[kd]
+          k = @classes[kd]; str.(k.find_method(v.name) || k.find_reader(v.name) || k.find_writer(v.name) ? "method" : nil)
+        else str.("method") end # a builtin receiver: assume it responds (the compile would otherwise have refused)
+      when Prism::YieldNode then @block == :none ? str.(nil) : (@block ? str.("yield") : (@block_param && @locals[@block_param] ? or_value(and_value(emit(:cmp, [@locals[@block_param], nil_const], :ne)) { emit(:sconst, ["yield"]) }) { nil_const } : str.(nil)))
+      when Prism::SuperNode, Prism::ForwardingSuperNode then str.("super")
+      when Prism::SelfNode then str.("self")
+      when Prism::NilNode then str.("expression")
+      when Prism::TrueNode, Prism::FalseNode then str.("expression")
+      when Prism::LocalVariableWriteNode, Prism::LocalVariableOperatorWriteNode, Prism::InstanceVariableWriteNode, Prism::CallOperatorWriteNode, Prism::CallOrWriteNode, Prism::IndexOperatorWriteNode, Prism::GlobalVariableWriteNode, Prism::MultiWriteNode then str.("assignment")
+      else str.("expression")
+      end
     end
 
     def class_const?(c) = c.is_a?(Prism::ConstantReadNode) && (@classes[c.name] || %i[Integer Float String Array Hash Symbol].include?(c.name))
