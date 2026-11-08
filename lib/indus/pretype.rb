@@ -113,8 +113,8 @@ module Indus
           when Prism::InstanceVariableReadNode then klass && @ivars[klass][n.name]
           when Prism::InstanceVariableWriteNode
             v = expr(n.value, env, klass, fkey); set_ivar(klass, n.name, v) if klass; v
-          when Prism::ConstantReadNode, Prism::ConstantPathNode then @classes[n.name] ? :"class:#{n.name}" : nil
-          when Prism::ConstantWriteNode then expr(n.value, env, klass, fkey)
+          when Prism::ConstantReadNode, Prism::ConstantPathNode then @classes[n.name] ? :"class:#{n.name}" : (@const_kinds ||= {})[n.name]
+          when Prism::ConstantWriteNode then (v = expr(n.value, env, klass, fkey); (@const_kinds ||= {})[n.name] = join(@const_kinds[n.name], v); v)
           when Prism::ClassVariableWriteNode then (v = expr(n.value, env, klass, fkey); (@cvars ||= {})[n.name] = join(@cvars[n.name], v); v)
           when Prism::ClassVariableReadNode then (@cvars ||= {})[n.name]
           when Prism::ClassVariableOperatorWriteNode then (expr(n.value, env, klass, fkey); (@cvars ||= {})[n.name])

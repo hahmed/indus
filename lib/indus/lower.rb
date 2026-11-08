@@ -392,7 +392,8 @@ module Indus
       d = @defs_by_func[f]
       nfixed = d ? (d.parameters&.requireds&.size || 0) + (d.parameters&.optionals&.size || 0) : f.params.size - skip
       if (si = args.index { _1.is_a?(Prism::SplatNode) }) # m(*arr): the array's elements by index, up to the callee's fixed arity; a rest callee takes the array itself
-        before = args[0...si].map { expr(_1) }; sp = expr(args[si].expression); after = (args[(si + 1)..] || []).map { expr(_1) }
+        before = args[0...si].map { expr(_1) }; after = (args[(si + 1)..] || []).map { expr(_1) }
+        sp = args[si].expression ? expr(args[si].expression) : @locals.fetch(lname(:__rest)) { raise "anonymous * outside a method taking *" } # f(*): this method's own rest
         if f.rest # the rest array is everything past the fixed parameters: pieces of before, the splat, after
           fixed_from_splat = [nfixed - before.size, 0].max
           taken = (0...fixed_from_splat).map { |k| emit(:idx, [sp, const(k)]) }
@@ -824,7 +825,7 @@ module Indus
         n.elements.each do |el|
           case el
           when Prism::AssocNode then h = emit(:hset, [h, expr(el.key), expr(el.value)])
-          when Prism::AssocSplatNode then h = emit(:call, [demand(:__hash_merge_into), h, expr(el.value)]) # { **other }
+          when Prism::AssocSplatNode then h = emit(:call, [demand(:__hash_merge_into), h, el.value ? expr(el.value) : @locals.fetch(lname(:__kwrest))]) # { **other } / { ** } (anonymous)
           else raise "unsupported hash element #{el.class}"
           end
         end
@@ -1110,6 +1111,10 @@ module Indus
       # a method taking &blk on self or on an object of a known class, called with a block literal: the block is a closure value
       if n.block.is_a?(Prism::BlockNode)
         mk = n.receiver.nil? ? @klass : ((kd = kind_of(n.receiver)).is_a?(Symbol) ? @classes[kd] : nil)
+        if mk.nil? && n.receiver && !n.receiver.is_a?(Prism::ConstantReadNode) && !ENUMERABLE.include?(n.name) && !%i[each each_with_index times upto downto step each_char each_byte each_line each_pair each_key each_value loop fetch].include?(n.name) # a receiver of unknown class: every user class defining the method takes a block the same way
+          cands = @classes.values.filter_map { |k| k.methods[n.name] }.select { @defs_by_func[_1] && !_1.cls.name.to_s.start_with?("__") }
+          mk = cands[0].cls if !cands.empty? && cands.all? { |mf| @defs_by_func[mf].parameters&.block }
+        end
         if mk && (mf = mk.find_method(n.name)) && (d = @defs_by_func[mf]) && d.parameters&.block
           blk = n.block
           params = blk.parameters&.parameters&.requireds&.map(&:name) || []
@@ -1121,8 +1126,8 @@ module Indus
       if n.block.is_a?(Prism::BlockArgumentNode) && n.block.expression.is_a?(Prism::SymbolNode) && n.receiver
         return block_call(n, args) # map(&:upcase), group_by(&:length), ...: the block { |e| e.sym }
       end
-      if n.block.is_a?(Prism::BlockArgumentNode) # m(&b): the block is already a value
-        bv = expr(n.block.expression)
+      if n.block.is_a?(Prism::BlockArgumentNode) # m(&b): the block is already a value; m(&) forwards this method's own block
+        bv = n.block.expression ? expr(n.block.expression) : @locals.fetch(@block_param || :__blk) { raise "anonymous & outside a method taking a block" }
         return block_arg_call(n, args, bv)
       end
       return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash)
@@ -1557,7 +1562,7 @@ module Indus
         end
       end
       given = {}; splats = []
-      kw&.elements&.each { |el| el.is_a?(Prism::AssocSplatNode) ? splats << expr(el.value) : given[el.key.unescaped.to_sym] = el.value } # m(**h, k: v)
+      kw&.elements&.each { |el| el.is_a?(Prism::AssocSplatNode) ? splats << (el.value ? expr(el.value) : @locals.fetch(lname(:__kwrest))) : given[el.key.unescaped.to_sym] = el.value } # m(**h, k: v); m(**) forwards
       ps.keywords.each_with_index do |kp, k|
         idx = ps.requireds.size + ps.optionals.size + (ps.rest.is_a?(Prism::RestParameterNode) ? 1 : 0) + k
         if !given.key?(kp.name) && !splats.empty? # from the splatted hash at run time, else the default
@@ -2721,6 +2726,15 @@ module Indus
       if %i[each map select reject].include?(n.name) && n.receiver # arr.each(&b)
         pn = :__e
         return array_loop(expr(n.receiver), n.name, [pn], ->(pfx) { emit(:mcall, [:call, bv, @locals.fetch(:"#{pfx}#{pn}")]) })
+      end
+      if n.receiver.is_a?(Prism::ConstantReadNode) && (sf = @funcs[:"#{n.receiver.name}.#{n.name}"]) && (d = @defs_by_func[sf]) && d.parameters&.block # Owner.m(&b)
+        return emit(:call, [sf, *call_args(sf, args), bv])
+      end
+      # a method of the current class (bare) or of a known receiver class that takes &block: the block value is its last argument
+      k = n.receiver.nil? ? @klass : ((kd = kind_of(n.receiver)).is_a?(Symbol) ? @classes[kd] : nil)
+      if k && (mf = k.find_method(n.name)) && (d = @defs_by_func[mf]) && d.parameters&.block
+        rv = n.receiver ? expr(n.receiver) : me_val
+        return emit(:mcall, [n.name, rv, *method_args(mf, args, rv), bv])
       end
       raise "block argument to #{n.name}: not supported"
     end
