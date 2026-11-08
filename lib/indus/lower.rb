@@ -186,12 +186,15 @@ module Indus
       structs.each do |st|
         k = @classes[st.name] = Klass.new(st.name)
         k.id = @classes.size
-        sargs = st.value.arguments.arguments
+        sargs = (st.value.arguments&.arguments || []).dup
         kw = sargs.last.is_a?(Prism::KeywordHashNode) ? sargs.pop : nil
+        is_data = data_define?(st.value) # Data.define: positional or keyword construction, no writers, `with`
         (@struct_kw ||= {})[k.name] = true if kw && kw.elements.any? { |e| e.key.unescaped == "keyword_init" && e.value.is_a?(Prism::TrueNode) }
+        (@struct_kw_ok ||= {})[k.name] = true if is_data # keywords accepted alongside positionals
+        (@data_classes ||= {})[k.name] = true if is_data
         fields = sargs.map { |a| a.unescaped.to_sym }
         (@struct_fields ||= {})[k.name] = fields
-        fields.each { |f| k.ivar(:"@#{f}"); k.readers[f] = :"@#{f}"; k.writers[:"#{f}="] = :"@#{f}" }
+        fields.each { |f| k.ivar(:"@#{f}"); k.readers[f] = :"@#{f}"; k.writers[:"#{f}="] = :"@#{f}" unless is_data }
         init = Func.new(:"#{k.name}#initialize", 1 + fields.size)
         init.cls = k; k.methods[:initialize] = init
         # body: @a = a; @b = b ...  built as AST-free lowering below
@@ -209,7 +212,7 @@ module Indus
           def ==(o) = #{fl.empty? ? "true" : fl.map { "#{_1} == o.#{_1}" }.join(" && ")}
           def [](i) = i.is_a?(Integer) ? to_a[i] : to_h[i.to_sym]
           def each(&blk) = to_a.each(&blk)
-          def inspect = "#<struct #{k.name} " + [#{fl.map { "\"#{_1}=\" + #{_1}.inspect" }.join(", ")}].join(", ") + ">"
+          def inspect = "#<#{is_data ? "data" : "struct"} #{k.name} " + [#{fl.map { "\"#{_1}=\" + #{_1}.inspect" }.join(", ")}].join(", ") + ">"
           def to_s = inspect
         RUBY
         synth_defs = Prism.parse(synth).value.statements.body
@@ -599,7 +602,8 @@ module Indus
       end
     end
 
-    def struct_new?(v) = v.is_a?(Prism::CallNode) && v.name == :new && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Struct
+    def struct_new?(v) = v.is_a?(Prism::CallNode) && (v.name == :new && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Struct || data_define?(v))
+    def data_define?(v) = v.is_a?(Prism::CallNode) && v.name == :define && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Data
 
     public
     # A prelude generic (`__arr_sort_by(a, keys)`) is Ruby over whatever element type its
@@ -1303,6 +1307,18 @@ module Indus
         emit(:isa, [expr(args[0]), n.receiver.name]) # Klass === x
       elsif n.name == :class && args.empty? && n.receiver && (bk = builtin_kind(n.receiver))
         emit(:sconst, [{ int: "Integer", float: "Float", str: "String", array: "Array", hash: "Hash", range: "Range", sym: "Symbol", bool: n.receiver.is_a?(Prism::TrueNode) ? "TrueClass" : "FalseClass", nil: "NilClass" }[bk]]) # a builtin's class: its name (no class objects at run time)
+      elsif n.name == :method && args.size == 1 && args[0].is_a?(Prism::SymbolNode) # method(:m): a closure over the call
+        mname = args[0].unescaped.to_sym; src = n.send(:source); loc = n.location
+        target = n.receiver.nil? ? (@funcs[mname] || @yielders[mname] || (@klass && @klass.find_method(mname))) : nil
+        d = target.is_a?(Func) ? @defs_by_func[target] : (target.is_a?(Array) ? target[1] : nil)
+        zero_arity = %i[upcase downcase size length to_s to_i to_f reverse strip chars bytes sum min max first last sort uniq inspect succ abs even? odd? zero? empty? keys values to_a to_sym capitalize swapcase chomp chop hash].include?(mname)
+        nparams = d ? def_param_names(d).size : (n.receiver ? (zero_arity ? 0 : (mname == :pow ? 2 : 1)) : (%i[puts p print String Integer Float Array].include?(mname) ? 1 : raise("method(:#{mname}): unknown method")))
+        params = (0...nparams).map { :"a#{_1}__" }
+        arg_nodes = params.map { Prism::LocalVariableReadNode.new(src, 0, loc, 0, _1, 0) }
+        recv_node = n.receiver
+        captured = recv_node.is_a?(Prism::LocalVariableReadNode) ? [recv_node.name] : []
+        call_node = Prism::CallNode.new(src, 0, loc, 0, recv_node, nil, mname, loc, nil, arg_nodes.empty? ? nil : Prism::ArgumentsNode.new(src, 0, loc, 0, arg_nodes), nil, nil, nil)
+        closure_value(params, captured, [call_node])
       elsif n.name == :block_given? && args.empty? && n.receiver.nil?
         if @block == :none then (c = const(0); c.ty = :bool; c)
         elsif @block then (c = const(1); c.ty = :bool; c)
@@ -1371,7 +1387,7 @@ module Indus
         k = @classes[n.receiver.name]
         obj = emit(:onew, [k])
         if (init = k.find_method(:initialize))
-          if (fields = @struct_fields&.[](k.name)) && (@struct_kw&.[](k.name) || args.size < fields.size) # Struct: keyword_init, or fewer values than members (the rest nil)
+          if (fields = @struct_fields&.[](k.name)) && (@struct_kw&.[](k.name) || args.size < fields.size || args.last.is_a?(Prism::KeywordHashNode) && @struct_kw_ok&.[](k.name)) # Struct: keyword_init, or fewer values than members (the rest nil); Data: either
             given = {}
             if args.last.is_a?(Prism::KeywordHashNode) then args.last.elements.each { |e| given[e.key.unescaped.to_sym] = e.value }; args = args[0...-1] end
             vals = fields.each_with_index.map { |fl, ix| given.key?(fl) ? expr(given[fl]) : args[ix] ? expr(args[ix]) : nil_const }
@@ -2400,7 +2416,7 @@ module Indus
         guard = nil
         if pat.is_a?(Prism::IfNode) then guard = pat.predicate; pat = pat.statements.body[0]
         elsif pat.is_a?(Prism::UnlessNode) then guard = [:not, pat.predicate]; pat = pat.statements.body[0] end
-        pattern_match(pat, subj, fail_b)
+        pattern_match(pat, subj, fail_b, n.predicate)
         if guard
           g = guard.is_a?(Array) ? emit(:cmp, [expr(guard[1]), const(0)], :eq) : expr(guard)
           ok = @f.new_block(:pguard); emit(:condbr, [g, ok, fail_b]); @cur = ok
@@ -2421,7 +2437,7 @@ module Indus
     end
 
     # emit the tests for `pat` against value v; on failure branch to fail_b; fall through on success
-    def pattern_match(pat, v, fail_b)
+    def pattern_match(pat, v, fail_b, vnode = nil)
       check = ->(cond) { ok = @f.new_block(:pok); emit(:condbr, [cond, ok, fail_b]); @cur = ok }
       case pat
       when Prism::LocalVariableTargetNode then @locals[lname(pat.name)] = v
@@ -2453,6 +2469,19 @@ module Indus
         pat.posts.each_with_index { |e, k| pattern_match(e, emit(:idx, [v, emit(:sub, [emit(:alen, [v]), const(pat.posts.size - k)])]), fail_b) }
       when Prism::HashPatternNode
         check.(emit(:isa, [v, pat.constant.name])) if pat.constant
+        # an object with readers (a Struct / Data): deconstruct_keys is its readers
+        vkind = vnode ? kind_of(vnode) : nil
+        vk = vkind.is_a?(Symbol) && @classes[vkind] ? @classes[vkind] : (pat.constant && @classes[pat.constant.name])
+        if vk
+          pat.elements.each do |el|
+            kname = el.key.unescaped.to_sym
+            iv = vk.find_reader(kname) or (emit(:br, [fail_b]); @cur = @f.new_block(:dead); next)
+            got = emit(:fld_get, [v, vk.ivar(iv)])
+            if el.value.nil? || el.value.is_a?(Prism::ImplicitNode) then @locals[lname(kname)] = got
+            else pattern_match(el.value, got, fail_b) end
+          end
+          return
+        end
         check.(emit(:isa, [v, :Hash]))
         pat.elements.each do |el|
           key = el.key; kname = key.unescaped.to_sym
