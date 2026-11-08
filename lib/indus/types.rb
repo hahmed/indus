@@ -625,8 +625,12 @@ module Indus
           else i.op = :itos end
         when :to_i
           if of(f, i.args[0]) == :str then i.op = :stoi
+          elsif of(f, i.args[0]) == :dyn then i.op = :call; i.args = [fn(:__dyn_to_i), i.args[0]]; i.ty = :int
           elsif of(f, i.args[0]) == :nil && i.args[0].op == :const then i.op = :const; i.args = [0]; i.ty = :int end # nil.to_i
-        when :to_f then (i.op = :nop; i.ty = :float) if of(f, i.args[0]) == :float # already a Float
+        when :to_f
+          if of(f, i.args[0]) == :float then i.op = :nop; i.ty = :float # already a Float
+          elsif of(f, i.args[0]) == :dyn then i.op = :call; i.args = [fn(:__dyn_to_f), i.args[0]]; i.ty = :float
+          elsif of(f, i.args[0]) == :str then i.op = :call; i.args = [fn(:__str_to_f), i.args[0]]; i.ty = :float end
         when :alen
           if of(f, i.args[0]) == :int then i.op = :const; i.args = [8]; i.ty = :int # Integer#size: 8 bytes (the lowering guessed an array)
           elsif of(f, i.args[0]) == :sym then nm = Inst.new(:call, [fn(:__sym_name), i.args[0]]); nm.ty = :str; nm.block = i.block; i.block.insts.insert(i.block.insts.index(i), nm); i.args = [nm] end
@@ -876,7 +880,14 @@ module Indus
       when :aget, :hget, :apop
         a = o.args[0]; a = a.args[0] while %i[aset hset].include?(a.op)
         t = of(f, a); nt = arr(t) ? [:arr, :strbuf] : [:hash, t[1], :strbuf]
-        a.op == :param ? f.ptypes[f.params.index(a)] = nt : a.ty = nt
+        case a.op # the container's home learns the element type too, else another load of it keeps the old one
+        when :param then f.ptypes[f.params.index(a)] = nt
+        when :fld_get
+          k = of(f, a.args[0]); k = k[1][0] if poly?(k)
+          @ivars[k][a.args[1]] = nt if k && @ivars[k]
+          a.ty = nt
+        when :gget then @consts[a.args[0]] = nt; a.ty = nt
+        else a.ty = nt end
         o.ty = :strbuf; bufferize(f, o); return o
       when :gget
         @consts[o.args[0]] = :strbuf; o.ty = :strbuf; bufferize(f, o); return o
@@ -1240,6 +1251,10 @@ module Indus
       if t == :int && args.size == 1 && name == :divmod && of(f, args[0]) == :float then i.op = :call; i.args = [fn(:__float_divmod), recv, args[0]]; return end
       fam = hsh(t) ? "hash" : (t == :int || t == :float) ? "num" : t == :str ? "str" : arr(t) ? "arr" : nil
       if fam && (fn = prelude_method(fam, name, args.size))
+        if fam == "str" && args.any? { |a| a.op == :const && a.ty == :nil } # "s".index(nil): TypeError, not a null read
+          w = Inst.new(:sconst, ["String"]); w.ty = :str; w.block = i.block; i.block.insts.insert(i.block.insts.index(i), w)
+          i.op = :call; i.args = [fn(:__raise_no_conversion), w]; i.ty = :int?; return
+        end
         i.op = :call; i.args = [fn, recv, *args, *default_args(fn, i, args.size)]; i.routed = name; return # routed by the receiver's family: rebindable if the receiver changes kind
       end
       if t == :int && %i[succ pred].include?(name) && args.empty? # Integer#succ / #pred

@@ -866,7 +866,7 @@ module Indus
         ((@ivar_kinds ||= {})[[@klass&.name, n.name]] ||= kind_of(n.value)) if @klass
         emit(:fld_set, [me_val, @klass.ivar(n.name), v]); v
       when Prism::ConstantReadNode
-        if n.name == :ARGV then (c = const(0); c.ty = :nil; c) # no arguments: every ARGV[k] is nil
+        if n.name == :ARGV then emit(:anew, [const(0), emit(:sconst, [""])]) # no arguments: an empty array of strings (ARGV[k] is nil, ARGV.size 0)
         elsif (o = const_owner(n.name)) then emit(:gget, [:"#{o}::#{n.name}"]) # a class's constant, found lexically
         else emit(:gget, [n.name]) end
       when Prism::ConstantWriteNode
