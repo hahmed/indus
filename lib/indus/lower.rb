@@ -2674,7 +2674,74 @@ module Indus
       # a local assigned inside a rescued body is read by the handler as it was at the raise:
       # a cell, not a value, since the raise can come from anywhere in the body
       rescued_bodies(stmts).each { |body| shared.concat(assigned_locals_plain(body).select { all_assigned.count(_1) > 0 }) }
+      # a local that aliases another local (x = y, or x = c ? y : z) and is then grown in place: both names
+      # must see the growth, which the value representation cannot give. Refuse rather than diverge (notes/31).
+      check_alias_growth(stmts) unless @f.name.to_s.start_with?("__") # the prelude knows its own aliases
       shared.uniq
+    end
+
+    # events in source order: [:assign, x, [sources]], [:grow, x], [:read, x]. A grow of x while an alias
+    # partner y (x = y or y = x, not since reassigned) is still read afterwards would diverge: refuse.
+    def check_alias_growth(stmts)
+      ev = []; alias_events(stmts, ev)
+      partners = Hash.new { |h, k| h[k] = {} } # name -> {partner => true}
+      ev.each_with_index do |(kind, x, srcs), at|
+        case kind
+        when :assign
+          partners[x].each_key { |y| partners[y].delete(x) }; partners[x] = {} # a fresh binding breaks the old aliases
+          srcs.each { |y| next if y == x; partners[x][y] = true; partners[y][x] = true }
+        when :grow
+          partners[x].each_key do |y|
+            later = ev[(at + 1)..].take_while { |(k2, x2, _)| !(k2 == :assign && x2 == y) }
+            if later.any? { |(k2, x2, _)| k2 == :read && x2 == y }
+              raise "#{@f.name}: #{x} aliases #{y} and is grown in place (<<, push, ...) while #{y} is still used; the other name would not see the growth; not supported"
+            end
+          end
+        end
+      end
+    end
+    def alias_events(node, ev)
+      return node.each { alias_events(_1, ev) } if node.is_a?(Array)
+      return unless node.is_a?(Prism::Node)
+      case node
+      when Prism::LocalVariableWriteNode then alias_events(node.value, ev); ev << [:assign, node.name, local_sources(node.value)]; return
+      when Prism::LocalVariableReadNode then ev << [:read, node.name]; return
+      when Prism::CallNode
+        if %i[<< push insert concat unshift].include?(node.name) && node.receiver.is_a?(Prism::LocalVariableReadNode)
+          node.compact_child_nodes.each { alias_events(_1, ev) unless _1.equal?(node.receiver) }
+          ev << [:grow, node.receiver.name]; return
+        end
+      when Prism::BlockNode, Prism::LambdaNode then return # another scope: its own check when lowered (closures share through cells)
+      end
+      node.compact_child_nodes.each { alias_events(_1, ev) }
+    end
+
+    def real_growers(node, out = []) # locals grown through a handle-moving method (a []= store in range moves nothing)
+      return (node.each { real_growers(_1, out) }; out) if node.is_a?(Array)
+      return out unless node.is_a?(Prism::Node)
+      out << node.receiver.name if node.is_a?(Prism::CallNode) && %i[<< push insert concat unshift].include?(node.name) && node.receiver.is_a?(Prism::LocalVariableReadNode)
+      node.compact_child_nodes.each { real_growers(_1, out) }
+      out
+    end
+
+    # [x, y] for every `x = y` / `x = cond ? y : z` where y, z are locals
+    def alias_pairs(node, out = [])
+      return (node.each { alias_pairs(_1, out) }; out) if node.is_a?(Array)
+      return out unless node.is_a?(Prism::Node)
+      if node.is_a?(Prism::LocalVariableWriteNode)
+        srcs = local_sources(node.value)
+        srcs.each { |s| out << [node.name, s] unless s == node.name }
+      end
+      node.compact_child_nodes.each { alias_pairs(_1, out) }
+      out
+    end
+    def local_sources(v)
+      case v
+      when Prism::LocalVariableReadNode then [v.name]
+      when Prism::IfNode then (v.statements&.body&.last ? local_sources(v.statements.body.last) : []) + (v.subsequent.is_a?(Prism::ElseNode) && v.subsequent.statements&.body&.last ? local_sources(v.subsequent.statements.body.last) : [])
+      when Prism::OrNode then local_sources(v.left) + local_sources(v.right)
+      when Prism::ParenthesesNode then v.body&.body&.last ? local_sources(v.body.body.last) : []
+      else [] end
     end
 
     def rescued_bodies(node, out = [])
