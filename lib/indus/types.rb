@@ -294,6 +294,7 @@ module Indus
                 end
                 i.args = [c]; i.op = i.op == :print_v ? :print_str : :puts_str; changed = true
               end
+              if @settled && %i[add sub mul div mod].include?(i.op) && coerce_error(f, i) then changed = true end # 1.5 + "s": TypeError at run time
               if @settled && %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :sym # puts :a -> "a"; p :a -> ":a"
                 c = Inst.new(:call, [fn(i.op == :p_v ? :__sym_inspect : :__sym_name), i.args[0]]); c.ty = :str; c.block = i.block
                 i.block.insts.insert(i.block.insts.index(i), c); i.args = [c]; i.op = i.op == :print_v ? :print_str : :puts_str; changed = true
@@ -577,7 +578,8 @@ module Indus
       end
       f.all.each do |i|
         case i.op
-        when :add then i.op = :scat if of(f, i.args[0]) == :str
+        when :add, :sub, :mul, :div, :mod
+          i.op = :scat if i.op == :add && of(f, i.args[0]) == :str
         when :cmp
           l, r = i.args
           if of(f, l) == :str && of(f, r) == :str # nil stays a pointer compare
@@ -1100,6 +1102,7 @@ module Indus
       if t == :dyn && args.empty? && name == :to_i then i.op = :call; i.args = [fn(:__dyn_to_i), recv]; i.ty = :int; return end
       if t == :dyn && args.empty? && name == :to_f then i.op = :call; i.args = [fn(:__dyn_to_f), recv]; i.ty = :float; return end
       if name == :class && args.empty? && classes_of(t) && classes_of(t).none? { @classes[_1].find_method(:class) } # the class's name, as a String (no class objects at run time)
+        return unless @settled # the set may still widen (an exception value joins every raise in the program)
         if classes_of(t).size == 1 then i.op = :sconst; i.args = [classes_of(t)[0].to_s]; i.ty = :str; return end # one class: no header to read
         cid = Inst.new(:class_id, [recv]); cid.ty = :int; cid.block = i.block; i.block.insts.insert(i.block.insts.index(i), cid)
         i.op = :call; i.args = [fn(:__class_name), cid]; i.ty = :str; return
@@ -1515,6 +1518,19 @@ module Indus
       when :call then i.args[1..].each_with_index { |v, k| yield v, i.args[0].ptypes[k], ->(w) { i.args[k + 1] = w } }
       when :ret then yield i.args[0], f.rtype, ->(w) { i.args[0] = w }
       end
+    end
+
+    # `1.5 + "s"`: a TypeError at run time, with Ruby's wording (a provisional nil join is left alone: only a literal nil)
+    def self.coerce_error(f, i)
+      l, r = i.args
+      lt, rt = of(f, l), of(f, r)
+      return false unless %i[int int? float].include?(lt) && rt && (!%i[int int? float dyn nil].include?(rt) || rt == :nil && r.op == :const)
+      what = rt == :str ? "String" : rt == :sym ? (r.op == :const ? ":" + @lower.syms.key(r.args[0]).to_s : "Symbol") : rt == :bool ? "true" : rt == :nil ? "nil" : arr(rt) ? "Array" : hsh(rt) ? "Hash" : rt.to_s
+      into = lt == :float ? "Float" : "Integer"
+      w = Inst.new(:sconst, [what]); w.ty = :str; w.block = i.block; i.block.insts.insert(i.block.insts.index(i), w)
+      n = Inst.new(:sconst, [into]); n.ty = :str; n.block = i.block; i.block.insts.insert(i.block.insts.index(i), n)
+      i.op = :call; i.args = [fn(:__raise_coerce), w, n]; i.ty = lt
+      true
     end
 
     def self.drop_dead_phis(f)

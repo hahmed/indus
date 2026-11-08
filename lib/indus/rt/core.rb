@@ -1391,3 +1391,8 @@ def __float_round_neg(f, digits)
   end
   __float_round0(f / m.to_f) * m
 end
+
+# an arithmetic operand of the wrong kind: Ruby's TypeError, message by the operand's class
+def __raise_coerce(what, into)
+  raise TypeError, what + " can't be coerced into " + into
+end

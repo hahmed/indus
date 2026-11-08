@@ -467,6 +467,7 @@ module Indus
       # the handler: the exception value, then rescue clauses by class
       @cur = hb; @locals = before.dup
       exc = emit(:exc_value, [])
+      emit(:gset, [:__current_exception, exc]) if rescues.any? { |(_, _, body)| body.any? { has_global?(_1, :"$!") } } # $! inside the handler
       arms = rescues.map do |(classes, ref, body)|
         test = classes.map { |cn| emit(:isa, [exc, cn]) }.reduce { |a, b| emit(:or, [a, b]) }
         [test, ref, body, classes]
@@ -696,6 +697,8 @@ module Indus
       v
     end
     def me_val = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
+    # @x outside any class (main, top-level defs): the toplevel object's ivars, as globals
+    def ivar_owner = @owner || (@klass.nil? && !@locals.key?(:self) && !(@name_pfx && @locals.key?(:"#{@name_pfx}self")) ? :main : nil)
     # append to the *current* block after the arguments have been evaluated
     # (lowering an argument may move @cur: loops, inlining)
     def emit(op, args = [], cond = nil) = (@cur << Inst.new(op, args, cond))
@@ -791,18 +794,25 @@ module Indus
         end
         h
       when Prism::InstanceVariableReadNode
-        return emit(:gget, [:"#{@owner}#{n.name}"]) if @owner # a module's / class object's own ivar
+        ow = ivar_owner # a module's / class object's / the toplevel's own ivar
+        return emit(:gget, [:"#{ow}#{n.name}"]) if ow
         emit(:fld_get, [me_val, @klass.ivar(n.name)])
       when Prism::InstanceVariableOrWriteNode # @x ||= v
-        cur = @owner ? emit(:gget, [:"#{@owner}#{n.name}"]) : emit(:fld_get, [me_val, @klass.ivar(n.name)])
-        cond_assign(cur, false, -> { expr(n.value) }, ->(v) { @owner ? emit(:gset, [:"#{@owner}#{n.name}", v]) : emit(:fld_set, [me_val, @klass.ivar(n.name), v]) })
+        ow = ivar_owner
+        cur = ow ? emit(:gget, [:"#{ow}#{n.name}"]) : emit(:fld_get, [me_val, @klass.ivar(n.name)])
+        cond_assign(cur, false, -> { expr(n.value) }, ->(v) { ow ? emit(:gset, [:"#{ow}#{n.name}", v]) : emit(:fld_set, [me_val, @klass.ivar(n.name), v]) })
+      when Prism::InstanceVariableAndWriteNode # @x &&= v
+        ow = ivar_owner
+        cur = ow ? emit(:gget, [:"#{ow}#{n.name}"]) : emit(:fld_get, [me_val, @klass.ivar(n.name)])
+        cond_assign(cur, true, -> { expr(n.value) }, ->(v) { ow ? emit(:gset, [:"#{ow}#{n.name}", v]) : emit(:fld_set, [me_val, @klass.ivar(n.name), v]) })
       when Prism::InstanceVariableOperatorWriteNode # @x += v
-        cur = @owner ? emit(:gget, [:"#{@owner}#{n.name}"]) : emit(:fld_get, [me_val, @klass.ivar(n.name)])
+        ow = ivar_owner
+        cur = ow ? emit(:gget, [:"#{ow}#{n.name}"]) : emit(:fld_get, [me_val, @klass.ivar(n.name)])
         v = emit(ARITH.fetch(n.binary_operator), [cur, expr(n.value)])
-        @owner ? emit(:gset, [:"#{@owner}#{n.name}", v]) : emit(:fld_set, [me_val, @klass.ivar(n.name), v])
+        ow ? emit(:gset, [:"#{ow}#{n.name}", v]) : emit(:fld_set, [me_val, @klass.ivar(n.name), v])
         v
       when Prism::InstanceVariableWriteNode
-        if @owner then v = expr(n.value); emit(:gset, [:"#{@owner}#{n.name}", v]); return v end
+        if (ow = ivar_owner) then v = expr(n.value); emit(:gset, [:"#{ow}#{n.name}", v]); return v end
         (@hash_defaults ||= {})[[@klass&.name, n.name]] = hash_default_node(n.value) if hash_new_with_default?(n.value)
         v = expr(n.value)
         ((@ivar_kinds ||= {})[[@klass&.name, n.name]] ||= kind_of(n.value)) if @klass
@@ -813,7 +823,11 @@ module Indus
         else emit(:gget, [n.name]) end
       when Prism::ConstantWriteNode
         v = expr(n.value); emit(:gset, [n.name, v]); v
-      when Prism::GlobalVariableReadNode then n.name == :$~ ? emit(:call, [demand(:__re_groups_array)]) : emit(:gget, [n.name])
+      when Prism::GlobalVariableReadNode
+        case n.name
+        when :$~ then emit(:call, [demand(:__re_groups_array)])
+        when :$! then emit(:gget, [:__current_exception])
+        else emit(:gget, [n.name]) end
       when Prism::NumberedReferenceReadNode then emit(:call, [demand(:__re_group), const(n.number)]) # $1..$9 after the last match
       when Prism::BackReferenceReadNode # $~ (the groups of the last match as an array; $~[0] the whole match), $& the match
         raise "#{n.name}: only $~ and $& are supported" unless %i[$~ $&].include?(n.name)
@@ -868,7 +882,7 @@ module Indus
           case t
           when Prism::LocalVariableTargetNode then @locals[lname(t.name)] = v
           when Prism::InstanceVariableTargetNode
-            if @owner then emit(:gset, [:"#{@owner}#{t.name}", v])
+            if (ow = ivar_owner) then emit(:gset, [:"#{ow}#{t.name}", v])
             else emit(:fld_set, [me_val, @klass.ivar(t.name), v]) end
           else raise "unsupported assignment target #{t.class}"
           end
@@ -1086,7 +1100,7 @@ module Indus
         case root # the chain's home is rebound to the result (a grown string/array may have moved)
         when Prism::LocalVariableReadNode then shared?(root.name) ? write_shared(root.name, r) : @locals[lname(root.name)] = r
         when Prism::InstanceVariableReadNode, Prism::InstanceVariableOrWriteNode, Prism::InstanceVariableOperatorWriteNode
-          @owner ? emit(:gset, [:"#{@owner}#{root.name}", r]) : emit(:fld_set, [me_val, @klass.ivar(root.name), r])
+          (ow = ivar_owner) ? emit(:gset, [:"#{ow}#{root.name}", r]) : emit(:fld_set, [me_val, @klass.ivar(root.name), r])
         when Prism::CallNode
           if root.name == :[] # h[k] << v / a[i] << v: the element slot takes the grown handle
             idx_set_value(root.receiver, root.arguments.arguments[0], r)
@@ -1151,7 +1165,7 @@ module Indus
         end
         r
       elsif n.name == :p && n.receiver.nil? && args.size > 1 # p a, b: every argument evaluated, then one line each
-        vals = args.map { |a| kind_of(a) == :array ? [:str, inspect_str(a)] : a.is_a?(Prism::CallNode) && a.name == :class && a.arguments.nil? && a.receiver ? [:puts, expr(a)] : [:p, expr(a)] }
+        vals = args.map { |a| kind_of(a) == :array ? [:str, inspect_str(a)] : class_valued?(a) ? [:puts, expr(a)] : [:p, expr(a)] }
         vals.each { |(k, v)| emit(k == :str ? :puts_str : k == :puts ? :puts_v : :p_v, [v]) }; return const(0)
       elsif n.name == :p && n.receiver.nil? && args.size == 1 then p_one(args[0])
       elsif n.name == :inspect && args.empty? && n.receiver then inspect_str(n.receiver)
@@ -2596,6 +2610,11 @@ module Indus
       return true if node.is_a?(klass)
       node.compact_child_nodes.any? { has_node?(_1, klass) }
     end
+    def has_global?(node, name)
+      return false unless node.is_a?(Prism::Node)
+      return true if node.is_a?(Prism::GlobalVariableReadNode) && node.name == name
+      node.compact_child_nodes.any? { has_global?(_1, name) }
+    end
 
     # locals that are grown in place (<<, push, insert, concat, []= with a new key): their handle may change
     def grown_locals_plain(node, out = [])
@@ -2731,9 +2750,19 @@ module Indus
     end
 
     # p of one value: arrays are inspected element by element, everything else by type
+    # an expression whose value is a class (printed as its bare name): x.class, (e rescue $!.class), Klass
+    def class_valued?(a)
+      a = a.body.body.last while a.is_a?(Prism::ParenthesesNode) && a.body&.body&.size == 1
+      if a.is_a?(Prism::RescueModifierNode) # (x rescue $!.class): puts and p agree for the numeric/boolean/nil arm, so the class arm decides
+        return class_valued?(a.rescue_expression) && ![:str, :sym].include?(kind_of(a.expression)) && !kind_of(a.expression).is_a?(Array) && !a.expression.is_a?(Prism::StringNode) && !a.expression.is_a?(Prism::SymbolNode) && !a.expression.is_a?(Prism::ArrayNode) && !a.expression.is_a?(Prism::HashNode)
+      end
+      return true if a.is_a?(Prism::ConstantReadNode) && (@classes[a.name] || %i[Integer Float String Array Hash Symbol NilClass].include?(a.name))
+      a.is_a?(Prism::CallNode) && a.name == :class && a.arguments.nil? && a.receiver
+    end
+
     def p_one(a)
       if kind_of(a) == :array then emit(:puts_str, [inspect_str(a)])
-      elsif a.is_a?(Prism::CallNode) && a.name == :class && a.arguments.nil? && a.receiver then emit(:puts_v, [expr(a)]) # p x.class: the class name, unquoted (classes are names at run time)
+      elsif class_valued?(a) then emit(:puts_v, [expr(a)]) # p x.class: the class name, unquoted (classes are names at run time)
       else emit(:p_v, [expr(a)]) end       # inspect form: strings quoted, nil as "nil"
     end
 
