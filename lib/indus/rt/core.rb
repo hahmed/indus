@@ -999,7 +999,40 @@ def __str_capitalize(s)
 end
 
 # tr with single characters or simple sets (no ranges yet)
+# "a-y" in a tr set: the range expanded; a leading ^ negates (characters NOT in the set map to to's last)
+def __tr_expand(set)
+  out = ""
+  i = 0
+  while i < set.length
+    c = __ld8(set, i)
+    if i + 2 < set.length && __ld8(set, i + 1) == 45 # a-z
+      hi = __ld8(set, i + 2)
+      while c <= hi
+        out = out + c.chr
+        c = c + 1
+      end
+      i = i + 3
+    else
+      out = out + set[i, 1]
+      i = i + 1
+    end
+  end
+  out
+end
 def __str_tr(s, from, to)
+  if from.length > 0 && __ld8(from, 0) == 94 && from.length > 1 # ^set: everything not in the set
+    keep = __tr_expand(from[1, from.length - 1])
+    last = to.length > 0 ? __ld8(to, to.length - 1) : 32
+    out = __sdup(s)
+    i = 0
+    while i < out.length
+      __st8(out, i, last) unless __str_include_p(keep, out[i, 1])
+      i = i + 1
+    end
+    return out
+  end
+  from = __tr_expand(from)
+  to = __tr_expand(to)
   out = __sdup(s)
   i = 0
   while i < out.length

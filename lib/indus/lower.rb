@@ -881,6 +881,8 @@ module Indus
         @cur = @f.new_block(:dead); const(0)
       when Prism::BreakNode
         raise "break outside loop" unless @loop
+        bv = n.arguments ? expr(n.arguments.arguments[0]) : nil
+        (@loop[:break_values] ||= []) << [@cur, bv] if bv
         @loop[:breaks] << [@cur, @locals.dup]
         emit(:br, [@loop[:exit]])
         @cur = @f.new_block(:dead); const(0)
@@ -1644,10 +1646,10 @@ module Indus
         emit(:br, [hb]) unless @cur.term
         phis.each { |nm, ph| ph.args << [bend, @locals[nm]] unless bend.term && bend.succs.empty? }
         @loop[:nexts].each { |(b, l)| phis.each { |nm, ph| ph.args << [b, l.fetch(nm)] } }
-        breaks = @loop[:breaks]; @loop = outer
+        breaks = @loop[:breaks]; bvals = @loop[:break_values] || []; @loop = outer
         @cur = xb
         @locals = breaks.empty? ? phis.dup : merge_locals(xb, breaks)
-        return nil_const
+        return break_result(xb, breaks, bvals, nil)
       end
       # s.gsub(/re/) { |m| ... }: the block as a closure value, called per match
       if n.receiver && blk.is_a?(Prism::BlockNode) && %i[gsub sub].include?(n.name) && args.size == 1 && (args[0].is_a?(Prism::RegularExpressionNode) || args[0].is_a?(Prism::StringNode))
@@ -2056,11 +2058,22 @@ module Indus
       @locals[ivar] = emit(:add, [@locals[ivar], const(1)])
       emit(:br, [hb])
       phis.each { |nm, ph| ph.args << [lb, @locals.fetch(nm)] }
-      breaks = @loop[:breaks]; @loop = outer
+      breaks = @loop[:breaks]; bvals = @loop[:break_values] || []; @loop = outer
       @cur = xb
       @locals = breaks.empty? ? phis.dup : merge_locals(xb, [[hb, phis.dup], *breaks])
       @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
-      const(0)
+      break_result(xb, breaks, bvals, hb)
+    end
+
+    # the value of a loop that `break v` may leave: v from a break site, nil from the normal exit.
+    # Without break values: const 0 (callers substitute the construct's own result)
+    def break_result(xb, breaks, bvals, normal_pred)
+      return const(0) if bvals.empty?
+      arms = []
+      arms << [normal_pred, nil_const] if normal_pred
+      vals = bvals.to_h
+      breaks.each { |(b, _)| arms << [b, vals[b] || nil_const] }
+      p = xb.phi; p.args = arms; p
     end
 
     # h.each { |k, v| }: the i-th inserted entry, for i < count (Ruby's insertion order)
@@ -2145,7 +2158,8 @@ module Indus
       end.then do |r|
         if out
           res = @locals.delete(outv); res
-        else r end
+        elsif r.op == :phi then r # a `break v` left the loop with v
+        else kind == :each ? arr : r end
       end
     end
 
@@ -2798,11 +2812,11 @@ module Indus
       emit(:br, [hb]) unless @cur.term
       phis.each { |nm, ph| ph.args << [bend, @locals[nm]] unless @cur.name.to_s.start_with?("dead") && bend.succs.empty? }
       @loop[:nexts].each { |(b, l)| phis.each { |nm, ph| ph.args << [b, l.fetch(nm)] } } # `next` sites also reach the header
-      breaks = @loop[:breaks]; @loop = outer
+      breaks = @loop[:breaks]; bvals = @loop[:break_values] || []; @loop = outer
       @cur = xb
       # exit sees the header's values, or a break site's
       @locals = breaks.empty? ? phis.dup : merge_locals(xb, [[hb, phis.dup], *breaks])
-      const(0)
+      break_result(xb, breaks, bvals, hb)
     end
   end
 end

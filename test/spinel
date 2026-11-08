@@ -1,0 +1,53 @@
+#!/usr/bin/env ruby
+# test/spinel [N | --all] [--seed S] [--jobs J] [--filter re]
+# Run Spinel's own test programs (../../matz/spinel/test/*.rb with .expected) under Indus and compare.
+# The score is the fraction that print exactly what Spinel expects. Failures are grouped by message.
+require "open3"; require "timeout"
+SP = File.expand_path("~/src/github.com/matz/spinel/test")
+ROOT = File.expand_path("..", __dir__)
+args = ARGV.dup
+n = (args.find { _1 =~ /\A\d+\z/ } || 300).to_i
+all = args.include?("--all")
+seed = (i = args.index("--seed")) ? args[i + 1].to_i : 1
+jobs = (i = args.index("--jobs")) ? args[i + 1].to_i : 3
+filter = (i = args.index("--filter")) ? Regexp.new(args[i + 1]) : nil
+files = Dir["#{SP}/*.rb"].select { File.exist?(_1.sub(/\.rb\z/, ".rb.expected")) }.sort
+files = files.grep(filter) if filter
+files = files.shuffle(random: Random.new(seed)).first(n) unless all
+puts "#{files.size} programs, #{jobs} jobs"
+results = Queue.new
+work = Queue.new; files.each { work << _1 }; jobs.times { work << nil }
+threads = jobs.times.map do
+  Thread.new do
+    while (f = work.pop)
+      want = File.read(f.sub(/\.rb\z/, ".rb.expected"))
+      got, _st = Open3.capture2e("timeout", "-k", "1", "30", "env", "INDUS_HEAP_MB=64", "#{ROOT}/bin/indus", f)
+      got = got.scrub.lines.reject { _1.start_with?("indus:") || _1.start_with?("\tfrom ") || _1.include?("prism.rb:") }.join
+      if got == want then results << [f, :pass, nil]
+      else
+        err = got.scrub.lines.find { _1 =~ /Error\b|\[BUG\]|Trace\/BPT|Segmentation|unsupported|unknown|not supported/ }
+        msg = if err then err.scrub.sub(/\A.*?: /, "").gsub(/\d+/, "N")[0, 90].strip
+              elsif got.strip.empty? then "(no output: trapped or exited)"
+              else # the first differing line, so wrong answers group by shape
+                gl, wl = got.lines, want.lines
+                k = (0...[gl.size, wl.size].max).find { gl[_1] != wl[_1] } || 0
+                "(wrong output) line #{k + 1}: got #{gl[k].to_s.strip[0, 30].inspect} want #{wl[k].to_s.strip[0, 30].inspect}".gsub(/\d+/, "N")
+              end
+        # an unresolved method: say which
+        if msg.start_with?("codegen: mcall")
+          dump, _ = Open3.capture2e({ "DUMP" => "1", "INDUS_HEAP_MB" => "64" }, "timeout", "30", "#{ROOT}/bin/indus", f)
+          nm = dump.scrub[/= mcall (\S+)/, 1]
+          msg = "mcall #{nm}" if nm
+        end
+        results << [f, :fail, msg]
+      end
+    end
+  end
+end
+threads.each(&:join)
+rs = []; rs << results.pop until results.empty?
+pass = rs.count { _2 == :pass }
+puts "#{pass}/#{rs.size} pass (#{(100.0 * pass / rs.size).round(1)}%)"
+rs.select { _2 == :fail }.group_by(&:last).sort_by { -_2.size }.first(40).each do |m, fs|
+  puts "\n#{fs.size}x #{m}"; fs.first(4).each { puts "    #{File.basename(_1[0])}" }
+end
