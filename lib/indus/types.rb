@@ -1290,7 +1290,8 @@ module Indus
       # seen one class at a time): wait; settled, it is Ruby's NoMethodError at run time (a trap)
       unless klass.find_reader(name) && args.empty? || klass.find_writer(name) && args.size == 1 || klass.find_method(name) || klass.find_method(:method_missing)
         return unless @settled
-        i.op = :trap; i.args = []; i.ty = nil; return
+        tr = Inst.new(:trap, []); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr) # NoMethodError at run time
+        i.op = :const; i.args = [0]; i.ty = :nil; return # the value after a trap: never read
       end
       kind, payload = resolve(klass, name, args.size, allow_missing: true)
       case kind
