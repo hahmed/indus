@@ -511,7 +511,14 @@ module Indus
         end
       end
       @settled = false; @promoted = false; @no_defer = false
-      funcs.each { |f| f.all.each { |i| raise "uninitialized constant #{i.args[0]}" if i.op == :gget && !@consts.key?(i.args[0]) } }
+      funcs.each do |f|
+        f.all.each do |i|
+          next unless i.op == :gget && !@consts.key?(i.args[0])
+          # a $global or an object's @ivar never assigned reads as nil; a bare constant is an error
+          if i.args[0].to_s =~ /[$@]/ then i.op = :const; i.args = [0]; i.ty = :nil
+          else raise "uninitialized constant #{i.args[0]}" end
+        end
+      end
       # classes that appear in any poly type carry a tag word
       # the layout (class id word, field base) is a property of the whole hierarchy: a
       # superclass's methods write fields through `self` typed as the superclass

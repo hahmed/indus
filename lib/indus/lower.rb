@@ -68,6 +68,16 @@ module Indus
       # `def self.m` in a class or module body: a function named Owner.m, no self
       @modules = mods.map { _1.constant_path.name }
       sdefs = (cdefs + mods).flat_map { |c| (c.body&.body || []).grep(Prism::DefNode).select { _1.receiver.is_a?(Prism::SelfNode) }.map { [c.constant_path.name, _1] } }
+      # `extend M` in a class body: M's methods are class methods of that class
+      (cdefs + mods).each do |c|
+        (c.body&.body || []).each do |st|
+          next unless st.is_a?(Prism::CallNode) && st.name == :extend && st.receiver.nil? && st.arguments
+          st.arguments.arguments.each do |m|
+            raise "extend #{m.class}: a module name" unless m.is_a?(Prism::ConstantReadNode)
+            (@module_defs[m.name] || raise("extend #{m.name}: no such module")).each { |d| sdefs << [c.constant_path.name, d]; (@inherited_cm ||= {})[[c.constant_path.name, d.name]] = true } # extended: not the class's own
+          end
+        end
+      end
       # class << self ... end: defs inside are class methods; attr_accessor inside reads/writes the class object's ivars
       (cdefs + mods).each do |c|
         (c.body&.body || []).grep(Prism::SingletonClassNode).each do |sc|
@@ -76,6 +86,12 @@ module Indus
             case st
             when Prism::DefNode then sdefs << [c.constant_path.name, st]
             when Prism::CallNode
+              if st.name == :alias_method && st.arguments&.arguments&.size == 2 # alias_method :new, :old on the class object: a second def with the old body
+                nn, on = st.arguments.arguments.map { _1.unescaped.to_sym }
+                src_def = (sc.body&.body || []).grep(Prism::DefNode).find { _1.name == on } || (c.body&.body || []).grep(Prism::DefNode).find { _1.name == on && _1.receiver.is_a?(Prism::SelfNode) } or raise "alias_method #{nn}: no class method #{on}"
+                sdefs << [c.constant_path.name, src_def.copy(name: nn)]; next
+              end
+              next if %i[private public protected private_class_method].include?(st.name)
               raise "unsupported in class << self: #{st.name}" unless %i[attr_accessor attr_reader attr_writer].include?(st.name)
               (st.arguments&.arguments || []).each do |sym|
                 nm = sym.unescaped.to_sym; src = sym.send(:source); loc = sym.location
@@ -107,6 +123,19 @@ module Indus
           elsif bare && st.is_a?(Prism::DefNode) && !st.receiver
             sdefs << [m.constant_path.name, st]
           end
+        end
+      end
+      # a class method is inherited: Q.m where only P.m exists is P's def compiled for Q (so `kind` inside
+      # resolves to Q.kind and `new` to Q.new), one copy per subclass that lacks its own
+      sup_of = cdefs.to_h { |c| [c.constant_path.name, c.superclass&.name] }
+      cdefs.each do |c|
+        anc = sup_of[c.constant_path.name]
+        while anc
+          sdefs.select { |(o, _)| o == anc }.each do |(_, d)|
+            next if sdefs.any? { |(o, dd)| o == c.constant_path.name && dd.name == d.name }
+            sdefs << [c.constant_path.name, d]; (@inherited_cm ||= {})[[c.constant_path.name, d.name]] = true
+          end
+          anc = sup_of[anc]
         end
       end
       # constants written inside class bodies run before everything else
@@ -312,6 +341,7 @@ module Indus
           env = ct.merge(var => ct_symbol(el, ct))
           (blk.body&.body || []).each { |inner| class_body_call(k, inner, env, methods) }
         end
+      when :extend then nil # handled in run (the module's defs became class methods)
       else raise "unsupported in class body: #{st.name}"
       end
     end
@@ -534,18 +564,24 @@ module Indus
           f.shadowed = k.methods[st.name] if k.methods[st.name]&.cls == k
           f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
           (k.hidden ||= {})[st.name] = true if @visibility && @visibility != :public
-        when Prism::CallNode
-          next if st.name == :include || st.name == :prepend # mixed in above
-          if %i[private public protected].include?(st.name) && st.receiver.nil?
-            if st.arguments.nil? then @visibility = st.name # a bare `private`: the defs below are not public
-            else (st.arguments.arguments).each { |a| nm = a.unescaped.to_sym; (k.methods[nm] || k.readers[nm]) && (k.hidden ||= {})[nm] = st.name != :public } end # private :m
-            next
-          end
-          next if %i[private_constant module_function freeze].include?(st.name) && st.receiver.nil? # visibility is not enforced (every call is resolved at compile time)
-          class_body_call(k, st, {}, methods)
         when Prism::ConstantWriteNode then nil # hoisted above
-        when Prism::AliasMethodNode # alias new old: the same Func under a second name (a yielder: a second inline site)
-          new_name = st.new_name.unescaped.to_sym; old_name = st.old_name.unescaped.to_sym
+        when Prism::AliasMethodNode, Prism::CallNode # alias new old / alias_method :new, :old: the same Func under a second name (a yielder: a second inline site)
+          if st.is_a?(Prism::CallNode)
+            if st.name == :alias_method && st.receiver.nil? && st.arguments&.arguments&.size == 2
+              new_name = st.arguments.arguments[0].unescaped.to_sym; old_name = st.arguments.arguments[1].unescaped.to_sym
+            else
+              next if st.name == :include || st.name == :prepend # mixed in above
+              if %i[private public protected].include?(st.name) && st.receiver.nil?
+                if st.arguments.nil? then @visibility = st.name # a bare `private`: the defs below are not public
+                else (st.arguments.arguments).each { |a| nm = a.unescaped.to_sym; (k.methods[nm] || k.readers[nm]) && (k.hidden ||= {})[nm] = st.name != :public } end # private :m
+                next
+              end
+              next if %i[private_constant module_function freeze].include?(st.name) && st.receiver.nil? # visibility is not enforced (every call is resolved at compile time)
+              class_body_call(k, st, {}, methods); next
+            end
+          else
+            new_name = st.new_name.unescaped.to_sym; old_name = st.old_name.unescaped.to_sym
+          end
           if (y = @yielders[old_name]) then @yielders[new_name] = y
           elsif (m = k.methods[old_name]) then k.methods[new_name] = m
           elsif k.readers[old_name] then k.readers[new_name] = k.readers[old_name]
@@ -1213,6 +1249,18 @@ module Indus
         emit(:sconst, [n.receiver.name.to_s]) # Klass.name
       elsif n.name == :class && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name))
         emit(:sconst, [@modules.include?(n.receiver.name) ? "Module" : "Class"])
+      elsif %i[instance_methods public_instance_methods singleton_methods methods].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && ((kk = @classes[n.receiver.name]) || @modules.include?(n.receiver.name))
+        own_only = args[0].is_a?(Prism::FalseNode)
+        names = if n.name == :singleton_methods || n.name == :methods # the class object's methods (inherited class methods too, unless (false))
+                  chain = []; c = kk; while c; chain << c.name; c = c.superclass && @classes[c.superclass]; end
+                  chain = [n.receiver.name] if own_only || chain.empty?
+                  chain.flat_map { |cn| @funcs.keys.map(&:to_s).select { _1.start_with?("#{cn}.") }.map { _1.split(".", 2)[1].to_sym }.reject { own_only && @inherited_cm&.[]([cn, _1]) } }.uniq
+                else
+                  chain = []; c = kk; while c; chain << c; c = c.superclass && @classes[c.superclass]; end
+                  chain = [kk] if own_only
+                  chain.flat_map { |c| c.methods.keys.reject { _1 == :initialize || _1.to_s.start_with?("__") } + c.readers.keys + c.writers.keys }.uniq
+                end
+        pack_values(names.map { |nm| c = const(sym_id(nm.to_s)); c.ty = :sym; c })
       elsif n.name == :members && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @struct_fields&.[](n.receiver.name)
         pack_values(@struct_fields[n.receiver.name].map { |fl| c = const(sym_id(fl.to_s)); c.ty = :sym; c })
       elsif n.name == :superclass && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
