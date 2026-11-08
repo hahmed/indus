@@ -1159,6 +1159,16 @@ module Indus
         rv = expr(n.receiver)
         return emit(:mcall, [:<<, rv, expr(args[0])])
       end
+      if n.name == :concat && args.size >= 1 && n.receiver && (root = append_root(n)) # a.concat(b[, c]): grown in place, the home rebound like <<
+        a = expr(n.receiver)
+        r = emit(:call, [demand(args.size == 1 ? :__arr_concat : :__arr_concat2), a, *args.map { expr(_1) }]); r.routed = :concat # Types reroutes to the String helper by the receiver's type
+        case root
+        when Prism::LocalVariableReadNode then shared?(root.name) ? write_shared(root.name, r) : @locals[lname(root.name)] = r
+        when Prism::InstanceVariableReadNode then (ow = ivar_owner) ? emit(:gset, [:"#{ow}#{root.name}", r]) : emit(:fld_set, [me_val, @klass.ivar(root.name), r])
+        when Prism::ConstantReadNode, Prism::GlobalVariableReadNode then emit(:gset, [root.name, r])
+        end
+        return r
+      end
       if n.name == :<< && (root = append_root(n)) # `<<` is append on strings/arrays and shift on integers; Types fixes up a misguess
         a = expr(n.receiver); v = expr(args[0])
         r = emit(:lshift_or_append, [a, v])
@@ -1258,6 +1268,9 @@ module Indus
              else interpolated_literal(args[0])
              end&.to_sym
         k = n.receiver.nil? ? @klass : ((kd = kind_of(n.receiver)).is_a?(Symbol) ? @classes[kd] : nil)
+        if k.nil? && nm && n.receiver # the receiver's class is decided at run time: Types answers per class of the set (respond_to_q)
+          return emit(:respond_to_q, [expr(n.receiver), nm])
+        end
         raise "respond_to?: the receiver's class is not known at compile time" unless k
         if nm # a literal name: a compile-time fact
           expr(n.receiver) if n.receiver # the receiver is still evaluated

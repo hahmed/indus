@@ -1720,3 +1720,8 @@ def __dyn_slice_range(v, lo, hi, excl)
   return __arr_slice_range(__dyn_arr(v), lo, hi, excl) if __tag(v) == 4
   __str_slice_range(__dyn_str(v), lo, hi, excl)
 end
+# concat: in place in Ruby; here the grown container (the caller rebinds the home, like <<)
+def __arr_concat(a, b) = __arr_plus(a, b)
+def __arr_concat2(a, b, c) = __arr_plus(__arr_plus(a, b), c)
+def __str_concat(a, b) = a + b
+def __str_concat2(a, b, c) = a + b + c

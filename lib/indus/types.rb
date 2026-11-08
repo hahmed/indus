@@ -294,6 +294,28 @@ module Indus
                 end
                 i.args = [c]; i.op = i.op == :print_v ? :print_str : :puts_str; changed = true
               end
+              if i.op == :respond_to_q && (t = of(f, i.args[0])) && @settled
+                nm = i.args[1]
+                has = ->(cn) { k = @classes[cn]; k && (k.find_method(nm) || k.find_reader(nm) || k.find_writer(nm)) && !k.hidden&.[](nm) }
+                builtin = ->(fam) { prelude_method(fam, nm, 0) || prelude_method(fam, nm, 1) || %i[to_s inspect class nil? == != hash size length].include?(nm) }
+                if (cs = classes_of(t))
+                  yes = cs.select { has.(_1) }
+                  if yes.empty? then i.op = :const; i.args = [0]; i.ty = :bool
+                  elsif yes.size == cs.size then i.op = :const; i.args = [1]; i.ty = :bool
+                  else i.op = :isa_tags; i.args = [i.args[0], yes.map { @classes[_1].id }]; i.ty = :bool end
+                elsif t == :dyn # by tag: a user object answers by class id, a builtin by its family's helpers
+                  ids = @classes.values.select { |k| k.tagged && has.(k.name) }.map(&:id)
+                  fams = { 2 => "str", 4 => "arr", 6 => "hash" }.select { |_, fm| builtin.(fm) }.keys
+                  fams << 1 if builtin.("num")
+                  c1 = Inst.new(:const, [0]); c1.ty = :int; c1.block = i.block; i.block.insts.insert(i.block.insts.index(i), c1) # placeholder kept simple: refuse on mixed answers
+                  raise "respond_to?(:#{nm}) on a tagged value: not supported" if !ids.empty? || !fams.empty? && fams.size != 4
+                  i.op = :const; i.args = [fams.empty? ? 0 : 1]; i.ty = :bool
+                else
+                  fm = t == :str ? "str" : arr(t) ? "arr" : hsh(t) ? "hash" : %i[int float].include?(t) ? "num" : nil
+                  i.op = :const; i.args = [fm && builtin.(fm) ? 1 : 0]; i.ty = :bool
+                end
+                changed = true
+              end
               if i.op == :raise_any && (t = of(f, i.args[0])) && (t == :str || classes_of(t) || t == :dyn)
                 raise "#{f.name}: raise of a value that may be a String or an exception object (tagged): not supported" if t == :dyn
                 if t == :str # raise "message": a RuntimeError around it
@@ -1264,6 +1286,12 @@ module Indus
       # prelude methods take no optional parameters: an arity-suffixed name (__str_rjust1) serves the shorter call
       if arr(t) && name == :to_a && args.empty? then i.op = :nop; i.args = [recv]; i.ty = t; return end
       return unless t.is_a?(Symbol) && (klass = @classes[t])
+      # a class without the method while the receiver's set may still widen (an element of a mixed array
+      # seen one class at a time): wait; settled, it is Ruby's NoMethodError at run time (a trap)
+      unless klass.find_reader(name) && args.empty? || klass.find_writer(name) && args.size == 1 || klass.find_method(name) || klass.find_method(:method_missing)
+        return unless @settled
+        i.op = :trap; i.args = []; i.ty = nil; return
+      end
       kind, payload = resolve(klass, name, args.size, allow_missing: true)
       case kind
       when :fld_get then i.op = :fld_get; i.args = [recv, payload]
@@ -1461,6 +1489,7 @@ module Indus
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
       when :dsend then nil
       when :gc_now, :raise_any then :int
+      when :respond_to_q then :bool
       when :str_or_empty then :str
       when :to_f, :fsqrt, :libm, :clock then :float
       when :eputs_v, :eputs_str then :int
