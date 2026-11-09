@@ -3205,13 +3205,43 @@ module Indus
       node.compact_child_nodes.each { alias_pairs(_1, out) }
       out
     end
+    SELF_RETURNING = %i[concat << push append prepend insert unshift replace clear fill map! select! reject! sort! reverse! uniq! compact! flatten! shuffle! rotate! upcase! downcase! capitalize! swapcase! strip! chomp! chop! squeeze! gsub! sub! tr! delete! force_encoding freeze tap itself].freeze
     def local_sources(v)
       case v
       when Prism::LocalVariableReadNode then [v.name]
+      when Prism::CallNode # r = s.concat(x) / s.tap {} : r is s; r = m(s) where m returns a parameter: r may be s
+        if SELF_RETURNING.include?(v.name) && v.receiver then local_sources(v.receiver)
+        elsif v.receiver.nil? && (d = @defs_by_func[@funcs[v.name]] || @yielders&.[](v.name)&.[](1)) && (ps = d.parameters&.requireds) && (args = v.arguments&.arguments)
+          returned = returned_param_indexes(d, ps.map(&:name))
+          returned.flat_map { |ix| args[ix] ? local_sources(args[ix]) : [] }
+        else [] end
       when Prism::IfNode then (v.statements&.body&.last ? local_sources(v.statements.body.last) : []) + (v.subsequent.is_a?(Prism::ElseNode) && v.subsequent.statements&.body&.last ? local_sources(v.subsequent.statements.body.last) : [])
       when Prism::OrNode then local_sources(v.left) + local_sources(v.right)
       when Prism::ParenthesesNode then v.body&.body&.last ? local_sources(v.body.body.last) : []
       else [] end
+    end
+
+    # which of a def's required parameters its body may return as-is (the last expression, through parens/if/begin)
+    def returned_param_indexes(d, names)
+      out = []
+      tails = lambda do |n, acc|
+        case n
+        when nil then acc
+        when Prism::LocalVariableReadNode then acc << n.name
+        when Prism::ParenthesesNode, Prism::BeginNode then tails.(n.respond_to?(:body) ? n.body&.body&.last : n.statements&.body&.last, acc)
+        when Prism::StatementsNode then tails.(n.body.last, acc)
+        when Prism::IfNode, Prism::UnlessNode then tails.(n.statements&.body&.last, acc); tails.(n.subsequent.is_a?(Prism::ElseNode) ? n.subsequent.statements&.body&.last : n.subsequent, acc)
+        when Prism::ReturnNode then tails.(n.arguments&.arguments&.first, acc)
+        end
+        acc
+      end
+      acc = tails.(d.body&.body&.last, [])
+      explicit = []
+      walk = ->(n) { next unless n.is_a?(Prism::Node); explicit << n.arguments.arguments.first if n.is_a?(Prism::ReturnNode) && n.arguments&.arguments&.size == 1; n.compact_child_nodes.each { walk.(_1) } }
+      walk.(d.body)
+      explicit.each { tails.(_1, acc) }
+      acc.uniq.each { |nm| (ix = names.index(nm)) && out << ix }
+      out
     end
 
     def rescued_bodies(node, out = [])
