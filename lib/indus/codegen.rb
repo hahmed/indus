@@ -381,7 +381,7 @@ module Indus
                 if v.float? then @asm.fmov(fi, freg(v, fi)); fi += 1
                 else (n == 0 && recv.ty == :dyn ? @asm.mov(xi, rr) : @asm.mov(xi, reg(v, xi))); xi += 1 end
               end
-              @asm.bl(payload.name); i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
+              payload.patchable ? (@asm.ldr_off(16, Asm::GBASE, @asm.global(:"m_#{payload.name}")); @asm.blr(16)) : @asm.bl(payload.name); i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0) # a redefinable method: through its slot
             when :fld_get
               off = @classes[recv.ty].base + payload * 8
               i.float? ? @asm.fldr_off(d, reg(recv), off) : @asm.ldr_off(d, reg(recv), off)
@@ -412,7 +412,7 @@ module Indus
                 if v.float? then @asm.fmov(fi, freg(v, fi)); fi += 1
                 else (n == 0 && recv.ty == :dyn ? @asm.mov(xi, rr) : @asm.mov(xi, reg(v, xi))); xi += 1 end
               end
-              @asm.bl(payload.name); i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
+              payload.patchable ? (@asm.ldr_off(16, Asm::GBASE, @asm.global(:"m_#{payload.name}")); @asm.blr(16)) : @asm.bl(payload.name); i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0) # a redefinable method: through its slot
               @asm.ldr_off(16, rr, 0) if false
             when :fld_get
               off = klass.base + payload * 8

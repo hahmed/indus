@@ -1357,6 +1357,10 @@ module Indus
     # whose arity matches; dispatch compares symbol ids
     def self.dsend(f, i)
       name_v, recv, *args = i.args
+      if of(f, name_v) == :str # a String name: its symbol
+        c = Inst.new(:call, [fn(:__str_to_sym), name_v]); c.ty = :sym; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+        i.args[0] = name_v = c
+      end
       t = of(f, recv)
       return unless t.is_a?(Symbol) && (klass = @classes[t])
       arms = []

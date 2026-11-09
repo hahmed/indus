@@ -71,6 +71,18 @@ module Indus
 
     def run
       body = @ast.statements.body
+      # A = Class.new(Base) { ... } / A = Module.new { } at the top level: the same as `class A < Base ... end`
+      body = body.map do |st|
+        next st unless st.is_a?(Prism::ConstantWriteNode) && st.value.is_a?(Prism::CallNode) && st.value.name == :new && st.value.receiver.is_a?(Prism::ConstantReadNode) && %i[Class Module].include?(st.value.receiver.name) && st.value.block.is_a?(Prism::BlockNode)
+        v = st.value; src = st.send(:source); loc = st.location
+        path = Prism::ConstantReadNode.new(src, 0, loc, 0, st.name)
+        if v.receiver.name == :Module
+          Prism::ModuleNode.new(src, 0, loc, 0, [], loc, path, v.block.body, loc, st.name)
+        else
+          sup = v.arguments&.arguments&.first
+          Prism::ClassNode.new(src, 0, loc, 0, [], loc, path, sup && loc, sup, v.block.body, loc, st.name)
+        end
+      end
       # modules are namespaces: hoist their classes and constants to the top level
       mods = body.grep(Prism::ModuleNode)
       # a module's instance methods: `include M` in a class body compiles them as that class's own
@@ -439,7 +451,7 @@ module Indus
         raise "class-body each over a non-literal array" unless recv.is_a?(Prism::ArrayNode)
         blk = st.block; var = blk.parameters.parameters.requireds[0].name
         recv.elements.each do |el|
-          env = ct.merge(var => ct_symbol(el, ct))
+          env = ct.merge(var => (el.is_a?(Prism::StringNode) ? el.unescaped : ct_symbol(el, ct))) # a %w element stays a String in the body
           (blk.body&.body || []).each { |inner| class_body_call(k, inner, env, methods) }
         end
       when :extend then nil # handled in run (the module's defs became class methods)
@@ -452,7 +464,7 @@ module Indus
       case node
       when Prism::SymbolNode then node.unescaped.to_sym
       when Prism::StringNode then node.unescaped.to_sym
-      when Prism::LocalVariableReadNode then ct.fetch(node.name) { raise "#{node.name} is not a compile-time symbol" }
+      when Prism::LocalVariableReadNode then ct.fetch(node.name) { raise "#{node.name} is not a compile-time symbol" }.to_sym
       when Prism::InterpolatedSymbolNode
         node.parts.map do |part|
           case part
@@ -1008,7 +1020,7 @@ module Indus
         v = emit(ARITH.fetch(n.binary_operator), [emit(:gget, [n.name]), expr(n.value)]); emit(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode
         if @in_safe_nav && @in_safe_nav_node.equal?(n) then @in_safe_nav
-        elsif @ct&.key?(n.name) then (c = const(sym_id(@ct[n.name])); c.ty = :sym; c) # compile-time symbol
+        elsif @ct&.key?(n.name) then (@ct[n.name].is_a?(String) ? emit(:sconst, [@ct[n.name]]) : (c = const(sym_id(@ct[n.name])); c.ty = :sym; c)) # a compile-time symbol or string
         elsif shared?(n.name) then emit(:cell_get, [@locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" }])
         else @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" } end
       when Prism::LocalVariableWriteNode
@@ -1179,7 +1191,18 @@ module Indus
           @eval_parsed[node].each { |st| out << [node.receiver.name, st] if st.is_a?(Prism::DefNode) }
           return
         end
-        return if struct_new?(node) || node.name == :define_method # Struct.new/Data.define bodies are class bodies (registered with the struct); define_method blocks are methods
+        return if struct_new?(node)
+        if node.name == :define_method && node.block.is_a?(Prism::BlockNode) && node.arguments&.arguments&.first.is_a?(Prism::SymbolNode) && (node.receiver.is_a?(Prism::ConstantReadNode) || node.receiver.nil? && owner && !top_level)
+          # X.define_method(:m) { |a| ... } at run time: a def of m on X, written at this site
+          return if node.receiver.nil? && top_level # inside a class body: handled by class_body_call
+          cname = node.receiver ? node.receiver.name : owner
+          blk = node.block; src = node.send(:source); loc = node.location
+          ps = blk.parameters.is_a?(Prism::BlockParametersNode) ? blk.parameters.parameters : nil
+          d = Prism::DefNode.new(src, 0, loc, 0, node.arguments.arguments.first.unescaped.to_sym, loc, nil, ps, blk.body, blk.locals, loc, nil, nil, nil, nil, nil)
+          (@define_method_defs ||= {})[node] = d
+          out << [cname, d]; return
+        end
+        return if node.name == :define_method
       when Prism::ConstantWriteNode
         return if struct_new?(node.value)
       end
@@ -1291,7 +1314,7 @@ module Indus
       if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && (y = @yielders[n.name]) && y[0] && (k == y[0].name)
         return inline_yielder(y, n.receiver, args, nil, :none) # obj.m without a block, m yields: inlined with block_given? false
       end
-      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send respond_to? class_eval instance_variable_get].include?(n.name)
+      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send respond_to? instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
         rv = expr(n.receiver)
         return emit(:mcall, [n.name, rv, *object_args(n, args, @classes[k], rv)])
       end
@@ -1323,7 +1346,7 @@ module Indus
         bv = n.block.expression ? expr(n.block.expression) : @locals.fetch(@block_param || :__blk) { raise "anonymous & outside a method taking a block" }
         return block_arg_call(n, args, bv)
       end
-      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash) && !(%i[class_eval class_exec].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode))
+      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash) && !(%i[class_eval class_exec].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode)) && !(n.name == :define_method && @define_method_defs&.key?(n)) && !(%i[instance_eval instance_exec].include?(n.name) && n.receiver)
       if n.name == :<< && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] && args.size == 1 # obj << v: the class's own method
         rv = expr(n.receiver)
         return emit(:mcall, [:<<, rv, expr(args[0])])
@@ -1376,7 +1399,8 @@ module Indus
           return emit(:mcall, [name.unescaped.to_sym, recv_v, *rest.map { expr(_1) }])
         end
         nv = expr(name)
-        nv = emit(:call, [demand(:__str_to_sym), nv]) if name.is_a?(Prism::StringNode) || name.is_a?(Prism::InterpolatedStringNode) # a computed name: its symbol
+        nv = emit(:call, [demand(:__str_to_sym), nv]) if name.is_a?(Prism::StringNode) || name.is_a?(Prism::InterpolatedStringNode) || kind_of(name) == :str # a computed name: its symbol (Types converts a str-typed name too)
+        @classes.each_value { |k| (k.methods.keys + k.readers.keys + k.writers.keys).each { sym_id(_1.to_s) } } # every method name is a symbol the table knows: a computed name interns to the same id
         return emit(:dsend, [nv, recv_v, *rest.map { expr(_1) }]) # switch over the class's methods
       end
       if n.name == :% && n.receiver && (kind_of(n.receiver) == :str || n.receiver.is_a?(Prism::StringNode) || n.receiver.is_a?(Prism::InterpolatedStringNode))
@@ -1585,6 +1609,32 @@ module Indus
       elsif %i[class_eval module_eval].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name] && @eval_parsed&.key?(n)
         @eval_parsed[n].each { |st| st.is_a?(Prism::DefNode) ? expr(st) : nil } # a literal string: its defs' slot writes here (other statements in it: ignored)
         nil_const
+      elsif %i[instance_variable_get instance_variable_set instance_variable_defined? instance_variables].include?(n.name) && n.receiver && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd]
+        k = @classes[kd]; rv = expr(n.receiver)
+        if n.name == :instance_variables then pack_values(k.ivars.reject { _1.to_s.start_with?("@__") }.map { |iv| c = const(sym_id(iv.to_s)); c.ty = :sym; c })
+        else
+          iv = args[0].is_a?(Prism::SymbolNode) ? args[0].unescaped.to_sym : (args[0].is_a?(Prism::StringNode) ? args[0].unescaped.to_sym : raise("#{n.name}: the name must be a literal"))
+          case n.name
+          when :instance_variable_get then k.ivars.include?(iv) ? emit(:fld_get, [rv, k.ivar(iv)]) : nil_const
+          when :instance_variable_set then (k.ivar(iv); v = expr(args[1]); emit(:fld_set, [rv, k.ivar(iv), v]); v)
+          else (c = const(k.ivars.include?(iv) ? 1 : 0); c.ty = :bool; c) end
+        end
+      elsif n.name == :define_method && (d = @define_method_defs&.[](n)) # a run-time define_method site: the slot write
+        expr(d)
+      elsif %i[instance_eval instance_exec].include?(n.name) && n.receiver && n.block.is_a?(Prism::BlockNode) && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd]
+        # obj.instance_eval { body }: the block inlined with self = obj (ivars are obj's)
+        rv = expr(n.receiver)
+        saved_self, saved_k = @locals[:self], @klass
+        @locals[:self] = rv; @klass = @classes[kd]
+        params = n.block.parameters&.parameters&.requireds&.map(&:name) || []
+        pfx = :"ie#{@f.blocks.size}:"
+        @locals[:"#{pfx}#{params[0]}"] = rv if params[0]
+        (n.arguments&.arguments || []).each_with_index { |a, k| @locals[:"#{pfx}#{params[k + (n.name == :instance_eval ? 1 : 0)]}"] = expr(a) if params[k + (n.name == :instance_eval ? 1 : 0)] }
+        @blk_pfx = (@blk_pfx || []) << pfx
+        r = (n.block.body&.body || []).map { expr(_1) }.last || nil_const
+        @blk_pfx.pop; @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
+        saved_self ? @locals[:self] = saved_self : @locals.delete(:self); @klass = saved_k
+        r
       elsif n.name == :eval && n.receiver.nil? && args.size == 1 # eval "literal": the code, compiled here
         lit = literal_string(args[0]) or raise "eval of a computed string: the resident compiler for arbitrary code is not available yet (a literal string compiles in place)"
         Lower.normalize(Prism.parse(lit).value).statements.body.map { expr(_1) }.last || nil_const
