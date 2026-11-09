@@ -88,6 +88,13 @@ module Indus
         changed = false
         raise "type inference does not converge (#{rounds} rounds): a rewrite keeps undoing another's work; refusing rather than looping" if (rounds += 1) > 400
         mark_unused_results(funcs) if funcs.any? { _1.name == :main } # a whole-program fact; the resident compiler sees one function
+        funcs.each do |pr| # method versions behind one slot: one signature for all
+          next unless pr.versions
+          group = [pr, *pr.versions]
+          pr.params.each_index { |k| t = group.map { _1.ptypes[k] }.reduce { |a, b| join(a, b) }; group.each { |g| (g.ptypes[k] = t; changed = true) if t && g.ptypes[k] != t } }
+          rt = group.map(&:rtype).reduce { |a, b| join(a, b) }
+          group.each { |g| (g.rtype = rt; changed = true) if rt && g.rtype != rt }
+        end
         set = ->(cur, nt, &w) { (w.call(join(cur, nt)); changed = true) if nt && join(cur, nt) != cur }
         funcs.each do |f|
           f.all.each do |i|
@@ -745,8 +752,8 @@ module Indus
         end
       end
       funcs.each do |f|
-        base = f.name.to_s.split("#").last.to_sym
-        unused = !read[f] && !read_name[base] && f.name != :main && !f.patchable && !prelude?(f)
+        base = f.name.to_s.split("#").last.sub(/@v\d+\z/, "").to_sym
+        unused = !read[f] && !read_name[base] && f.name != :main && !f.patchable && !f.primary && !prelude?(f) # a version is reached through its primary's slot
         f.result_unused = unused
         # Once the types have settled (mcalls bound), a dead result is made to return a
         # constant, so the value -- and any phi only it kept alive -- stops existing instead of
@@ -1490,7 +1497,7 @@ module Indus
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
       when :dsend then nil
-      when :gc_now, :raise_any then :int
+      when :gc_now, :raise_any, :setslot then :int
       when :respond_to_q then :bool
       when :str_or_empty then :str
       when :to_f, :fsqrt, :libm, :clock then :float

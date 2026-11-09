@@ -18,6 +18,7 @@ module Indus
           when :call, :zcheck then work << i.args[0]
           when :pcall, :sendsw then i.args[0].each { |(_, kind, payload)| work << payload if kind == :call }
           when :dsend then i.args.each { |a| work << a if a.is_a?(Func) }
+          when :setslot then work << i.args[1]
           end
           i.args.each { |a| work << a if a.is_a?(Func) } if i.op == :const || i.op == :lambda || i.op == :adrlbl
         end

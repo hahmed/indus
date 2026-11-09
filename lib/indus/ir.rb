@@ -57,6 +57,7 @@ module Indus
   end
 
   class Func
+    attr_accessor :primary, :versions # a method defined again later: versions behind the primary's slot (see Lower#register_class_body)
     attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :returns_fresh, :rest, :allocates, :result_unused,
                   :shadowed # the definition this one overrides in the same class's chain (a mixin's, or the one a prepend covers): super's target
     def initialize(name, nparams)

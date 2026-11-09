@@ -92,9 +92,13 @@ module Indus
       # a class opened several times (class A; ...; end ... class A; ...; end) is one class: the bodies
       # concatenated in order, the superclass from whichever body names it. (Whole program: every body is known.)
       by_name = {}
+      @redefine_markers = {} # a later re-opening's ClassNode -> [class, [method names it redefines]]: a slot write at its program position
       cdefs = cdefs.each_with_object([]) do |c, out|
         nm = c.constant_path.name
         if (first = by_name[nm])
+          earlier = (first.body&.body || []).grep(Prism::DefNode).reject { _1.receiver }.map(&:name)
+          redefs = (c.body&.body || []).grep(Prism::DefNode).reject { _1.receiver }.map(&:name) & earlier
+          @redefine_markers[c] = [nm, redefs] unless redefs.empty?
           merged_body = (first.body&.body || []) + (c.body&.body || [])
           src = first.send(:source); loc = first.location
           merged = first.copy(body: Prism::StatementsNode.new(src, 0, loc, 0, merged_body), superclass: first.superclass || c.superclass)
@@ -204,14 +208,31 @@ module Indus
       class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).map { |w| w.copy(name: :"#{c.constant_path.name}::#{w.name}") } + (c.body&.body || []).grep(Prism::ClassVariableWriteNode) } # @@x = v in a class body: run first, like a constant
       # Name = Struct.new(:a, :b) defines a class with accessors and an initialize
       structs = body.select { |st| st.is_a?(Prism::ConstantWriteNode) && struct_new?(st.value) }
-      top = (body - defs - body.grep(Prism::ClassNode) - mods - structs) # every class body (merged or not) leaves the top level
+      @lazy = {}; @defs_by_func = {} # prelude functions (__name): lowered on first demand, see `demand`
+      @def_versions = {} # DefNode (a later definition) -> [primary Func, version Func]: its site writes the slot
+      defs.each do |d|
+        next if yields?(d) && !d.parameters&.block # a yielder without &blk inlines at its call sites
+        ps = d.parameters
+        if (prev = @funcs[d.name]) && !d.name.to_s.start_with?("__") # `def f` again at the top level: a version behind f's slot
+          f = Func.new(:"#{d.name}@v#{(prev.versions || []).size + 1}", def_param_names(d).size)
+          f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
+          f.primary = prev; (prev.versions ||= []) << f; prev.patchable = true
+          @defs_by_func[f] = d; @def_versions[d] = [prev, f]
+          (@deferred_variants ||= []) << [f, def_param_names(d), d.body&.body || []]
+          next
+        end
+        f = @funcs[d.name] = Func.new(d.name, def_param_names(d).size)
+        f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
+        @defs_by_func[f] = d
+        @lazy[d.name] = d if d.name.to_s.start_with?("__")
+      end
+      top = (body - (defs - @def_versions.keys) - mods - structs).flat_map { |st| st.is_a?(Prism::ClassNode) ? (@redefine_markers[st] ? [[:redefine, *@redefine_markers[st]]] : []) : [st] } # a re-opening that redefines methods, or a second `def f`: a slot write at its position
       top = class_consts + mod_consts + top
       @mod_ivars = mod_ivars
       # methods that take a block (contain yield) are inlined at call sites with a literal block;
       # they still get compiled as functions for block-less callers
       @yielders = {} # name -> [klass or nil, def]
       defs.each { |d| @yielders[d.name] = [nil, d] if yields?(d) && !d.parameters&.block }
-      @defs_by_func = {}
       @dm_bodies = {}
       dm.each do |st|
         name = st.arguments.arguments.first.unescaped.to_sym
@@ -225,16 +246,9 @@ module Indus
         f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
         @defs_by_func[f] = d
       end
-      @lazy = {} # prelude functions (__name): lowered on first demand, see `demand`
-      defs.each do |d|
-        next if yields?(d) && !d.parameters&.block # a yielder without &blk inlines at its call sites
-        ps = d.parameters
-        f = @funcs[d.name] = Func.new(d.name, def_param_names(d).size)
-        f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
-        @defs_by_func[f] = d
-        @lazy[d.name] = d if d.name.to_s.start_with?("__")
-      end
       methods = [] # [klass, def, func]
+      @nested_defs = [] # [enclosing class name or nil, DefNode] found below the hoisted positions
+      collect_nested_defs(body, nil, @nested_defs, top_level: true)
       structs.each do |st|
         k = @classes[st.name] = Klass.new(st.name)
         k.id = @classes.size
@@ -288,12 +302,38 @@ module Indus
         end
         register_class_body(k, (c.body&.body || []) + readers, methods)
       end
+      # nested defs (inside methods, conditionals, blocks, class_eval blocks): versions behind the method's slot
+      @nested_defs.each do |owner, d|
+        raise "a `def` with yield nested in #{owner || 'the top level'}: not supported (yielders are inlined)" if yields?(d) && !d.parameters&.block
+        if owner
+          k = @classes.fetch(owner) { raise "def #{d.name} inside unknown class #{owner}" }
+          prev = k.methods[d.name]
+          f = Func.new(:"#{k.name}##{d.name}#{prev ? "@v#{((prev.primary || prev).versions || []).size + 1}" : ""}", 1 + def_param_names(d).size)
+          f.rest = true if d.parameters&.rest.is_a?(Prism::RestParameterNode)
+          f.cls = k; @defs_by_func[f] = d
+          if prev && prev.cls == k
+            primary = prev.primary || prev
+            f.primary = primary; (primary.versions ||= []) << f; primary.patchable = true; @def_versions[d] = [primary, f]
+          else
+            k.methods[d.name] = f # first definition of the method anywhere: it is the method (defined when its site runs, approximately)
+          end
+          methods << [k, d, f]
+        else
+          prev = @funcs[d.name]
+          f = Func.new(prev ? :"#{d.name}@v#{(prev.versions || []).size + 1}" : d.name, def_param_names(d).size)
+          f.rest = true if d.parameters&.rest.is_a?(Prism::RestParameterNode)
+          @defs_by_func[f] = d
+          if prev then f.primary = prev; (prev.versions ||= []) << f; prev.patchable = true; @def_versions[d] = [prev, f]
+          else @funcs[d.name] = f end
+          (@deferred_variants ||= []) << [f, def_param_names(d), d.body&.body || []]
+        end
+      end
       @pre = Pretype.new(@ast, @classes) # receiver kinds for the structural decisions below
       main = Func.new(:main, 0)
       lower_body(main, [], top)
       # prelude functions are lowered only when something names them (most of the prelude is
       # never used by a given program, and typing it first was half the compile)
-      defs.each { |d| lower_body(@funcs[d.name], def_param_names(d), d.body&.body || []) if @funcs[d.name] && !@lazy.key?(d.name) && !(@lowered_late || []).include?(@funcs[d.name]) }
+      defs.each { |d| lower_body(@funcs[d.name], def_param_names(d), d.body&.body || []) if @funcs[d.name] && !@def_versions.key?(d) && !@lazy.key?(d.name) && !(@lowered_late || []).include?(@funcs[d.name]) } # a version lowers as its own function (deferred)
       @dm_bodies.each { |f, (params, stmts)| lower_body(f, params, stmts) }
       sdefs.each do |owner, d|
         @owner = owner
@@ -313,7 +353,7 @@ module Indus
       demand(:__gc_run) if @funcs[:__gc_run] # the collector is entered from the runtime, not by a call
       demand(:__gc_keep) if @funcs[:__gc_keep] # loop regions call it from codegen
       drain_demands
-      all = [main, *@funcs.values.reject { @lazy.key?(_1.name) }, *methods.map { _1[2] }, *@classes.values.select(&:closure).map { _1.methods[:call] }]
+      all = [main, *@funcs.values.reject { @lazy.key?(_1.name) }, *methods.map { _1[2] }, *@classes.values.select(&:closure).map { _1.methods[:call] }, *@def_versions.values.map(&:last)].uniq
       all.each { prune(_1) }
       all
     end
@@ -624,6 +664,15 @@ module Indus
           ps = st.parameters
           f = Func.new(:"#{k.name}##{st.name}#{k.methods[st.name] ? "'" * (1 + k.methods[st.name].name.to_s.count("'")) : ""}", 1 + def_param_names(st).size)
           f.rest = true if ps&.rest.is_a?(Prism::RestParameterNode)
+          if (prev = k.methods[st.name]) && prev.cls == k && !(mixed_in + prepended_defs).include?(st) && !(mixed_in + prepended_defs).include?(@defs_by_func[prev])
+            # the same class defines the method again (a later re-opening): a version. Callers bind to the first;
+            # the method is patchable and a `redefine` at the re-opening's position points its slot at this body.
+            primary = prev.primary || prev
+            f.name = :"#{k.name}##{st.name}@v#{(primary.versions || []).size + 1}" # one label per version
+            f.primary = primary; (primary.versions ||= []) << f; primary.patchable = true
+            f.cls = k; methods << [k, st, f]; @defs_by_func[f] = st
+            next
+          end
           f.shadowed = k.methods[st.name] if k.methods[st.name]&.cls == k
           f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
           (k.hidden ||= {})[st.name] = true if @visibility && @visibility != :public
@@ -692,7 +741,20 @@ module Indus
         return
       end
       last = nil
-      stmts.each { last = expr(_1) }
+      stmts.each do |st|
+        if st.is_a?(Array) && st[0] == :redefine # a re-opening that redefines methods, at its program position: the slots take the next versions
+          _, cname, names = st
+          k = @classes[cname]
+          names.each do |nm|
+            primary = k.methods[nm]; primary = primary.primary || primary
+            @redefine_count ||= Hash.new(0); v = primary.versions[@redefine_count[[cname, nm]]]; @redefine_count[[cname, nm]] += 1
+            raise "redefinition of #{cname}##{nm} without a version" unless v
+            emit(:setslot, [primary, v])
+          end
+          last = nil_const; next
+        end
+        last = expr(st)
+      end
       last = const(0) if f.name == :main # the program's last expression is not a value anyone reads
       emit(:ret, [last || const(0)]) unless @cur.term
     end
@@ -1066,8 +1128,46 @@ module Indus
         l = expr(n.left)
         l.ty == :nil ? l : and_value(l) { expr(n.right) }
       when Prism::IndexTargetNode then raise "unsupported index target"
+      when Prism::DefNode # a def reached as a statement: a later definition writes the method's slot; the first is already compiled
+        if (pv = @def_versions[n]) then emit(:setslot, pv) end
+        c = const(sym_id(n.name.to_s)); c.ty = :sym; c
+      when Prism::ClassNode # a class body reached at run time (under an if, inside a method): its defs' slot writes
+        (n.body&.body || []).each { |st| expr(st) if st.is_a?(Prism::DefNode) }
+        nil_const
       else raise "unsupported: #{n.class}"
       end
+    end
+
+    # defs nested below the hoisted positions: inside methods, conditionals, blocks, class_eval blocks.
+    # Each is a version of the method on the lexically enclosing class (nil: the top level).
+    def collect_nested_defs(node, owner, out, top_level: false)
+      return node.each { collect_nested_defs(_1, owner, out, top_level: top_level) } if node.is_a?(Array)
+      return unless node.is_a?(Prism::Node)
+      case node
+      when Prism::ClassNode
+        cname = node.constant_path.name
+        (node.body&.body || []).each do |st|
+          if st.is_a?(Prism::DefNode)
+            out << [cname, st] if !top_level && !st.receiver # a class body reached at run time (under an if, in a method): its defs are versions
+            collect_nested_defs(st.body, cname, out)
+          else collect_nested_defs(st, cname, out) end
+        end
+        return
+      when Prism::ModuleNode, Prism::SingletonClassNode then return # a module's defs are mixed into classes; class << self defs are class methods
+      when Prism::DefNode
+        return if node.receiver # def self.m: a class method (versions of those: not yet)
+        out << [owner, node] unless top_level
+        collect_nested_defs(node.body, owner, out); return
+      when Prism::CallNode
+        if node.name == :class_eval && node.receiver.is_a?(Prism::ConstantReadNode) && node.block.is_a?(Prism::BlockNode) # X.class_eval { def ... }: defs on X
+          (node.block.body&.body || []).each { |st| out << [node.receiver.name, st] if st.is_a?(Prism::DefNode) }
+          return
+        end
+        return if struct_new?(node) || node.name == :define_method # Struct.new/Data.define bodies are class bodies (registered with the struct); define_method blocks are methods
+      when Prism::ConstantWriteNode
+        return if struct_new?(node.value)
+      end
+      node.compact_child_nodes.each { |c| collect_nested_defs(c, owner, out, top_level: top_level && node.is_a?(Prism::StatementsNode)) }
     end
 
     # l || <right>: l if truthy else right, as a value
@@ -1207,7 +1307,7 @@ module Indus
         bv = n.block.expression ? expr(n.block.expression) : @locals.fetch(@block_param || :__blk) { raise "anonymous & outside a method taking a block" }
         return block_arg_call(n, args, bv)
       end
-      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash)
+      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash) && !(%i[class_eval class_exec].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode))
       if n.name == :<< && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] && args.size == 1 # obj << v: the class's own method
         rv = expr(n.receiver)
         return emit(:mcall, [:<<, rv, expr(args[0])])
@@ -1463,6 +1563,9 @@ module Indus
           end
         end
         obj
+      elsif n.name == :class_eval && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name] && n.block.is_a?(Prism::BlockNode)
+        (n.block.body&.body || []).each { |st| expr(st) if st.is_a?(Prism::DefNode) } # X.class_eval { def m ... }: versions written here
+        nil_const
       elsif n.name == :class_eval && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
         # a puncture: the methods this string defines can change at run time.
         # They are called through a slot from here on; nothing else changes.

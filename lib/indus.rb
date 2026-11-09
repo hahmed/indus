@@ -97,7 +97,7 @@ module Indus
     asm.libm = %i[sin cos pow cbrt hypot log2 log10 log exp atan2 atan tan asin acos clock_gettime open creat read write close unlink exit].to_h { [_1, Metal::LIBC[_1.to_s].to_i] } unless standalone
     asm.os = standalone
     asm.emit_start_linux if standalone == :linux
-    funcs.each { Codegen.new(asm, lower.classes).func(_1) }
+    funcs.each { Codegen.new(asm, lower.classes, funcs).func(_1) }
     asm.emit_runtime_blob
     asm.emit_overflow_trap
     asm.emit_gc_tables if GC.enabled?

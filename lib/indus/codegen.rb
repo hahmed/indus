@@ -5,7 +5,7 @@ module Indus
     # ops that may bump the heap: a collection may run just before them
     ALLOCATING = %i[anew aset onew hnew hset hkeys sconst scat sjoin sappend ssub itos call pcall sendsw].freeze
 
-    def initialize(asm, classes = {}) = (@asm, @classes = asm, classes)
+    def initialize(asm, classes = {}, funcs = []) = (@asm, @classes, @funcs = asm, classes, funcs)
 
     def layout(f)
       order, seen, work = [], {}, [f.entry]
@@ -63,11 +63,9 @@ module Indus
         @asm.adr(16, :__mmap_fn_entry); @asm.str_off(16, Asm::GBASE, @asm.global(:__mmap_fn))
         @asm.adr(16, :__munmap_fn_entry); @asm.str_off(16, Asm::GBASE, @asm.global(:__munmap_fn))
         # patchable methods start out pointing at their static code
-        @classes.each_value do |k|
-          k.methods.each_value do |m|
-            next unless m.patchable
-            @asm.adr(16, m.name); @asm.str_off(16, Asm::GBASE, @asm.global(:"m_#{m.name}"))
-          end
+        (@classes.values.flat_map { _1.methods.values } + @funcs).uniq.each do |m| # class methods and top-level defs alike
+          next unless m.patchable && !m.primary
+          @asm.adr(16, m.name); @asm.str_off(16, Asm::GBASE, @asm.global(:"m_#{m.name}"))
         end
       end
       # params: ints in x0.., floats in d0.. (separate counters, AAPCS64)
@@ -506,6 +504,9 @@ module Indus
             @asm.bl(f.name)
           end
           i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
+        when :setslot # a redefinition point: the method's slot takes the version defined here
+          primary, version = i.args
+          @asm.adr(16, version.name); @asm.str_off(16, Asm::GBASE, @asm.global(:"m_#{primary.name}"))
         when :seam # call the resident compiler with the seam id; it patches the slots
           @asm.seams << i.args
           @asm.mov_imm(0, @asm.seams.size - 1)
