@@ -215,6 +215,7 @@ module Indus
       # constants written inside class bodies run before everything else
       # a class's constants are its own (Base::PREFIX and Child::PREFIX are two globals, "Base::PREFIX" and
       # "Child::PREFIX"); bare X inside a class resolves lexically through the ancestors (see const_owner)
+      @top_consts = body.grep(Prism::ConstantWriteNode).map(&:name) # the program's top-level constants
       @class_const_owners = Hash.new { |h, k| h[k] = [] } # const name -> classes that define it
       cdefs.each { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).each { |w| @class_const_owners[w.name] << c.constant_path.name } }
       class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).map { |w| w.copy(name: :"#{c.constant_path.name}::#{w.name}") } + (c.body&.body || []).grep(Prism::ClassVariableWriteNode) } # @@x = v in a class body: run first, like a constant
@@ -238,7 +239,15 @@ module Indus
         @defs_by_func[f] = d
         @lazy[d.name] = d if d.name.to_s.start_with?("__")
       end
-      top = (body - (defs - @def_versions.keys) - mods - structs).flat_map { |st| st.is_a?(Prism::ClassNode) ? (@redefine_markers[st] ? [[:redefine, *@redefine_markers[st]]] : []) : [st] } # a re-opening that redefines methods, or a second `def f`: a slot write at its position
+      # `class B < A` where an ancestor defines `self.inherited`: the hook runs at the declaration's program position
+      # (the first declaration of each class only), with the subclass's name as the class value
+      seen_decl = {}
+      inherited_hook = lambda do |st|
+        next [] unless st.superclass && !seen_decl[st.constant_path.name]
+        seen_decl[st.constant_path.name] = true
+        [[:inherited, st.constant_path.name]] # resolved when lowered: the class methods are registered later
+      end
+      top = (body - (defs - @def_versions.keys) - mods - structs).flat_map { |st| st.is_a?(Prism::ClassNode) ? inherited_hook.(st) + (@redefine_markers[st] ? [[:redefine, *@redefine_markers[st]]] : []) : [st] } # a re-opening that redefines methods, or a second `def f`: a slot write at its position
       top = class_consts + mod_consts + top
       @mod_ivars = mod_ivars
       # methods that take a block (contain yield) are inlined at call sites with a literal block;
@@ -386,6 +395,10 @@ module Indus
         end
       end
       lower_deferred_lambdas
+      # a class with method_missing may receive any call's name as a Symbol: every called name is a symbol
+      if @classes.each_value.any? { _1.methods.key?(:method_missing) }
+        all_call_names(@ast).each { sym_id(_1.to_s) }
+      end
       install_symbol_names(main)
       demand(:__gc_run) if @funcs[:__gc_run] # the collector is entered from the runtime, not by a call
       demand(:__gc_keep) if @funcs[:__gc_keep] # loop regions call it from codegen
@@ -456,6 +469,10 @@ module Indus
     # compile-time environment: block variables bound to literal symbols by
     # an unrolled `[:a, :b].each do |f| ... end`.
     def class_body_call(k, st, ct, methods)
+      if st.is_a?(Prism::CallNode) && %i[send public_send __send__].include?(st.name) && st.arguments&.arguments&.first.is_a?(Prism::SymbolNode) # send(:define_method, ...) is the call itself
+        sym, *rest = st.arguments.arguments
+        st = st.copy(name: sym.unescaped.to_sym, arguments: st.arguments.copy(arguments: rest))
+      end
       args = st.arguments&.arguments || []
       case st.name
       when :attr_accessor, :attr_reader, :attr_writer
@@ -471,12 +488,14 @@ module Indus
         f = Func.new(:"#{k.name}##{name}", 1 + params.size)
         f.cls = k; k.methods[name] = f
         methods << [k, nil, f, [:self, *params], blk.body&.body || [], ct.dup]
-      when :each # [:a, :b].each do |f| ... end  -> unrolled at compile time
+      when :each, :each_with_index # [:a, :b].each do |f| ... end  -> unrolled at compile time
         recv = st.receiver
+        recv = recv.receiver if recv.is_a?(Prism::CallNode) && recv.name == :each_with_index && recv.receiver.is_a?(Prism::ArrayNode) # a.each_with_index.each
         raise "class-body each over a non-literal array" unless recv.is_a?(Prism::ArrayNode)
-        blk = st.block; var = blk.parameters.parameters.requireds[0].name
-        recv.elements.each do |el|
+        blk = st.block; var, ivar = blk.parameters.parameters.requireds.map(&:name)
+        recv.elements.each_with_index do |el, ix|
           env = ct.merge(var => (el.is_a?(Prism::StringNode) ? el.unescaped : ct_symbol(el, ct))) # a %w element stays a String in the body
+          env[ivar] = ix if ivar
           (blk.body&.body || []).each { |inner| class_body_call(k, inner, env, methods) }
         end
       when :extend then nil # handled in run (the module's defs became class methods)
@@ -779,6 +798,12 @@ module Indus
       end
       last = nil
       stmts.each do |st|
+        if st.is_a?(Array) && st[0] == :inherited # Parent.inherited(Sub) at the subclass's declaration, if an ancestor defines the hook
+          anc = @classes[st[1]]&.superclass
+          anc = anc.superclass while anc && !@funcs[:"#{anc.name}.inherited"]
+          emit(:call, [@funcs[:"#{anc.name}.inherited"], emit(:sconst, [st[1].to_s])]) if anc
+          next
+        end
         if st.is_a?(Array) && st[0] == :redefine # a re-opening that redefines methods, at its program position: the slots take the next versions
           _, cname, names = st
           k = @classes[cname]
@@ -1045,7 +1070,7 @@ module Indus
         v = emit(ARITH.fetch(n.binary_operator), [emit(:gget, [n.name]), expr(n.value)]); emit(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode
         if @in_safe_nav && @in_safe_nav_node.equal?(n) then @in_safe_nav
-        elsif @ct&.key?(n.name) then (@ct[n.name].is_a?(String) ? emit(:sconst, [@ct[n.name]]) : (c = const(sym_id(@ct[n.name])); c.ty = :sym; c)) # a compile-time symbol or string
+        elsif @ct&.key?(n.name) then (@ct[n.name].is_a?(String) ? emit(:sconst, [@ct[n.name]]) : @ct[n.name].is_a?(Integer) ? const(@ct[n.name]) : (c = const(sym_id(@ct[n.name])); c.ty = :sym; c)) # a compile-time symbol, string or index
         elsif shared?(n.name) then emit(:cell_get, [@locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" }])
         else @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" } end
       when Prism::LocalVariableWriteNode
@@ -1230,6 +1255,12 @@ module Indus
         out << [owner, node] unless top_level
         collect_nested_defs(node.body, owner, out); return
       when Prism::CallNode
+        if %i[send public_send __send__].include?(node.name) && node.receiver.is_a?(Prism::ConstantReadNode) && node.arguments&.arguments&.first.is_a?(Prism::SymbolNode) && node.arguments.arguments.first.unescaped == "define_method" && node.block
+          sym, *rest = node.arguments.arguments # X.send(:define_method, :m) { }: the define_method call itself
+          rewritten = node.copy(name: :define_method, arguments: node.arguments.copy(arguments: rest))
+          (@send_rewrites ||= {})[node] = rewritten
+          return collect_nested_defs(rewritten, owner, out, top_level: top_level)
+        end
         if node.name == :class_eval && node.receiver.is_a?(Prism::ConstantReadNode) && node.block.is_a?(Prism::BlockNode) # X.class_eval { def ... }: defs on X
           (node.block.body&.body || []).each { |st| out << [node.receiver.name, st] if st.is_a?(Prism::DefNode) }
           return
@@ -1391,11 +1422,17 @@ module Indus
       if n.block.is_a?(Prism::BlockArgumentNode) && n.block.expression.is_a?(Prism::SymbolNode) && n.receiver
         return block_call(n, args) # map(&:upcase), group_by(&:length), ...: the block { |e| e.sym }
       end
+      if n.block.is_a?(Prism::BlockArgumentNode) && n.block.expression && (kd = kind_of(n.block.expression)).is_a?(Symbol) && @classes[kd]&.find_method(:to_proc)
+        # m(&obj) where obj's class defines to_proc: the block is obj.to_proc
+        src = n.send(:source); loc = n.location
+        tp = Prism::CallNode.new(src, 0, loc, 0, n.block.expression, nil, :to_proc, nil, nil, nil, nil, nil, nil)
+        return expr(n.copy(block: n.block.copy(expression: tp)))
+      end
       if n.block.is_a?(Prism::BlockArgumentNode) # m(&b): the block is already a value; m(&) forwards this method's own block
         bv = n.block.expression ? expr(n.block.expression) : @locals.fetch(@block_param || :__blk) { raise "anonymous & outside a method taking a block" }
         return block_arg_call(n, args, bv)
       end
-      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash) && !(%i[class_eval class_exec].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode)) && !(n.name == :define_method && @define_method_defs&.key?(n)) && !(%i[instance_eval instance_exec].include?(n.name) && n.receiver) && !@singletons&.key?(n)
+      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash) && !(%i[class_eval class_exec].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode)) && !(n.name == :define_method && @define_method_defs&.key?(n)) && !(%i[instance_eval instance_exec].include?(n.name) && n.receiver) && !@singletons&.key?(n) && !@send_rewrites&.key?(n)
       if n.name == :<< && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] && args.size == 1 # obj << v: the class's own method
         rv = expr(n.receiver)
         return emit(:mcall, [:<<, rv, expr(args[0])])
@@ -1441,6 +1478,7 @@ module Indus
       if n.name == :call && n.receiver.is_a?(Prism::LocalVariableReadNode) && (@lambdas || {})[lname(n.receiver.name)]
         return inline_lambda(@lambdas[lname(n.receiver.name)], args)
       end
+      return expr(@send_rewrites[n]) if @send_rewrites&.key?(n) # X.send(:define_method, ...): the call itself
       if n.name == :send || n.name == :public_send
         name, *rest = args
         recv_v = n.receiver ? expr(n.receiver) : me_val
@@ -1515,8 +1553,13 @@ module Indus
         end
         raise "respond_to?: the receiver's class is not known at compile time" unless k
         if nm # a literal name: a compile-time fact
-          expr(n.receiver) if n.receiver # the receiver is still evaluated
-          c = const((k.find_method(nm) || k.find_reader(nm) || k.find_writer(nm)) && !k.hidden&.[](nm) ? 1 : 0); c.ty = :bool; c # a private method does not respond
+          rv = n.receiver ? expr(n.receiver) : me_val # the receiver is still evaluated
+          has = (k.find_method(nm) || k.find_reader(nm) || k.find_writer(nm)) && !k.hidden&.[](nm)
+          if !has && (rtm = k.find_method(:respond_to_missing?)) # the class decides at run time
+            sc = const(sym_id(nm.to_s)); sc.ty = :sym; fc = const(0); fc.ty = :bool
+            return emit(:call, [rtm, rv, sc, fc])
+          end
+          c = const(has ? 1 : 0); c.ty = :bool; c # a private method does not respond
         else # a computed name: its symbol against the class's own, at run time
           nv = expr(args[0])
           nv = emit(:call, [demand(:__str_to_sym_q), nv]) unless args[0].is_a?(Prism::SymbolNode)
@@ -1545,6 +1588,26 @@ module Indus
                   chain.flat_map { |c| c.methods.keys.reject { _1 == :initialize || _1.to_s.start_with?("__") } + c.readers.keys + c.writers.keys }.uniq
                 end
         pack_values(names.map { |nm| c = const(sym_id(nm.to_s)); c.ty = :sym; c })
+      elsif %i[call bind_call].include?(n.name) && n.receiver.is_a?(Prism::CallNode) && (um = unbound_method_of(n.receiver, n.name == :bind_call ? args[0] : nil))
+        kname, mname, obj = um
+        rest = n.name == :bind_call ? args[1..] : args
+        expr(Prism::CallNode.new(n.send(:source), 0, n.location, 0, obj, nil, mname, nil, nil, rest.empty? ? nil : Prism::ArgumentsNode.new(n.send(:source), 0, n.location, 0, rest), nil, nil, nil))
+      elsif %i[method_defined? instance_method public_method_defined? private_method_defined?].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && (kk = @classes[n.receiver.name]) && args[0].is_a?(Prism::SymbolNode)
+        nm = args[0].unescaped.to_sym; has = kk.find_method(nm) || kk.find_reader(nm) || kk.find_writer(nm)
+        raise "#{n.receiver.name}.instance_method(:#{nm}): no such method" if n.name == :instance_method && !has
+        return emit(:sconst, ["#<UnboundMethod: #{n.receiver.name}##{nm}>"]) if n.name == :instance_method # a method object: bind(obj).call is the call (below)
+        c = const(has && (n.name == :private_method_defined? ? kk.hidden&.[](nm) : !kk.hidden&.[](nm)) ? 1 : 0); c.ty = :bool; c
+      elsif n.name == :const_get && n.receiver.is_a?(Prism::ConstantReadNode) && args.size == 1 && (args[0].is_a?(Prism::SymbolNode) || args[0].is_a?(Prism::StringNode))
+        cn = args[0].unescaped.to_sym
+        if n.receiver.name == :Object then expr(Prism::ConstantReadNode.new(n.send(:source), 0, n.location, 0, cn))
+        else emit(:gget, [:"#{n.receiver.name}::#{cn}"]) end
+      elsif n.name == :const_defined? && n.receiver.is_a?(Prism::ConstantReadNode) && args.size == 1 && (args[0].is_a?(Prism::SymbolNode) || args[0].is_a?(Prism::StringNode))
+        cn = args[0].unescaped.to_sym
+        known = n.receiver.name == :Object ? (@classes.key?(cn) || @modules.include?(cn) || has_const?(cn) || %i[String Integer Float Array Hash Symbol Object Kernel Comparable Enumerable Math Struct].include?(cn)) : has_const?(:"#{n.receiver.name}::#{cn}")
+        c = const(known ? 1 : 0); c.ty = :bool; c
+      elsif n.name == :constants && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
+        pfx = "#{n.receiver.name}::"
+        pack_values(const_names.select { _1.to_s.start_with?(pfx) }.map { |cn| c = const(sym_id(cn.to_s.delete_prefix(pfx))); c.ty = :sym; c })
       elsif n.name == :members && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @struct_fields&.[](n.receiver.name)
         pack_values(@struct_fields[n.receiver.name].map { |fl| c = const(sym_id(fl.to_s)); c.ty = :sym; c })
       elsif n.name == :superclass && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
@@ -2884,6 +2947,13 @@ module Indus
 
     # every Symbol the program names, as a String array in the global SYMBOL_NAMES, built at the top of
     # main: Symbol#to_s / inspect / puts read it. (Symbols are ids at run time.)
+    def all_call_names(node, out = [])
+      return out unless node.is_a?(Prism::Node)
+      out << node.name if node.is_a?(Prism::CallNode)
+      node.compact_child_nodes.each { all_call_names(_1, out) }
+      out.uniq
+    end
+
     def install_symbol_names(main)
       @syms ||= {}
       saved = [@f, @locals, @cur, @klass, @ct, @owner, @shared]
@@ -3218,6 +3288,21 @@ module Indus
     FLOAT_CONSTS = { INFINITY: Float::INFINITY, NAN: Float::NAN, MAX: Float::MAX, MIN: Float::MIN, EPSILON: Float::EPSILON }.freeze
     FLOAT_INT_CONSTS = { DIG: Float::DIG, MAX_EXP: Float::MAX_EXP, MIN_EXP: Float::MIN_EXP, MANT_DIG: Float::MANT_DIG }.freeze
     # the class whose constant a bare name means here: the current class (or class-method owner), then its ancestors
+    # X.instance_method(:m).bind(obj) -> [X, :m, obj node]; X.instance_method(:m) with obj given (bind_call) likewise
+    def unbound_method_of(node, obj)
+      if node.name == :bind && node.receiver.is_a?(Prism::CallNode) && node.arguments&.arguments&.size == 1
+        inner = unbound_method_of(node.receiver, node.arguments.arguments[0]) and return inner
+      end
+      return nil unless node.name == :instance_method && node.receiver.is_a?(Prism::ConstantReadNode) && @classes[node.receiver.name] && node.arguments&.arguments&.first.is_a?(Prism::SymbolNode) && obj
+      [node.receiver.name, node.arguments.arguments.first.unescaped.to_sym, obj]
+    end
+
+    def has_const?(name) # Klass::X or a top-level X
+      cn, x = name.to_s.split("::", 2)
+      x ? @class_const_owners[x.to_sym].include?(cn.to_sym) : @top_consts&.include?(name.to_sym)
+    end
+    def const_names = @class_const_owners.flat_map { |x, owners| owners.map { |o| :"#{o}::#{x}" } }
+
     def const_owner(name)
       return nil unless @class_const_owners && !@class_const_owners[name].empty?
       k = @owner ? @classes[@owner] : @klass

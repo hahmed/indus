@@ -309,6 +309,10 @@ module Indus
                 builtin = ->(fam) { prelude_method(fam, nm, 0) || prelude_method(fam, nm, 1) || %i[to_s inspect class nil? == != hash size length].include?(nm) }
                 if (cs = classes_of(t))
                   yes = cs.select { has.(_1) }
+                  if cs.size == 1 && yes.empty? && (rtm = @classes[cs[0]]&.find_method(:respond_to_missing?)) # the class decides at run time
+                    sc = sym_const(i, nm); fc = Inst.new(:const, [0]); fc.ty = :bool; fc.block = i.block; i.block.insts.insert(i.block.insts.index(i), fc)
+                    i.op = :call; i.args = [rtm, i.args[0], sc, fc]; i.ty = :bool; changed = true; next
+                  end
                   if yes.empty? then i.op = :const; i.args = [0]; i.ty = :bool
                   elsif yes.size == cs.size then i.op = :const; i.args = [1]; i.ty = :bool
                   else i.op = :isa_tags; i.args = [i.args[0], yes.map { @classes[_1].id }]; i.ty = :bool end
@@ -1167,6 +1171,7 @@ module Indus
         return if t == :bool || t == :nil && recv.op != :const # true/false share a type; a joined nil may still widen
         i.op = :sconst; i.args = [cn]; i.ty = :str; return
       end
+      if t == :str && args.empty? && name == :name then i.op = :nop; i.args = [recv]; i.ty = :str; return end # a class value is its name (no class objects at run time)
       if t == :dyn && args.empty? && %i[to_s inspect].include?(name) then i.op = :call; i.args = [fn(name == :to_s ? :__dyn_to_s : :__dyn_inspect), recv]; i.ty = :str; return end
       if t == :dyn && args.empty? && name == :to_sym then i.op = :call; i.args = [fn(:__dyn_sym), recv]; i.ty = :sym; return end
       if t == :dyn && args.empty? && name == :to_i then i.op = :call; i.args = [fn(:__dyn_to_i), recv]; i.ty = :int; return end
