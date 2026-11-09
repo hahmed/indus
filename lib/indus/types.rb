@@ -1152,6 +1152,11 @@ module Indus
       name, recv, *args = i.args
       t = of(f, recv)
       if name == :class && args.empty? && t == :dyn then i.op = :call; i.args = [fn(:__dyn_class_name), recv]; i.ty = :str; return end
+      # an operator guessed to be an object's method (the pre-typing misjudged the receiver): the builtin operation
+      if args.size == 1 && (ar = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :% => :mod }[name]) && %i[int int? float].include?(t)
+        i.op = ar; i.args = [recv, args[0]]; i.ty = nil; return
+      end
+      if name == :+ && args.size == 1 && t == :str then i.op = :scat; i.args = [recv, args[0]]; i.ty = :str; return end
       if name == :class && args.empty? && (cn = { int: "Integer", float: "Float", str: "String", sym: "Symbol", bool: "TrueClass", nil: "NilClass" }[t] || (arr(t) && "Array") || (hsh(t) && "Hash"))
         return if t == :bool || t == :nil && recv.op != :const # true/false share a type; a joined nil may still widen
         i.op = :sconst; i.args = [cn]; i.ty = :str; return
