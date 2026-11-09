@@ -1419,6 +1419,70 @@ def __float_round_neg(f, digits)
   __float_round0(f / m.to_f) * m
 end
 
+# Integer#<< / >> with a count not known at compile time: a negative count shifts the other way;
+# a left shift that would not fit 63 bits traps (a Bignum result is not supported here)
+def __int_shl(a, n)
+  return __int_shr(a, 0 - n) if n < 0
+  return (a == 0 ? 0 : __trap_shift) if n >= 64
+  r = __shl_raw(a, n)
+  __trap_shift if __shr_raw(r, n) != a
+  r
+end
+def __int_shr(a, n)
+  return __int_shl(a, 0 - n) if n < 0
+  return (a < 0 ? -1 : 0) if n >= 64
+  __shr_raw(a, n)
+end
+def __trap_shift
+  __trap
+  0
+end
+
+# Kernel#Integer(str): strict -- optional sign, 0x/0b/0o prefixes, underscores between digits; anything else is ArgumentError
+def __kernel_integer(s)
+  s = s.strip
+  i = 0
+  neg = false
+  if i < s.length && (s[i] == "-" || s[i] == "+")
+    neg = s[i] == "-"
+    i = i + 1
+  end
+  base = 10
+  if i + 1 < s.length && s[i] == "0"
+    c = s[i + 1]
+    if c == "x" || c == "X" then base = 16; i = i + 2
+    elsif c == "b" || c == "B" then base = 2; i = i + 2
+    elsif c == "o" || c == "O" then base = 8; i = i + 2
+    elsif c != "_" then base = 8; i = i + 1
+    end
+  end
+  raise ArgumentError, "invalid value for Integer(): " + s.inspect if i >= s.length
+  n = 0
+  last_us = true
+  while i < s.length
+    c = s[i]
+    if c == "_"
+      raise ArgumentError, "invalid value for Integer(): " + s.inspect if last_us
+      last_us = true
+    else
+      d = __digit_value(c)
+      raise ArgumentError, "invalid value for Integer(): " + s.inspect if d < 0 || d >= base
+      n = n * base + d
+      last_us = false
+    end
+    i = i + 1
+  end
+  raise ArgumentError, "invalid value for Integer(): " + s.inspect if last_us
+  neg ? -n : n
+end
+def __digit_value(c)
+  o = c.ord
+  return o - 48 if o >= 48 && o <= 57
+  return o - 87 if o >= 97 && o <= 122
+  return o - 55 if o >= 65 && o <= 90
+  -1
+end
+
 # an arithmetic operand of the wrong kind: Ruby's TypeError, message by the operand's class
 def __raise_coerce(what, into)
   raise TypeError, what + " can't be coerced into " + into

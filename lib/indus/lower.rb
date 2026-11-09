@@ -1484,6 +1484,8 @@ module Indus
         return r
       end
       if n.receiver.nil? && n.name.to_s.start_with?("__") && !@funcs[n.name] && !(@klass && @klass.find_method(n.name))
+        return (r = emit(:shl, [expr(args[0]), expr(args[1])]); r.raw_shift = true; r) if n.name == :__shl_raw
+        return (r = emit(:shr, [expr(args[0]), expr(args[1])]); r.raw_shift = true; r) if n.name == :__shr_raw
         return intrinsic(n.name, args) # the GC prelude's raw memory access
       end
       if n.name == :-@ && args.empty? # unary minus: 0 - x
@@ -1550,7 +1552,7 @@ module Indus
       elsif n.name == :print && n.receiver.nil? && args.size == 1
         emit(:print_v, [expr(args[0])])   # no newline
       elsif n.name == :Integer && n.receiver.nil? && args.size == 1
-        emit(:to_i, [expr(args[0])])      # Integer(x): the parse, no exception on junk (yet)
+        r = emit(:to_i, [expr(args[0])]); r.strict = true; r # Integer("junk") raises ArgumentError (Types: a String goes to __kernel_integer)
       elsif n.name == :Integer && n.receiver.nil? && args.size == 2 then expr(n.copy(name: :to_i, receiver: args[0], arguments: n.arguments.copy(arguments: [args[1]]))) # Integer("1f", 16)
       elsif n.name == :Float && n.receiver.nil? && args.size == 1 then emit(:to_f, [expr(args[0])])
       elsif n.name == :String && n.receiver.nil? && args.size == 1 then to_s(expr(args[0]))

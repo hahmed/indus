@@ -368,6 +368,19 @@ module Indus
                 i.block.insts.insert(i.block.insts.index(i), c); i.args[1] = c; changed = true
               end
               dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
+              # a shift whose count is not known to be in range (negative counts shift the other way; a left shift past 63 bits
+              # is a Bignum in Ruby): the helper decides at run time. The library (`__*`) shifts are written in range.
+              if %i[shl shr].include?(i.op) && !i.raw_shift && !f.name.to_s.start_with?("__") && of(f, i.args[0]) == :int && of(f, i.args[1]) == :int
+                n = i.args[1]
+                safe_count = n.op == :const && n.args[0].is_a?(Integer) && (0...63).cover?(n.args[0])
+                safe = safe_count && (i.op == :shr || i.args[0].op == :const && i.args[0].args[0].is_a?(Integer) && (i.args[0].args[0] << n.args[0]).bit_length < 63 || i.args[0].op == :and && i.args[0].args[1].op == :const && (i.args[0].args[1].args[0].bit_length + n.args[0]) < 63)
+                unless safe
+                  i.args = [fn(i.op == :shl ? :__int_shl : :__int_shr), *i.args]; i.op = :call; i.ty = :int; changed = true
+                end
+              end
+              if i.op == :to_i && i.strict && of(f, i.args[0]) == :str # Kernel#Integer(str): strict parse, ArgumentError on junk
+                i.op = :call; i.args = [fn(:__kernel_integer), i.args[0]]; i.ty = :int; changed = true
+              end
               if i.op == :lshift_or_append && of(f, i.args[0]) == :dyn && @settled # v << x on a dynamic receiver: decided at run time
                 # the result must land back in the receiver's home (a local, ivar, element store); an append whose result nobody
                 # keeps (`h.first[1] << "!"`) would be lost when the value is a String (strings are values here, aliasing is not)

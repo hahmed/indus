@@ -9,6 +9,8 @@ module Indus
     attr_accessor :nocheck # an add/sub/mul whose range analysis proves it cannot overflow
     attr_accessor :nonneg # a div/mod whose operands are provably non-negative: no floor fix-up
     attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home, :uses
+    attr_accessor :strict # to_i from Kernel#Integer: junk raises
+    attr_accessor :raw_shift # a shift the helper itself performs (count already checked)
     attr_reader :id
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)
