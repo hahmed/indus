@@ -42,13 +42,28 @@ module Indus
   # require_relative "x" / require "./x" splice the file in, once, where the call is (a
   # program is one compilation unit). require of a library name: a few are built in (set is
   # a prelude class; json/time... are not), the rest refuse with the name.
-  BUILTIN_LIBS = %w[set].freeze
+  BUILTIN_LIBS = %w[set].freeze # the prelude's own versions
+  # `require "x"` resolves like CRuby: the prelude's builtins, then the pure-Ruby standard library
+  # (RbConfig's rubylibdir) and $LOAD_PATH entries (INDUS_LOAD_PATH, colon-separated). The library
+  # is compiled as user code: the compiler takes it or refuses at a line.
+  def self.load_path
+    @load_path ||= begin
+      require "rbconfig"
+      gems = Dir[File.join(Gem.default_dir, "gems", "*", "lib")].sort # the bundled gems' pure-Ruby parts (abbrev, benchmark, ostruct, erb, ...)
+      # lib/indus/stdlib first: Indus's own versions of files CRuby generates or implements in C (rbconfig, ...)
+      (ENV["INDUS_LOAD_PATH"].to_s.split(":") + [File.join(__dir__, "indus", "stdlib"), RbConfig::CONFIG["rubylibdir"], *gems]).reject(&:empty?)
+    end
+  end
   def self.expand_requires(src, dir, seen = {})
-    src.gsub(/^[ \t]*require(_relative)?[ (]\s*["']([^"']+)["']\)?[ \t]*$/) do
+    src.gsub(/^[ \t]*require(_relative)?[ (]\s*["']([^"']+)["']\)?[ \t]*(?:#.*)?$/) do
       rel, name = $1, $2
       if !rel && !name.start_with?(".", "/")
         next "" if BUILTIN_LIBS.include?(name)
-        raise "require '#{name}': only files (require_relative) and #{BUILTIN_LIBS.join(', ')} are available; no load path"
+        found = load_path.map { |d| File.join(d, name.end_with?(".rb") ? name : "#{name}.rb") }.find { File.exist?(_1) }
+        raise "require '#{name}': not found in the prelude or on the load path (#{load_path.join(':')}); C extensions are not available" unless found
+        next "" if seen[found]
+        seen[found] = true
+        next "# -- #{found}\n" + expand_requires(File.read(found), File.dirname(found), seen) + "\n"
       end
       path = File.expand_path(name.end_with?(".rb") ? name : "#{name}.rb", dir)
       raise "#{rel ? 'require_relative' : 'require'} '#{name}': no such file #{path}" unless File.exist?(path)

@@ -1,0 +1,26 @@
+#!/usr/bin/env ruby
+# test/stdlib : compile CRuby's own pure-Ruby standard library, one `require` at a time, and group
+# the first refusal of each. The library is the test suite: nothing to write, everything real.
+require "open3"; require "rbconfig"
+ROOT = File.expand_path("..", __dir__)
+libdir = RbConfig::CONFIG["rubylibdir"]
+gemlibs = Dir[File.join(Gem.default_dir, "gems", "*", "lib")]
+names = (Dir["#{libdir}/*.rb"].map { File.basename(_1, ".rb") } +
+         gemlibs.flat_map { |d| Dir["#{d}/*.rb"].map { File.basename(_1, ".rb") } }).uniq.sort
+skip = %w[mkmf rubygems bundler irb debug rdoc typeprof repl_type_completor racc rake power_assert test-unit minitest net-ftp net-imap net-pop net-smtp syslog win32ole fiddle openssl readline reline ripper socket zlib io/console objspace coverage]
+names -= skip
+names = ARGV unless ARGV.empty?
+res = names.map do |n|
+  src = "require \"#{n}\"\nputs :ok\n"
+  out, _ = Open3.capture2e({ "INDUS_HEAP_MB" => "64" }, "timeout", "-k", "1", "60", "#{ROOT}/bin/indus", "-e", src)
+  out = out.scrub
+  if out.start_with?("ok") then [n, :ok, nil]
+  else
+    line = out.lines.find { _1 =~ /Error|BUG|unsupported|unknown|not supported|not found/ }.to_s
+    msg = line.sub(/\A.*?\.rb:\d+:in '[^']*': /, "").sub(/ \(\/[^)]*\)/, "").sub(/\(RuntimeError\)|\(NoMethodError\)/, "").gsub(/\d+/, "N").strip[0, 90]
+    [n, :fail, msg.empty? ? "(no output)" : msg]
+  end
+end
+ok = res.count { _2 == :ok }
+puts "#{ok}/#{res.size} libraries compile: #{res.select { _2 == :ok }.map(&:first).join(' ')}"
+res.select { _2 == :fail }.group_by(&:last).sort_by { -_2.size }.each { |m, fs| puts "\n#{fs.size}x #{m}"; fs.each { puts "    #{_1[0]}" } }
