@@ -311,7 +311,7 @@ module Indus
                   if v.op == :onew # certainly an object
                     c = Inst.new(:mcall, [want, v]); c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); bind(f, c)
                   else # the slot may hold nil (the 0 word): "nil", else the object's own method
-                    c = split_on_nil(f, i, v, "nil") { |ob| m = Inst.new(:mcall, [want, v]); m.block = ob; ob.insts << m; bind(f, m); m }
+                    c = split_on_nil(f, i, v, i.op == :p_v ? "nil" : "") { |ob| m = Inst.new(:mcall, [want, v]); m.block = ob; ob.insts << m; bind(f, m); m } # puts nil is a blank line
                   end
                 else
                   c = Inst.new(:sconst, ["#<#{cs.first}>"]); c.ty = :str; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)

@@ -535,7 +535,8 @@ module Indus
       check_default_hash_args(args)
       # the receiver's class unknown: candidates are user classes (the library's own classes -- MatchData, Set, exceptions --
       # take arguments as the builtin families do; packing a *rest for them would mis-shape a Hash#values_at(:a, :b))
-      cands = klass ? [klass.find_method(n.name)].compact : @classes.values.reject { |k| prelude_class?(k) }.filter_map { |k| k.methods[n.name] }
+      return args.map { expr(_1) } if klass.nil? && n.receiver && (bk = kind_of(n.receiver)) && (bk == :hash || bk == :array || bk == :str || bk == :int || bk == :float || bk == :range) # a builtin receiver: its methods take arguments as given
+      cands = klass ? [klass.find_method(n.name)].compact : @classes.values.filter_map { |k| k.methods[n.name] }
       cands = cands.select { @defs_by_func[_1] }
       needs = args.last.is_a?(Prism::KeywordHashNode) || cands.any? { |f| f.rest || @defs_by_func[f].parameters&.then { |ps| ps.optionals.any? || ps.keywords.any? || ps.keyword_rest.is_a?(Prism::KeywordRestParameterNode) } }
       return args.map { expr(_1) } unless needs
