@@ -106,10 +106,17 @@ module Indus
     Unit.new(asm.resolve!, asm, lower, funcs)
   end
 
-  def self.diff_tables((iv0, c0), (iv1, c1))
+  def self.ivars_in(node, out = [])
+    return out unless node.is_a?(Prism::Node)
+    out << node.name if node.is_a?(Prism::InstanceVariableReadNode) || node.is_a?(Prism::InstanceVariableWriteNode) || node.is_a?(Prism::InstanceVariableOrWriteNode) || node.is_a?(Prism::InstanceVariableOperatorWriteNode) || node.is_a?(Prism::InstanceVariableAndWriteNode)
+    node.compact_child_nodes.each { ivars_in(_1, out) }
+    out.uniq
+  end
+
+  def self.diff_tables((iv0, c0), (iv1, c1), typed_only = false)
     out = []
-    iv1.each { |k, h| h.each { |ix, t| out << "#{k} ivar #{ix}: #{iv0.dig(k, ix).inspect} -> #{t.inspect}" if iv0.dig(k, ix) != t } }
-    c1.each { |k, t| out << "#{k}: #{c0[k].inspect} -> #{t.inspect}" if c0[k] != t }
+    iv1.each { |k, h| h.each { |ix, t| out << "#{k} ivar #{ix}: #{iv0.dig(k, ix).inspect} -> #{t.inspect}" if iv0.dig(k, ix) != t && !(typed_only && iv0.dig(k, ix).nil?) } }
+    c1.each { |k, t| out << "#{k}: #{c0[k].inspect} -> #{t.inspect}" if c0[k] != t && !(typed_only && c0[k].nil?) }
     out.join(", ")
   end
 
@@ -119,27 +126,59 @@ module Indus
   def self.compile_method(unit, base, klass, d)
     old = klass.find_method(d.name) or raise "class_eval at run time: #{klass.name}##{d.name} is new; only a method the program already has can be redefined (nothing could call a new one)"
     old = old.primary || old
+    ivars_in(d).each { |iv| klass.claim_spare(iv) unless klass.ivars.include?(iv) } # a new ivar: a spare slot
     f = unit.lower.lower_method(klass, d, old)
     Passes.trivial_phis(f)
+    # library functions the new code needs that the program never did: compiled into the same blob (typed already; pruned before)
+    callees = ->(g) { g.all.flat_map { |i| i.op == :call || i.op == :zcheck ? [i.args[0]] : i.op == :pcall || i.op == :sendsw ? i.args[0].filter_map { _2 == :call ? _3 : nil } : i.op == :dsend ? i.args.grep(Func) : [] }.uniq }
+    # typing turns method calls into library calls, which may need further library functions: to a fixpoint
+    extra = []
     before = Types.snapshot
-    Types.run([f], unit.lower.classes)
-    after = Types.snapshot
-    if before != after # world-age, type edition: dependents would need recompiling
-      raise "redefinition of #{klass.name}##{d.name} changes a type the program was compiled against (#{diff_tables(before, after)}); not supported yet"
+    loop do
+      Types.run([f, *extra], unit.lower.classes)
+    if f.rtype == :dyn && old.rtype != :dyn # the callers expect the old return type: narrow at every return (a trap when the value is something else)
+        conv = { int: :__dyn_int, int?: :__dyn_int, str: :__dyn_str, float: :__dyn_float }[old.rtype] or raise "redefinition of #{klass.name}##{d.name} returns a dynamic value where the program expects #{old.rtype.inspect}; not supported yet"
+        cf = unit.lower.demand(conv)
+        f.blocks.each do |b|
+          b.insts = b.insts.flat_map do |i|
+            next [i] unless i.op == :ret
+            c = Inst.new(:call, [cf, i.args[0]]); c.ty = old.rtype; c.block = b
+            i.args[0] = c; [c, i]
+          end
+        end
+        f.rtype = old.rtype
+      end
+      work = [f, *extra].flat_map(&callees); added = false
+      until work.empty?
+        g = work.pop
+        next if extra.include?(g) || unit.funcs.include?(g) || g.equal?(f)
+        raise "redefinition of #{klass.name}##{d.name} calls #{g.name}, which has no body in this program" if g.blocks.empty?
+        extra << g; added = true; work.concat(callees.(g))
+      end
+      break unless added
     end
-    Passes.run(f)
-    Peephole.run(f) unless ENV["NOPEEP"]
-    GC.mark_allocators(unit.funcs + [f])
-    Escape.run([f], unit.lower.classes) unless ENV["NOESCAPE"]
+    after = Types.snapshot
+    # world-age, type edition: a slot the program typed and compiled against cannot change (dependents would need
+    # recompiling). A slot never typed (nil: no code ever wrote it) may take a type now -- its only readers are new.
+    unless (bad = diff_tables(before, after, true)).empty?
+      raise "redefinition of #{klass.name}##{d.name} changes a type the program was compiled against (#{bad}); not supported yet"
+    end
+    [f, *extra].each { Passes.run(_1) }
+    [f, *extra].each { Peephole.run(_1) unless ENV["NOPEEP"] }
+    extra.each { Ranges.run(_1) unless ENV["NORANGES"] }
+    GC.mark_allocators(unit.funcs + [f, *extra])
+    Escape.run(unit.funcs + [f, *extra], unit.lower.classes) unless ENV["NOESCAPE"] # the callees' summaries are needed
     raise "redefinition changed #{f.name}'s signature" unless f.ptypes == old.ptypes && f.rtype == old.rtype
     asm = Asm.new
     asm.gc_table = unit.asm.gc_table
     asm.write_addr = Metal::LIBC["write"].to_i
+    asm.mmap_addr = unit.asm.mmap_addr; asm.munmap_addr = unit.asm.munmap_addr; asm.libm = unit.asm.libm; asm.os = unit.asm.os
     asm.externs = unit.asm.labels.transform_values { base + _1 * 4 }
     asm.instance_variable_set(:@globals, unit.globals) # same slots
     f.name = :"#{old.name}@#{unit.seams.size}" # fresh label
     asm.label(:__text_base)
-    Codegen.new(asm, unit.lower.classes).func(f)
+    $stderr.puts f.dump if ENV["DUMP"]
+    [f, *extra].each { Codegen.new(asm, unit.lower.classes).func(_1) }
     asm.emit_overflow_trap            # checked arithmetic branches here (b.vs is pc-relative: per unit)
     asm.emit_gc_tables if GC.enabled? # this unit's frame maps, with the (grown) type table
     code = asm.resolve!

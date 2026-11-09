@@ -609,17 +609,19 @@ module Indus
           @asm.call_write
         when :condbr
           c, t, e = i.args
+          raise "#{@f.name}: condbr on a cmp without a condition: #{c}" if c.op == :cmp && !c.cond
           nb = next_block(b)
           if phi_pending?(b, t) || phi_pending?(b, e)
             # a successor's phi takes a value from this block: the copies belong to that edge only. Emitted
             # before the branch they would run on the other edge too and clobber a register live there.
             lf = phi_pending?(b, e) ? @asm.uniq : lbl(e)
-            if c.op == :cmp && fused?(c) then @asm.bcond(Asm::INV[c.cond], lf)
+            if c.op == :cmp && fused?(c) then (raise "#{@f.name}: cmp without a condition: #{c}" unless c.cond; @asm.bcond(Asm::INV[c.cond], lf))
             elsif c.ty == :dyn then r = reg(c); @asm.cbz(r, lf); @asm.cmpi(r, 10); @asm.bcond(:eq, lf)
             else @asm.cbz(reg(c), lf) end
             phi_moves(b, t); @asm.b(lbl(t))
             if phi_pending?(b, e) then @asm.label(lf); phi_moves(b, e); @asm.b(lbl(e)) end
           elsif c.op == :cmp && fused?(c)
+            raise "#{@f.name}: cond #{c.cond.inspect} unknown in #{c}" unless Asm::COND[c.cond]
             if nb == e then @asm.bcond(c.cond, lbl(t))
             else @asm.bcond(Asm::INV[c.cond], lbl(e)); @asm.b(lbl(t)) unless nb == t end
           elsif c.ty == :dyn # nil (0) and false (10) are the falsy words

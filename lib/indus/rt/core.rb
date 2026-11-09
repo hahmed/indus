@@ -768,6 +768,19 @@ def __str_sum(s)
   t % 65536
 end
 
+# v << x on a dynamic receiver: an Array grows in place; a String yields the appended string (its home takes the result)
+def __dyn_push(v, x)
+  t = __tag(v)
+  if t == 4
+    a = __unbox_arr(v)
+    a.push(x)
+    return __box_arr(a) # the array may have moved as it grew: the home takes the new handle
+  end
+  return __box_str(__unbox_str(v) + __dyn_str(x)) if t == 2
+  __trap
+  v
+end
+
 def __dyn_length(v)
   t = __tag(v)
   return __unbox_str(v).length if t == 2

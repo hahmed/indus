@@ -77,6 +77,7 @@ module Indus
       # function against the tables the whole program built
       @ivars ||= Hash.new { |h, k| h[k] = {} } # class name -> ivar index -> type
       classes.each_value { |k| (k.nullable_ivars || []).each { |iv| ix = k.ivars.index(iv); @ivars[k.name][ix] = join(@ivars[k.name][ix], :nil) if ix } } # @x ||= v: nil until then
+      classes.each_value { |k| (k.dyn_ivars || []).each { |iv| ix = k.ivars.index(iv); @ivars[k.name][ix] = :dyn if ix } } # spare slots: dyn by decree
       @consts ||= {}
       @funcs_live = funcs
       funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = self_type(f.cls) if f.cls }
@@ -348,11 +349,16 @@ module Indus
                 when :dyn then i.op = :call; i.args = [fn(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true
                 end
               end
-              if %i[sappend scat bufappend lshift_or_append].include?(i.op) && of(f, i.args[1]) == :dyn # must be a String at run time
+              if %i[sappend scat bufappend lshift_or_append].include?(i.op) && of(f, i.args[1]) == :dyn && of(f, i.args[0]) != :dyn # must be a String at run time (a dyn receiver decides at run time)
                 c = Inst.new(:call, [fn(:__dyn_str), i.args[1]]); c.ty = :str; c.block = i.block
                 i.block.insts.insert(i.block.insts.index(i), c); i.args[1] = c; changed = true
               end
               dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
+              if i.op == :lshift_or_append && of(f, i.args[0]) == :dyn && @settled # v << x on a dynamic receiver: decided at run time
+                x = i.args[1]
+                unless of(f, x) == :dyn then bx = Inst.new(:box, [x, of(f, x)]); bx.ty = :dyn; bx.block = i.block; i.block.insts.insert(i.block.insts.index(i), bx); x = bx end
+                i.op = :call; i.args = [fn(:__dyn_push), i.args[0], x]; i.ty = :dyn; changed = true
+              end
               if %i[idx idx_set].include?(i.op) && of(f, i.args[0]) == :dyn && of(f, i.args[1]) # v[k] / v[k] = x on a tagged value: by tag at run time (string, array or hash)
                 kt = of(f, i.args[1])
                 if kt != :int && kt != :int? && kt != :dyn # a non-integer key: a hash (a tagged key is decided at run time)
@@ -1568,7 +1574,7 @@ module Indus
           when :add, :sub, :mul, :div, :cmp, :mod
             if i.args.any? { of(f, _1) == :float }
               i.args.map! { |v| %i[int int?].include?(of(f, v)) ? coerce(f, b, i, v, :float) : v }
-              i.cond = :"f#{i.cond}" if i.op == :cmp
+              i.cond = :"f#{i.cond}" if i.op == :cmp && !i.cond.to_s.start_with?("f") # idempotent: a function may be typed twice (the resident compiler)
             end
           when :fsqrt then i.args[0] = coerce(f, b, i, i.args[0], :float)
           when :libm then i.args[1..].each_with_index { |v, k| i.args[k + 1] = coerce(f, b, i, v, :float) }

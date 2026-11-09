@@ -40,6 +40,20 @@ module Indus
   class Klass
     attr_reader :name, :ivars, :methods, :readers, :writers
     attr_accessor :nullable_ivars # ivars written only by ||= / &&= somewhere: nil before the first write
+    attr_accessor :dyn_ivars # ivars typed dyn by decree: the spare slots a run-time class_eval may name
+    SPARES = 4
+    # a run-time class_eval may add ivars: reserve dyn-typed spare slots (zero = nil) that the resident compiler names later
+    def reserve_spares
+      return if @spare_base
+      @spare_base = @ivars.size
+      SPARES.times { |i| ivar(:"@__spare#{i}"); (@dyn_ivars ||= []) << :"@__spare#{i}" }
+    end
+    # the resident compiler names a new ivar: it takes the next spare slot
+    def claim_spare(name)
+      ix = @ivars.index { _1.to_s.start_with?("@__spare") } or raise "#{@name} has no room for a new ivar #{name} (#{SPARES} spare slots per class_eval'd class)"
+      @dyn_ivars[@dyn_ivars.index(@ivars[ix])] = name; @ivars[ix] = name
+      ix
+    end
     attr_accessor :hidden # method name -> true when private/protected (respond_to? is false; calls still resolve)
     attr_accessor :superclass, :tagged, :boxed, :id, :closure, :mixins, :enumerable, :outer # outer: the class a closure's self belongs to # closure: a lambda literal's anonymous class; mixins: modules included/prepended here
     def initialize(name, superclass = nil)

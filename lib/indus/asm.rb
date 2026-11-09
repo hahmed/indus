@@ -212,7 +212,7 @@ module Indus
     attr_accessor :seams # [[klass, src], ...] in id order
     def blr(rn) = (@ncalls = (@ncalls || 0) + 1; emit(0xD63F0000 | (rn << 5)))
     def ret = emit(0xD65F03C0)
-    def adr(rd, n) = (fix(n, :adr); emit(0x10000000 | rd))
+    def adr(rd, n) = externs&.key?(n) && !@labels.key?(n) ? mov_imm(rd, externs[n]) : (fix(n, :adr); emit(0x10000000 | rd)) # an address in another unit: absolute
     def stp(t1, t2, off) = t2 ? emit(0xA9000000 | ((off / 8) << 15) | (t2 << 10) | (31 << 5) | t1) : str(t1, off)
     def ldp(t1, t2, off) = t2 ? emit(0xA9400000 | ((off / 8) << 15) | (t2 << 10) | (31 << 5) | t1) : ldr(t1, off)
     def str(t, off) = emit(0xF9000000 | ((off / 8) << 10) | (31 << 5) | t)

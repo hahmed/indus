@@ -1697,6 +1697,8 @@ module Indus
         # a computed string: the code arrives at run time. Every method of the class becomes redefinable (a slot
         # each); the resident compiler parses, types and compiles the string's defs against the running program.
         k.methods.each_value { |m| m.patchable = true unless m.primary }
+        raise "class_eval with a run-time string on #{k.name}, which has subclasses: not supported (new ivars would need room in every subclass)" if @classes.each_value.any? { _1.superclass.equal?(k) }
+        k.reserve_spares # a new ivar named by the string takes a spare slot (dyn-typed)
         emit(:seam, [k, nil, expr(src)])
       elsif n.name == :sqrt && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
         emit(:fsqrt, [expr(args[0])])
