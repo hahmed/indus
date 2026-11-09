@@ -1138,6 +1138,16 @@ module Indus
       end
     end
 
+    # a string known at compile time: a literal, a heredoc, or an interpolation of literals and constants
+    def literal_string(node)
+      case node
+      when Prism::StringNode then node.unescaped
+      when Prism::InterpolatedStringNode
+        parts = node.parts.map { |pt| pt.is_a?(Prism::StringNode) ? pt.unescaped : (pt.is_a?(Prism::EmbeddedStatementsNode) && pt.statements.body.size == 1 && pt.statements.body[0].is_a?(Prism::StringNode) ? pt.statements.body[0].unescaped : nil) }
+        parts.all? ? parts.join : nil
+      end
+    end
+
     # defs nested below the hoisted positions: inside methods, conditionals, blocks, class_eval blocks.
     # Each is a version of the method on the lexically enclosing class (nil: the top level).
     def collect_nested_defs(node, owner, out, top_level: false)
@@ -1161,6 +1171,12 @@ module Indus
       when Prism::CallNode
         if node.name == :class_eval && node.receiver.is_a?(Prism::ConstantReadNode) && node.block.is_a?(Prism::BlockNode) # X.class_eval { def ... }: defs on X
           (node.block.body&.body || []).each { |st| out << [node.receiver.name, st] if st.is_a?(Prism::DefNode) }
+          return
+        end
+        if %i[class_eval module_eval].include?(node.name) && node.receiver.is_a?(Prism::ConstantReadNode) && (lit = literal_string(node.arguments&.arguments&.first))
+          # X.class_eval "def ..." with a literal: known at compile time, the same as a block
+          (@eval_parsed ||= {})[node] = Lower.normalize(Prism.parse(lit).value).statements.body
+          @eval_parsed[node].each { |st| out << [node.receiver.name, st] if st.is_a?(Prism::DefNode) }
           return
         end
         return if struct_new?(node) || node.name == :define_method # Struct.new/Data.define bodies are class bodies (registered with the struct); define_method blocks are methods
@@ -1566,6 +1582,12 @@ module Indus
       elsif n.name == :class_eval && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name] && n.block.is_a?(Prism::BlockNode)
         (n.block.body&.body || []).each { |st| expr(st) if st.is_a?(Prism::DefNode) } # X.class_eval { def m ... }: versions written here
         nil_const
+      elsif %i[class_eval module_eval].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name] && @eval_parsed&.key?(n)
+        @eval_parsed[n].each { |st| st.is_a?(Prism::DefNode) ? expr(st) : nil } # a literal string: its defs' slot writes here (other statements in it: ignored)
+        nil_const
+      elsif n.name == :eval && n.receiver.nil? && args.size == 1 # eval "literal": the code, compiled here
+        lit = literal_string(args[0]) or raise "eval of a computed string: the resident compiler for arbitrary code is not available yet (a literal string compiles in place)"
+        Lower.normalize(Prism.parse(lit).value).statements.body.map { expr(_1) }.last || nil_const
       elsif n.name == :class_eval && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name]
         # a puncture: the methods this string defines can change at run time.
         # They are called through a slot from here on; nothing else changes.
