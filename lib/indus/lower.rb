@@ -1407,6 +1407,13 @@ module Indus
       # a method taking &blk on self or on an object of a known class, called with a block literal: the block is a closure value
       if n.block.is_a?(Prism::BlockNode)
         mk = n.receiver.nil? ? @klass : ((kd = kind_of(n.receiver)).is_a?(Symbol) ? @classes[kd] : nil)
+        if n.receiver.is_a?(Prism::ConstantReadNode) && (sf = @funcs[:"#{n.receiver.name}.#{n.name}"]) && (d = @defs_by_func[sf]) && d.parameters&.block && (iek = ie_target(sf))
+          # Owner.m { ... } where m does obj.instance_eval(&blk): the block's self is that object (its class is known)
+          blk = n.block
+          params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+          c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [], ie_self: iek)
+          return emit(:call, [sf, *call_args(sf, args), c])
+        end
         if mk.nil? && n.receiver && !n.receiver.is_a?(Prism::ConstantReadNode) && !ENUMERABLE.include?(n.name) && !%i[each each_with_index times upto downto step each_char each_byte each_line each_pair each_key each_value loop fetch].include?(n.name) # a receiver of unknown class: every user class defining the method takes a block the same way
           cands = @classes.values.filter_map { |k| k.methods[n.name] }.select { @defs_by_func[_1] && !_1.cls.name.to_s.start_with?("__") }
           mk = cands[0].cls if !cands.empty? && cands.all? { |mf| @defs_by_func[mf].parameters&.block }
@@ -1414,7 +1421,7 @@ module Indus
         if mk && (mf = mk.find_method(n.name)) && (d = @defs_by_func[mf]) && d.parameters&.block
           blk = n.block
           params = blk.parameters&.parameters&.requireds&.map(&:name) || []
-          c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
+          c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [], ie_self: ie_target(mf))
           rv = n.receiver ? expr(n.receiver) : me_val
           return emit(:mcall, [n.name, rv, *method_args(mf, args, rv), c])
         end
@@ -1428,11 +1435,11 @@ module Indus
         tp = Prism::CallNode.new(src, 0, loc, 0, n.block.expression, nil, :to_proc, nil, nil, nil, nil, nil, nil)
         return expr(n.copy(block: n.block.copy(expression: tp)))
       end
-      if n.block.is_a?(Prism::BlockArgumentNode) # m(&b): the block is already a value; m(&) forwards this method's own block
+      if n.block.is_a?(Prism::BlockArgumentNode) && !(%i[instance_eval instance_exec].include?(n.name) && n.block.expression) # m(&b): the block is already a value; m(&) forwards this method's own block
         bv = n.block.expression ? expr(n.block.expression) : @locals.fetch(@block_param || :__blk) { raise "anonymous & outside a method taking a block" }
         return block_arg_call(n, args, bv)
       end
-      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash) && !(%i[class_eval class_exec].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode)) && !(n.name == :define_method && @define_method_defs&.key?(n)) && !(%i[instance_eval instance_exec].include?(n.name) && n.receiver) && !@singletons&.key?(n) && !@send_rewrites&.key?(n)
+      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash) && !(%i[class_eval class_exec].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode)) && !(n.name == :define_method && @define_method_defs&.key?(n)) && !(%i[instance_eval instance_exec].include?(n.name) && (n.receiver || n.block.is_a?(Prism::BlockArgumentNode))) && !@singletons&.key?(n) && !@send_rewrites&.key?(n)
       if n.name == :<< && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] && args.size == 1 # obj << v: the class's own method
         rv = expr(n.receiver)
         return emit(:mcall, [:<<, rv, expr(args[0])])
@@ -1731,6 +1738,11 @@ module Indus
           when :instance_variable_set then (k.ivar(iv); v = expr(args[1]); emit(:fld_set, [rv, k.ivar(iv), v]); v)
           else (c = const(k.ivars.include?(iv) ? 1 : 0); c.ty = :bool; c) end
         end
+      elsif %i[instance_eval instance_exec].include?(n.name) && n.block.is_a?(Prism::BlockArgumentNode) && n.block.expression
+        # obj.instance_eval(&blk): the block was compiled with self = obj's class (ie_target at its call site); field 0 of the closure takes obj
+        rv = n.receiver ? expr(n.receiver) : me_val; bv = expr(n.block.expression)
+        emit(:fld_set, [bv, 0, rv])
+        emit(:mcall, [:call, bv, *args.map { expr(_1) }])
       elsif (sub = @singletons&.[](n)) # x.extend(M) / x.define_singleton_method: the object joins the hidden subclass
         rv = expr(n.receiver); emit(:retag, [rv, sub]); rv
       elsif n.name == :define_method && (d = @define_method_defs&.[](n)) # a run-time define_method site: the slot write
@@ -2903,22 +2915,41 @@ module Indus
       closure_value(params, captured, n.body&.body || [])
     end
 
-    def closure_value(params, captured, stmts)
+    def closure_value(params, captured, stmts, ie_self: nil)
       @lambda_count = (@lambda_count || 0) + 1
       k = @classes[:"__lambda#{@lambda_count}"] = Klass.new(:"__lambda#{@lambda_count}")
       k.id = @classes.size; k.closure = true
+      if ie_self # the block will be instance_eval'd: its self is an object of that class, stored into field 0 at the instance_eval site
+        k.outer = ie_self; k.ivar(:@__self); k.ie_self = true
+      end
       captured.each { k.ivar(:"@#{_1}") }
       outer_self = @klass && !@klass.closure ? @klass : (@klass&.closure ? @klass.outer : nil)
       outer_self = nil if @owner # module singleton methods have no instance
-      if outer_self && @locals.key?(lname(:self)) && refers_to_self_plain?(stmts) # the enclosing object rides along as a capture
+      if !ie_self && outer_self && @locals.key?(lname(:self)) && refers_to_self_plain?(stmts) # the enclosing object rides along as a capture
         k.outer = outer_self; k.ivar(:@__self)
       end
       f = Func.new(:"#{k.name}#call", 1 + params.size); f.cls = k; k.methods[:call] = f
       (@deferred_lambdas ||= []) << [k, f, params, captured, stmts, captured.select { shared?(_1) }]
       o = emit(:onew, [k])
       captured.each { |nm| emit(:fld_set, [o, k.ivar(:"@#{nm}"), @locals.fetch(lname(nm))]) } # a shared capture stores its cell
-      emit(:fld_set, [o, k.ivar(:@__self), me_val]) if k.outer
+      emit(:fld_set, [o, k.ivar(:@__self), me_val]) if k.outer && !k.ie_self
       o
+    end
+
+    # the class whose objects a method's &blk is instance_eval'd on: `x.instance_eval(&blk)` in the body, x of the owner's class
+    def ie_target(f)
+      d = @defs_by_func[f] or return nil
+      bp = d.parameters&.block&.name or return nil
+      found = nil
+      walk = lambda do |node|
+        next unless node.is_a?(Prism::Node)
+        if node.is_a?(Prism::CallNode) && %i[instance_eval instance_exec].include?(node.name) && node.block.is_a?(Prism::BlockArgumentNode) && node.block.expression.is_a?(Prism::LocalVariableReadNode) && node.block.expression.name == bp
+          found = node # receiverless: self
+        end
+        node.compact_child_nodes.each { walk.(_1) }
+      end
+      walk.(d.body)
+      found ? f.cls || @classes[f.name.to_s.split(".")[0].to_sym] : nil
     end
 
     def free_locals(node, bound, out = []) = free_locals_plain(node, bound, out)

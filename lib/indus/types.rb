@@ -439,6 +439,11 @@ module Indus
             case i.op
             when :call
               callee = i.args[0]
+              # a hash printed before its keys were known (a writer typed after settle): the variant follows the key type
+              if %i[__hash_inspect __hash_inspect_sym __hash_inspect_dyn].include?(callee.name) && (ht = of(f, i.args[1])) && hsh(ht) && ht[1]
+                want = ht[1] == :sym ? :__hash_inspect_sym : ht[1] == :dyn ? :__hash_inspect_dyn : :__hash_inspect
+                if callee.name != want then callee = i.args[0] = fn(want); changed = true end
+              end
               if generic?(callee) && clashes?(callee, i.args[1..].map { of(f, _1) }) # a call rewritten into a generic this very visit
                 callee = i.args[0] = instance_for(callee, i.args[1..].map { of(f, _1) }, funcs); changed = true
                 # the old callee's result shaped this value and (inside a generic) this function's result; both re-derive
@@ -538,6 +543,10 @@ module Indus
                 if cur.nil? || join(cur, nt) != cur
                   h = h.args[0] while h.op == :hset
                   h.op == :param ? f.ptypes[f.params.index(h)] = join(cur, nt) : h.ty = join(cur, nt); changed = true
+                end
+                h = h.args[0] while h.op == :hset
+                if h.op == :fld_get && (k = of(f, h.args[0])) && !poly?(k) && @classes[k] && (it = @ivars[k][h.args[1]]) != (jt = join(it, join(cur, nt))) # the field's hash widens too: the read is recomputed from the table each round
+                  @ivars[k][h.args[1]] = jt; changed = true
                 end
               end
             when :fld_set
@@ -867,7 +876,7 @@ module Indus
         t = of(f, i.args[0]); yield i.args[2], t[1] if arr(t)
       when :hset
         t = of(f, i.args[0]); (yield i.args[1], t[1]; yield i.args[2], t[2]) if hsh(t)
-      when :fld_set then yield i.args[2], ivar_type(of(f, i.args[0]), i.args[1])
+      when :fld_set then (k = of(f, i.args[0])) && (yield i.args[2], ivar_type(k, i.args[1]))
       when :cell_set then (t = of(f, i.args[0])) && cell?(t) && (yield i.args[1], t[1])
       when :gset then yield i.args[1], @consts[i.args[0]]
       when :call # a generic prelude function takes an instance per container type: no widening of the argument towards another caller's shape

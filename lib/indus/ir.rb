@@ -41,6 +41,7 @@ module Indus
     attr_reader :name, :ivars, :methods, :readers, :writers
     attr_accessor :nullable_ivars # ivars written only by ||= / &&= somewhere: nil before the first write
     attr_accessor :dyn_ivars # ivars typed dyn by decree: the spare slots a run-time class_eval may name
+    attr_accessor :ie_self # a closure whose self (field 0) is set by instance_eval at the call
     SPARES = 4
     # a run-time class_eval may add ivars: reserve dyn-typed spare slots (zero = nil) that the resident compiler names later
     def reserve_spares
