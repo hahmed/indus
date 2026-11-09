@@ -360,7 +360,13 @@ module Indus
                 when :str then i.op = :str_or_empty; i.ty = :str; changed = true # a nil in a String slot (the 0 word) has to_s ""
                 when :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]; i.ty = :str; changed = true
                 when :bool then i.op = :bool_to_s; changed = true
-                when :dyn then i.op = :call; i.args = [fn(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true
+                when :dyn
+                  users = boxed_user_classes.select { |k| k.find_method(:to_s) }
+                  if users.any? && !i.dyn_split # a user object's own to_s may be behind the tag
+                    v = i.args[0]
+                    split_dyn_object(f, i, v, users) { |un, ib| m = Inst.new(:mcall, [:to_s, un]); m.block = ib; ib.insts << m; m }
+                    i.op = :call; i.args = [fn(:__dyn_to_s), v]; i.ty = :str; changed = true
+                  else i.op = :call; i.args = [fn(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true end
                 end
               end
               if %i[sappend scat bufappend lshift_or_append].include?(i.op) && of(f, i.args[1]) == :dyn && of(f, i.args[0]) != :dyn # must be a String at run time (a dyn receiver decides at run time)
@@ -680,6 +686,10 @@ module Indus
         next unless i.op == :isa
         v, cname = i.args; t = of(f, v)
         want = { Integer: :int, Float: :float, String: :str, Array: :arr, Hash: :hash, Symbol: :sym, NilClass: :nil, TrueClass: :bool, FalseClass: :bool }[cname]
+        if t == :int? && %i[Integer Numeric Comparable NilClass].include?(cname) # a nullable int: the sentinel is nil, anything else an Integer
+          sent = Inst.new(:const, [INT_NIL]); sent.ty = :int; sent.block = i.block; i.block.insts.insert(i.block.insts.index(i), sent)
+          i.op = :cmp; i.args = [v, sent]; i.cond = cname == :NilClass ? :eq : :ne; i.ty = :bool; next
+        end
         if cname == :Numeric && !t.nil? && t != :dyn && !poly?(t) then i.op = :const; i.args = [%i[int int? float].include?(t) ? 1 : 0]; i.ty = :bool; next end
         if cname == :Comparable && !t.nil? && t != :dyn && !poly?(t) then i.op = :const; i.args = [%i[int int? float str].include?(t) || (t.is_a?(Symbol) && @classes[t] && @classes[t].mixins.include?(:Comparable)) ? 1 : 0]; i.ty = :bool; next end
         if cname == :Object && !t.nil? && t != :dyn then i.op = :const; i.args = [1]; i.ty = :bool; next end
@@ -1198,6 +1208,48 @@ module Indus
       i.ty = fn.rtype
     end
 
+    # the user classes whose objects flow into a tagged (:dyn) slot somewhere in the program (so far): element
+    # stores, fields, globals, arguments, returns, phis -- the places convert will box
+    def self.boxed_user_classes
+      names = {}
+      @funcs_live.each do |g|
+        g.all.each do |i|
+          if i.op == :box then (classes_of(i.args[1]) || []).each { |cn| names[cn] = true }; next end
+          if i.op == :phi
+            next unless i.ty == :dyn
+            i.args.each { |(_, v)| (classes_of(of(g, v)) || []).each { |cn| names[cn] = true } }
+            next
+          end
+          each_flow(g, i) { |v, dest| (classes_of(of(g, v)) || []).each { |cn| names[cn] = true } if dest == :dyn && v.is_a?(Inst) }
+        end
+      end
+      names.keys.flat_map { |cn| related(@classes[cn]) }.uniq.reject(&:closure)
+    end
+
+    # `i` (an mcall on the tagged value `recv`) becomes a branch on the tag: an object (tag 8) is unboxed to the
+    # set of user classes and the block's method call runs on it; anything else keeps `i` as the builtin path.
+    #   before: ... i ...        after: ... condbr -> [dynobj: unbox; yield] / [dynelse: i] -> [dynjoin: phi; ...]
+    def self.split_dyn_object(f, i, recv, users)
+      b = i.block; at = b.insts.index(i)
+      rest = b.insts[(at + 1)..]; b.insts = b.insts[0...at]
+      ob = f.new_block(:dynobj); eb = f.new_block(:dynelse); jb = f.new_block(:dynjoin)
+      jb.insts = rest; rest.each { _1.block = jb }
+      f.blocks.each { |bb| bb.phis.each { |p| p.args.map! { |(pred, v)| [pred.equal?(b) ? jb : pred, v] } } } # edges out of b now leave from the join
+      tg = Inst.new(:dyn_tag, [recv]); tg.ty = :int; b << tg
+      eight = Inst.new(:const, [8]); eight.ty = :int; b << eight
+      c = Inst.new(:cmp, [tg, eight], :eq); c.ty = :bool; b << c
+      b << Inst.new(:condbr, [c, ob, eb])
+      cs = users.map(&:name).sort
+      un = Inst.new(:unbox, [recv, cs.size == 1 ? cs[0] : [:poly, cs]]); un.ty = cs.size == 1 ? cs[0] : [:poly, cs]; ob << un
+      users.each { |k| related(k).each { _1.tagged = true; _1.boxed = true } }
+      r1 = yield(un, ob)
+      ob << Inst.new(:br, [jb])
+      i.block = eb; i.dyn_split = true; eb.insts << i; eb << Inst.new(:br, [jb])
+      ph = jb.phi; ph.args = [[ob, r1], [eb, i]]
+      f.replace_uses(i, ph); ph.args = [[ob, r1], [eb, i]] # replace_uses touched the phi's own operand
+      ph
+    end
+
     # puts/p/inspect of a tagged scalar: the prelude dispatches on the tag
     def self.dyn_print(f, i)
       name = i.op == :inspect_v || i.op == :p_v ? :__dyn_inspect : :__dyn_to_s
@@ -1248,7 +1300,16 @@ module Indus
         i.op = :sconst; i.args = [cn]; i.ty = :str; return
       end
       if t == :str && args.empty? && name == :name then i.op = :nop; i.args = [recv]; i.ty = :str; return end # a class value is its name (no class objects at run time)
-      if t == :dyn && args.empty? && %i[to_s inspect].include?(name) then i.op = :call; i.args = [fn(name == :to_s ? :__dyn_to_s : :__dyn_inspect), recv]; i.ty = :str; return end
+      if t == :dyn && args.empty? && %i[to_s inspect].include?(name)
+        # user classes defining to_s/inspect may be behind the tag: tag 8 (object) dispatches to them, anything else is the builtin
+        return unless @settled # the set of such classes must be final
+        users = boxed_user_classes.select { |k| k.find_method(name) }
+        if users.any? && !i.dyn_split
+          split_dyn_object(f, i, recv, users) { |un, ib| m = Inst.new(:mcall, [name, un]); m.block = ib; ib.insts << m; m }
+          return
+        end
+        i.op = :call; i.args = [fn(name == :to_s ? :__dyn_to_s : :__dyn_inspect), recv]; i.ty = :str; return
+      end
       if t == :dyn && args.empty? && name == :to_sym then i.op = :call; i.args = [fn(:__dyn_sym), recv]; i.ty = :sym; return end
       if t == :dyn && args.empty? && name == :to_i then i.op = :call; i.args = [fn(:__dyn_to_i), recv]; i.ty = :int; return end
       if t == :dyn && args.empty? && name == :to_f then i.op = :call; i.args = [fn(:__dyn_to_f), recv]; i.ty = :float; return end
@@ -1315,7 +1376,7 @@ module Indus
         in [:float, :to_f] then i.op = :nop; i.args = [recv]; i.ty = :float; return
         in [:str, :to_i] then i.op = :stoi; i.args = [recv]; i.ty = :int; return
         in [:str, :to_s] then i.op = :str_or_empty; i.args = [recv]; i.ty = :str; return # a nil in a String slot is the 0 word: its to_s is ""
-        in [:float, :to_s] then i.op = :call; i.args = [fn(:__float_to_s), recv]; i.ty = :str; return
+        in [:float, :to_s] then (return unless @settled || recv.op != :aget && recv.op != :hget && recv.op != :phi); i.op = :call; i.args = [fn(:__float_to_s), recv]; i.ty = :str; return # an element's type may still widen
         in [:int, :chr] then i.op = :chr; i.args = [recv]; i.ty = :str; return
         in [[:arr, *], :pop] then i.op = :apop; i.args = [recv]; return
         else nil

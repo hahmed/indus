@@ -16,8 +16,8 @@ module Indus
     def self.heap?(t) = t.is_a?(Symbol) && !%i[int float nil].include?(t) || (t.is_a?(Array) && %i[arr poly hash].include?(t[0])) # :str and classes are heap
     def self.ty(f, v) = v.op == :param ? f.ptypes[f.params.index(v)] : v.ty
 
-    def self.run(funcs, classes)
-      @classes = classes
+    def self.run(funcs, classes, user_family = nil)
+      @classes = classes; @user_family = user_family
       funcs.each do |f|
         # a patchable method can be replaced by anything at run time: assume it keeps and stores everything
         f.leaks = Array.new(f.params.size, !!f.patchable)       # param k flows somewhere that keeps it
@@ -39,7 +39,26 @@ module Indus
         end
         break unless changed
       end
+      check_aliased_appends(funcs)
       funcs.each { |f| tier0(f) unless ENV["NOTIER0"]; tier1(f) unless ENV["NOTIER1"] || ENV["NOTIER1_FN"] == f.name.to_s }
+    end
+
+    # `s << x` where s came out of a user method that may return one of its arguments or a field it holds
+    # (`def dup = self`, `def name = @n`): in Ruby the append is seen through the other name; strings are
+    # values here, so the program would silently diverge. Refused. (A method returning a fresh string is fine.)
+    def self.check_aliased_appends(funcs)
+      funcs.each do |f|
+        next if f.name.to_s.start_with?("__")
+        f.all.each do |i|
+          next unless %i[sappend bufappend].include?(i.op)
+          o = i.args[0]; o = o.args[0] while %i[sappend bufappend bufderef mkbuf].include?(o.op)
+          next unless o.op == :call && (g = o.args[0]).is_a?(Func) && (!g.name.to_s.start_with?("__") || @user_family&.include?(g.name)) && !g.returns_fresh && o.ty == :str
+          # does g return one of its parameters or a field (an alias), rather than a value it built?
+          aliasing = g.blocks.any? { |b| b.insts.any? { |r| r.op == :ret && (src = r.args[0]; src = src.args[0] while %i[sappend scat str_or_empty nop bufderef].include?(src.op) && !%i[scat].include?(src.op); src.op == :param || src.op == :fld_get || src.op == :aget || src.op == :hget || src.op == :gget) } }
+          next unless aliasing
+          raise "#{f.name}: `<<` on the result of #{g.name}, which returns one of its arguments or a field (the String would be shared with it in Ruby); not supported"
+        end
+      end
     end
 
     # f returns a value it allocated (directly, or through a callee that does) and stored nowhere:

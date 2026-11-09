@@ -11,6 +11,7 @@ module Indus
     attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home, :uses
     attr_accessor :strict # to_i from Kernel#Integer: junk raises
     attr_accessor :raw_shift # a shift the helper itself performs (count already checked)
+    attr_accessor :dyn_split # the builtin arm of a tag branch (Types.split_dyn_object): not split again
     attr_reader :id
     @@n = 0
     def initialize(op, args = [], cond = nil) = (@op, @args, @cond, @id = op, args, cond, @@n += 1)

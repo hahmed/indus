@@ -10,6 +10,7 @@ module Indus
     ARITH = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :% => :mod, :& => :and, :| => :or, :^ => :xor, :<< => :shl, :>> => :shr }
 
     attr_reader :classes, :syms, :funcs
+    attr_reader :user_family_defs # `class String; def dup ... end` bodies, as __str_dup etc.
     # a prelude function's trailing optional parameters: their literal default values (Integer / nil),
     # so a routed call with fewer arguments can be completed at the type level
     def optional_defaults(f)
@@ -136,6 +137,7 @@ module Indus
           body_ = Lower.onto_receiver(st.body, st, :self__)
           defs_extra = Prism::DefNode.new(src, 0, loc, 0, :"__#{fam}_#{st.name.to_s.sub('?', '_p').sub('!', '_bang')}", loc, nil, ps, body_, [:self__] + st.locals, loc, nil, nil, nil, nil, nil)
           body << defs_extra; defs << defs_extra
+          (@user_family_defs ||= []) << defs_extra.name # user code under a library name: the aliasing checks treat it as user code
         end
       end
       mod_ivars = (mods + cdefs).flat_map { |m| (m.body&.body || []).grep(Prism::InstanceVariableWriteNode).map { [m.constant_path.name, _1] } } # `@x = v` in a module or class body: the class object's own ivar, set before the program runs

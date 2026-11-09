@@ -88,7 +88,7 @@ module Indus
     funcs.each { Peephole.run(_1) unless ENV["NOPEEP"] }
     funcs.each { Ranges.run(_1) unless ENV["NORANGES"] } # overflow checks that cannot fire
     GC.mark_allocators(funcs)
-    Escape.run(funcs, lower.classes) unless ENV["NOESCAPE"]
+    Escape.run(funcs, lower.classes, lower.user_family_defs) unless ENV["NOESCAPE"]
     $stderr.puts funcs.map(&:dump) if ENV["DUMP"]
     asm = Asm.new
     asm.gc_table = GC::Table.new(lower.classes)
