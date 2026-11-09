@@ -533,7 +533,9 @@ module Indus
 
     def object_args(n, args, klass, recv = nil)
       check_default_hash_args(args)
-      cands = klass ? [klass.find_method(n.name)].compact : @classes.values.filter_map { |k| k.methods[n.name] }
+      # the receiver's class unknown: candidates are user classes (the library's own classes -- MatchData, Set, exceptions --
+      # take arguments as the builtin families do; packing a *rest for them would mis-shape a Hash#values_at(:a, :b))
+      cands = klass ? [klass.find_method(n.name)].compact : @classes.values.reject { |k| prelude_class?(k) }.filter_map { |k| k.methods[n.name] }
       cands = cands.select { @defs_by_func[_1] }
       needs = args.last.is_a?(Prism::KeywordHashNode) || cands.any? { |f| f.rest || @defs_by_func[f].parameters&.then { |ps| ps.optionals.any? || ps.keywords.any? || ps.keyword_rest.is_a?(Prism::KeywordRestParameterNode) } }
       return args.map { expr(_1) } unless needs
@@ -691,7 +693,7 @@ module Indus
       # nothing matched: run ensure, re-raise (never returns here)
       ensure_body.each { expr(_1) }
       emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc])
-      ends << [@cur, before.dup, const(0)]; emit(:br, [mb])
+      ends << [@cur, before.dup, (c = const(0); c.ty = :nil; c)]; emit(:br, [mb]) # unreachable: a nil joins any arm type without widening it (an int 0 made str arms dyn)
       @cur = mb
       arms_all = [[bend, blocals, bv], *ends]
       @locals = merge_locals(mb, arms_all.map { |(b, l, _)| [b, l] })
@@ -905,7 +907,7 @@ module Indus
       fl << "i" if n.ignore_case?
       raise "regexp /x flag: not supported" if n.extended?
       raise "regexp /m flag: not supported" if n.multi_line?
-      prog, ngroups = Regex.compile(n.unescaped, fl)
+      prog, ngroups, names = Regex.compile(n.unescaped, fl)
       @regexps ||= {}
       key = [n.unescaped, fl]
       gname = (@regexps[key] ||= :"__RE#{@regexps.size}")
@@ -920,7 +922,9 @@ module Indus
       arr = emit(:call, [demand(:__re_decode), emit(:sconst, [bytes])])
       k = @classes.fetch(:Regexp)
       o = emit(:onew, [k])
-      emit(:call, [k.methods.fetch(:initialize), o, arr, const((ngroups + 1) * 2), emit(:sconst, [n.unescaped])])
+      names_v = emit(:anew, [const(ngroups + 1), emit(:sconst, [""])])
+      names.each_with_index { |nm, ix| names_v = emit(:aset, [names_v, const(ix), emit(:sconst, [nm])]) if nm }
+      emit(:call, [k.methods.fetch(:initialize), o, arr, const((ngroups + 1) * 2), emit(:sconst, [n.unescaped]), names_v])
       emit(:gset, [gname, o])
       tend = @cur; emit(:br, [mb])
       @cur = eb; emit(:br, [mb])
@@ -1694,7 +1698,7 @@ module Indus
       elsif %i[match match? scan sub gsub split =~ !~].include?(n.name) && args.size >= 1 && args[0].is_a?(Prism::RegularExpressionNode) && n.receiver && !((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd])
         re = expr(args[0]); sv = expr(n.receiver)
         case n.name
-        when :match then emit(:call, [demand(:__str_match_re), sv, re])
+        when :match then (r = emit(:call, [demand(:__str_match_re), sv, re]); r.routed = :match; r) # Types reroutes when the receiver turns out not to be a String
         when :match? then emit(:call, [demand(:__str_match_p_re), sv, re])
         when :scan then emit(:call, [demand(regexp_groups(args[0]) > 0 ? :__str_scan_groups_re : :__str_scan_re), sv, re])
         when :sub then emit(:call, [demand(:__str_sub_re), sv, re, expr(args[1])])
@@ -1744,6 +1748,12 @@ module Indus
       elsif %i[class_eval module_eval].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name] && @eval_parsed&.key?(n)
         @eval_parsed[n].each { |st| st.is_a?(Prism::DefNode) ? expr(st) : nil } # a literal string: its defs' slot writes here (other statements in it: ignored)
         nil_const
+      elsif n.name == :values_at && n.receiver && args.any? { _1.is_a?(Prism::RangeNode) && _1.left.is_a?(Prism::IntegerNode) && _1.right.is_a?(Prism::IntegerNode) }
+        expanded = args.flat_map do |a| # m.values_at(1..2): the integers
+          next [a] unless a.is_a?(Prism::RangeNode) && a.left.is_a?(Prism::IntegerNode) && a.right.is_a?(Prism::IntegerNode)
+          (a.left.value..(a.exclude_end? ? a.right.value - 1 : a.right.value)).map { |k| a.left.copy(value: k) }
+        end
+        expr(n.copy(arguments: n.arguments.copy(arguments: expanded)))
       elsif %i[instance_variable_get instance_variable_set instance_variable_defined? instance_variables].include?(n.name) && n.receiver && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd]
         k = @classes[kd]; rv = expr(n.receiver)
         if n.name == :instance_variables then pack_values(k.ivars.reject { _1.to_s.start_with?("@__") }.map { |iv| c = const(sym_id(iv.to_s)); c.ty = :sym; c })
@@ -3365,6 +3375,9 @@ module Indus
       return nil unless node.name == :instance_method && node.receiver.is_a?(Prism::ConstantReadNode) && @classes[node.receiver.name] && node.arguments&.arguments&.first.is_a?(Prism::SymbolNode) && obj
       [node.receiver.name, node.arguments.arguments.first.unescaped.to_sym, obj]
     end
+
+    PRELUDE_CLASSES = %i[Exception StandardError RuntimeError ArgumentError TypeError NameError NoMethodError ZeroDivisionError IndexError KeyError StopIteration RangeError FloatDomainError IOError FrozenError NotImplementedError ScriptError NoMemoryError IndusThrow Set Regexp MatchData Struct Comparable Enumerable].freeze
+    def prelude_class?(k) = PRELUDE_CLASSES.include?(k.name) || k.name.to_s.start_with?("__")
 
     def has_const?(name) # Klass::X or a top-level X
       cn, x = name.to_s.split("::", 2)

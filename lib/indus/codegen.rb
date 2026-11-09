@@ -237,7 +237,12 @@ module Indus
         when :rawld32 then @asm.emit(0xB9400000 | (reg(i.args[0]) << 5) | d)      # ldr wd, [xn]
         when :rawst then @asm.str_off(reg(i.args[1], 9), reg(i.args[0]), 0)
         when :gbase then @asm.mov(d, Asm::GBASE)
-        when :trap then @asm.emit(0xD4200000) # brk #0: heap exhausted
+        when :trap # brk #0; with a message (a NoMethodError the types decided), the message goes to stderr first
+          if (msg = i.args[0]).is_a?(String)
+            name = :"trapmsg#{i.id}"; @asm.data(name, msg + "\n")
+            @asm.adr(1, name); @asm.mov_imm(2, msg.bytesize + 1); @asm.mov_imm(0, 2); @asm.call_write
+          end
+          @asm.emit(0xD4200000)
         when :zcheck # divisor nonzero, or raise (the raiser never returns here)
           ok = @asm.uniq
           @asm.cbnz(reg(i.args[1]), ok); @asm.bl(i.args[0].name); @asm.label(ok)
@@ -420,7 +425,9 @@ module Indus
             when :fld_set
               off = klass.base + payload * 8; v = args[0]
               v.float? ? @asm.fstr_off(freg(v), reg(recv), off) : @asm.str_off(reg(v, 9), reg(recv), off)
-            when :trap then @asm.emit(0xD4200000) # NoMethodError: this class has no such method
+            when :trap # NoMethodError: this class has no such method
+              name = :"trapmsg#{i.id}_#{klass.id}"; msg = "undefined method for an instance of #{klass.name} (NoMethodError)\n"; @asm.data(name, msg)
+              @asm.adr(1, name); @asm.mov_imm(2, msg.bytesize); @asm.mov_imm(0, 2); @asm.call_write; @asm.emit(0xD4200000)
             end
             @asm.b(done); @asm.label(nxt)
           end

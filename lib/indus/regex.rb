@@ -35,7 +35,7 @@ module Indus
       c = Compiler.new(p.ngroups, flags.include?("i"))
       c.emit_node(ast)
       c.code << OPS[:match]
-      [c.code, p.ngroups]
+      [c.code, p.ngroups, p.names || []]
     end
 
     class Parser
@@ -100,12 +100,17 @@ module Indus
         end
       end
 
+      attr_reader :names # capture index -> name (nil for unnamed), index 0 unused
       def group
         if eat("?")
           if eat(":") then capture = false
+          elsif eat("<") && @s[@i] != 61 && @s[@i] != 33 # (?<name>...) -- not lookbehind (?<= (?<!
+            nm = +""; nm << @s[@i].chr && (@i += 1) while @i < @s.size && @s[@i] != 62
+            raise "regexp: unterminated group name" unless eat(">")
+            capture = true; @ngroups += 1; idx = @ngroups; (@names ||= [])[idx] = nm
           else
             bad = @s[@i..].pack("C*")[0, 3]
-            raise "regexp: (?#{bad}... is not supported (only (?:...) groups; no lookaround or named groups)"
+            raise "regexp: (?#{bad}... is not supported (only (?:...) and (?<name>...) groups; no lookaround)"
           end
         else
           capture = true; @ngroups += 1; idx = @ngroups

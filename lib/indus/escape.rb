@@ -89,12 +89,12 @@ module Indus
         when :ret then mark.(i.args[0]) if with_ret
         when :call
           callee, *args = i.args
-          args.each_with_index { |a, k| mark.(a) if callee.leaks[k] }
+          args.each_with_index { |a, k| mark.(a) if callee.leaks.nil? || callee.leaks[k] } # no summary (a function outside this analysis): assume it keeps everything
         when :pcall
           arms, recv, *args = i.args
           arms.each do |_, kind, payload|
             case kind
-            when :call then [recv, *args].each_with_index { |a, k| mark.(a) if payload.leaks[k] }
+            when :call then [recv, *args].each_with_index { |a, k| mark.(a) if payload.leaks.nil? || payload.leaks[k] }
             when :fld_set then mark.(args[0])
             end
           end
@@ -102,7 +102,7 @@ module Indus
           arms, _, recv, *args = i.args
           arms.each do |_, kind, payload|
             case kind
-            when :call then [recv, *args].each_with_index { |a, k| mark.(a) if payload.leaks[k] }
+            when :call then [recv, *args].each_with_index { |a, k| mark.(a) if payload.leaks.nil? || payload.leaks[k] }
             when :fld_set then mark.(args[0])
             end
           end
@@ -188,8 +188,8 @@ module Indus
         when :gset then so = true if heap?(ty(f, i.args[1]))
         when :call
           callee, *args = i.args
-          so ||= callee.stores_other
-          args.each_with_index { |a, k| into.(a) if callee.stores_param[k] }
+          so ||= callee.stores_other.nil? || callee.stores_other
+          args.each_with_index { |a, k| into.(a) if callee.stores_param.nil? || callee.stores_param[k] }
         when :pcall, :sendsw then so = true # conservative
         end
       end

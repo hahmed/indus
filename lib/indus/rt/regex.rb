@@ -333,20 +333,89 @@ end
 
 # a Regexp literal: the compiled program and its capture count (2 * (groups + 1))
 class Regexp
-  attr_reader :prog, :ncap, :source
-  def initialize(prog, ncap, source)
+  attr_reader :prog, :ncap, :source, :group_names
+  def initialize(prog, ncap, source, group_names)
     @prog = prog
     @ncap = ncap
     @source = source
+    @group_names = group_names # capture index -> name ("" when unnamed)
   end
+  def names = @group_names.reject { |n| n == "" }
   def match?(s) = __re_match_p(@prog, @ncap, s)
-  def match(s) = __re_match(@prog, @ncap, s)
+  def match(s) = __re_match_data(self, s)
   def =~(s) = __re_index(@prog, @ncap, s)
   def to_s = "(?-mix:" + @source + ")"
   def inspect = "/" + @source + "/"
 end
 
-def __str_match_re(s, re) = __re_match(re.prog, re.ncap, s)
+def __str_match_re(s, re) = __re_match_data(re, s)
+
+# the result of match: the groups, by index or by name, with the positions
+class MatchData
+  def initialize(re, s, caps)
+    @re = re
+    @s = s
+    @caps = caps
+  end
+  def regexp = @re
+  def string = @s
+  def __group(g)
+    return nil if g < 0 || g * 2 + 1 >= @caps.length
+    gs = @caps[g * 2]
+    return nil if gs < 0
+    @s[gs, @caps[g * 2 + 1] - gs]
+  end
+  def __index_of(name)
+    names = @re.group_names
+    i = 1
+    while i < names.length
+      return i if names[i] == name
+      i = i + 1
+    end
+    raise IndexError, "undefined group name reference: " + name
+  end
+  def [](k) = k.is_a?(Integer) ? __group(k.to_i) : __group(__index_of(k.to_s))
+  def to_a = __re_groups(@s, @caps, @caps.length)
+  def captures = to_a.drop(1)
+  def named_captures
+    h = {}
+    names = @re.group_names
+    i = 1
+    while i < names.length
+      h[names[i]] = __group(i) if names[i] != ""
+      i = i + 1
+    end
+    h
+  end
+  def names = @re.names
+  def values_at(*ks) = ks.map { |k| self[k] }
+  def begin(g) = (g = __index_of(g.to_s) unless g.is_a?(Integer); @caps[g * 2] < 0 ? nil : @caps[g * 2])
+  def end(g) = (g = __index_of(g.to_s) unless g.is_a?(Integer); @caps[g * 2] < 0 ? nil : @caps[g * 2 + 1])
+  def pre_match = @s[0, @caps[0]]
+  def post_match = @s[@caps[1], @s.length - @caps[1]]
+  def size = @caps.length / 2
+  def length = size
+  def to_s = __group(0)
+  def inspect
+    out = "#<MatchData " + __group(0).inspect
+    names = @re.group_names
+    i = 1
+    while i * 2 < @caps.length
+      out = out + " " + (names[i] != "" ? names[i] : i.to_s) + ":" + __group(i).inspect
+      i = i + 1
+    end
+    out + ">"
+  end
+end
+
+def __re_match_data(re, s)
+  caps = __re_caps(re.ncap)
+  at = __re_search(re.prog, s, 0, caps, re.ncap)
+  return nil if at < 0
+  $__re_last_caps = caps
+  $__re_last_str = s
+  MatchData.new(re, s, caps)
+end
 def __str_match_p_re(s, re) = __re_match_p(re.prog, re.ncap, s)
 def __str_index_re(s, re) = __re_index(re.prog, re.ncap, s)
 def __str_scan_re(s, re) = __re_scan(re.prog, re.ncap, s)

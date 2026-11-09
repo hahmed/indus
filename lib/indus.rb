@@ -163,6 +163,10 @@ module Indus
     unless (bad = diff_tables(before, after, true)).empty?
       raise "redefinition of #{klass.name}##{d.name} changes a type the program was compiled against (#{bad}); not supported yet"
     end
+    # a library function reached only through a raise path whose argument never got a type here (nothing in the new code
+    # raises into it) cannot be compiled and cannot be called: it goes with the ones the main unit has
+    extra.reject! { |g| g.params.each_index.any? { |k| g.ptypes[k].nil? } && g.all.any? { |i| %i[eputs_v puts_v p_v].include?(i.op) } }
+    $stderr.puts "seam extras: #{extra.map(&:name).inspect}" if ENV["SEAM_LOG"]
     [f, *extra].each { Passes.run(_1) }
     [f, *extra].each { Peephole.run(_1) unless ENV["NOPEEP"] }
     extra.each { Ranges.run(_1) unless ENV["NORANGES"] }

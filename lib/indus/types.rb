@@ -307,7 +307,12 @@ module Indus
                 cs = classes_of(t)
                 want = i.op == :p_v && cs.any? { @classes[_1].find_method(:inspect) } ? :inspect : :to_s # p obj: its inspect when it has one
                 if cs.any? { @classes[_1].find_method(want) }
-                  c = Inst.new(:mcall, [want, i.args[0]]); c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); bind(f, c)
+                  v = i.args[0]
+                  if v.op == :onew # certainly an object
+                    c = Inst.new(:mcall, [want, v]); c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); bind(f, c)
+                  else # the slot may hold nil (the 0 word): "nil", else the object's own method
+                    c = split_on_nil(f, i, v, "nil") { |ob| m = Inst.new(:mcall, [want, v]); m.block = ob; ob.insts << m; bind(f, m); m }
+                  end
                 else
                   c = Inst.new(:sconst, ["#<#{cs.first}>"]); c.ty = :str; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
                 end
@@ -373,6 +378,18 @@ module Indus
                 c = Inst.new(:call, [fn(:__dyn_str), i.args[1]]); c.ty = :str; c.block = i.block
                 i.block.insts.insert(i.block.insts.index(i), c); i.args[1] = c; changed = true
               end
+              if i.op == :mod && of(f, i.args[0]) == :str # "fmt" % args where the receiver's type was not known at lowering: format
+                a = i.args[1]; at = of(f, a)
+                unless arr(at) # a single argument: as a one-element tagged list
+                  next unless at # wait for its type
+                  arr1 = Inst.new(:anew, [(one = Inst.new(:const, [1]); one.ty = :int; one.block = i.block; i.block.insts.insert(i.block.insts.index(i), one); one), (z = Inst.new(:const, [0]); z.ty = :nil; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z); z)])
+                  arr1.ty = [:arr, :dyn]; arr1.block = i.block; i.block.insts.insert(i.block.insts.index(i), arr1)
+                  zero = Inst.new(:const, [0]); zero.ty = :int; zero.block = i.block; i.block.insts.insert(i.block.insts.index(i), zero)
+                  st = Inst.new(:aset, [arr1, zero, a]); st.ty = [:arr, :dyn]; st.block = i.block; i.block.insts.insert(i.block.insts.index(i), st)
+                  a = st
+                end
+                i.op = :call; i.args = [fn(:__format), i.args[0], a]; i.ty = :str; changed = true; next
+              end
               dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
               # a shift whose count is not known to be in range (negative counts shift the other way; a left shift past 63 bits
               # is a Bignum in Ruby): the helper decides at run time. The library (`__*`) shifts are written in range.
@@ -383,6 +400,9 @@ module Indus
                 unless safe
                   i.args = [fn(i.op == :shl ? :__int_shl : :__int_shr), *i.args]; i.op = :call; i.ty = :int; changed = true
                 end
+              end
+              if i.op == :unbox && @settled && (ut = of(f, i.args[0])) && ut != :dyn && !poly?(ut) # a guard narrowed a value that was never tagged (an int? to Integer): the value itself
+                i.op = :nop; i.args = [i.args[0]]; i.ty = ut == :int? && i.ty == :int ? :int : ut; changed = true
               end
               if i.op == :to_i && i.strict && of(f, i.args[0]) == :str # Kernel#Integer(str): strict parse, ArgumentError on junk
                 i.op = :call; i.args = [fn(:__kernel_integer), i.args[0]]; i.ty = :int; changed = true
@@ -472,6 +492,13 @@ module Indus
             case i.op
             when :call
               callee = i.args[0]
+              # a tagged value's inspect/to_s may belong to a user class behind the tag: once the classes that flow into
+              # tagged slots are known (settled), the tag decides -- object arm dispatches, the rest stays builtin
+              if @settled && !i.dyn_split && %i[__dyn_inspect __dyn_to_s].include?(callee.name) && (users = boxed_user_classes.select { |k| k.find_method(callee.name == :__dyn_inspect ? :inspect : :to_s) }).any?
+                mname = callee.name == :__dyn_inspect ? :inspect : :to_s
+                split_dyn_object(f, i, i.args[1], users) { |un, ob| m = Inst.new(:mcall, [mname, un]); m.block = ob; ob.insts << m; m }
+                changed = true; next
+              end
               # a hash printed before its keys were known (a writer typed after settle): the variant follows the key type
               if %i[__hash_inspect __hash_inspect_sym __hash_inspect_dyn].include?(base = callee.name.to_s.sub(/\$\d+\z/, "").to_sym) && (ht = of(f, i.args[1])) && hsh(ht) && ht[1]
                 want = ht[1] == :sym ? :__hash_inspect_sym : ht[1] == :dyn ? :__hash_inspect_dyn : :__hash_inspect
@@ -670,6 +697,7 @@ module Indus
       # v[k] on a tagged value went to the builtin by-tag helpers; a user object with its own [] may be behind the tag
       funcs.each do |f|
         f.all.each do |i|
+          next if f.name.to_s.start_with?("__") || f.cls&.name.to_s&.start_with?("__") || %w[MatchData Regexp].include?(f.cls&.name.to_s) # library code indexes what it built
           next unless i.op == :call && %i[__dyn_hash __dyn_idx __dyn_idx_dyn __dyn_idx_set __dyn_idx_set_dyn].include?(i.args[0].name.to_s.sub(/\$\d+$/, "").to_sym)
           setter = i.args[0].name.to_s.include?("idx_set")
           uk = @classes.values.select { |k| k.boxed && !k.closure && k.find_method(setter ? :[]= : :[]) }
@@ -1226,6 +1254,23 @@ module Indus
       names.keys.flat_map { |cn| related(@classes[cn]) }.uniq.reject(&:closure)
     end
 
+    # before `i`: branch on v being the nil word; the nil arm yields the String `nil_text`, the other arm what the
+    # block builds in its block; the rest of i's block (from i on) continues at the join. Returns the join phi.
+    def self.split_on_nil(f, i, v, nil_text)
+      b = i.block; at = b.insts.index(i)
+      rest = b.insts[at..]; b.insts = b.insts[0...at]
+      nb = f.new_block(:isnil); ob = f.new_block(:notnil); jb = f.new_block(:niljoin)
+      jb.insts = rest; rest.each { _1.block = jb }
+      f.blocks.each { |bb| bb.phis.each { |p| p.args.map! { |(pred, x)| [pred.equal?(b) ? jb : pred, x] } } }
+      z = Inst.new(:const, [0]); z.ty = :nil; b << z
+      c = Inst.new(:cmp, [v, z], :eq); c.ty = :bool; b << c
+      b << Inst.new(:condbr, [c, nb, ob])
+      s = Inst.new(:sconst, [nil_text]); s.ty = :str; nb << s; nb << Inst.new(:br, [jb])
+      r = yield(ob); ob << Inst.new(:br, [jb])
+      ph = jb.phi; ph.args = [[nb, s], [ob, r]]; ph.ty = :str
+      ph
+    end
+
     # `i` (an mcall on the tagged value `recv`) becomes a branch on the tag: an object (tag 8) is unboxed to the
     # set of user classes and the block's method call runs on it; anything else keeps `i` as the builtin path.
     #   before: ... i ...        after: ... condbr -> [dynobj: unbox; yield] / [dynelse: i] -> [dynjoin: phi; ...]
@@ -1252,15 +1297,14 @@ module Indus
 
     # puts/p/inspect of a tagged scalar: the prelude dispatches on the tag
     def self.dyn_print(f, i)
-      name = i.op == :inspect_v || i.op == :p_v ? :__dyn_inspect : :__dyn_to_s
+      mname = i.op == :inspect_v || i.op == :p_v ? :inspect : :to_s
+      name = mname == :inspect ? :__dyn_inspect : :__dyn_to_s
       fn = fn(name)
-      if i.op == :inspect_v # the value itself becomes the call
-        i.op = :call; i.args = [fn, i.args[0]]; i.ty = :str
-      else
-        c = Inst.new(:call, [fn, i.args[0]]); c.block = i.block; c.ty = :str
-        i.block.insts.insert(i.block.insts.index(i), c)
-        i.args = [c]; i.op = i.op == :print_v ? :print_str : :puts_str
-      end
+      v = i.args[0]
+      c = Inst.new(:call, [fn, v]); c.block = i.block; c.ty = :str
+      i.block.insts.insert(i.block.insts.index(i), c)
+      if i.op == :inspect_v then i.op = :nop; i.args = [c]; i.ty = :str # the value itself is the string
+      else i.args = [c]; i.op = i.op == :print_v ? :print_str : :puts_str end
     end
 
     # inspect of one value, by type: int -> to_s, float -> __float_to_s, str -> __quote
@@ -1451,7 +1495,7 @@ module Indus
       # seen one class at a time): wait; settled, it is Ruby's NoMethodError at run time (a trap)
       unless klass.find_reader(name) && args.empty? || klass.find_writer(name) && args.size == 1 || klass.find_method(name) || klass.find_method(:method_missing)
         return unless @settled
-        tr = Inst.new(:trap, []); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr) # NoMethodError at run time
+        tr = Inst.new(:trap, ["undefined method '#{name}' for an instance of #{klass.name} (NoMethodError)"]); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr) # NoMethodError at run time
         i.op = :const; i.args = [0]; i.ty = :nil; return # the value after a trap: never read
       end
       kind, payload = resolve(klass, name, args.size, allow_missing: true)
@@ -1556,7 +1600,7 @@ module Indus
       elsif classes_of(t) # an object: its own [] / []= method
         i.args = [i.op == :idx ? :[] : :[]=, *i.args]; i.op = :mcall; i.ty = nil; bind(f, i)
       elsif t == :nil && @settled # indexing nil: dead code behind a nil? guard, or a NoMethodError at run time: trap, and the value is a constant
-        tr = Inst.new(:trap, []); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr)
+        tr = Inst.new(:trap, ["undefined method '[]' for nil (NoMethodError)"]); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr)
         i.op = :const; i.args = [0]; i.ty = :nil
       elsif t == :nil then nil
       elsif t == :int && i.args.size == 2 && !@settled.nil? && of(f, i.args[1]) == :int # n[k]: bit k

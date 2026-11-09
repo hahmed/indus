@@ -24,7 +24,42 @@ module Indus
         end
       end
       # with seams, keep every typed function too: the resident compiler may call it later
-      funcs.select { |f| live[f] || (seams && f.ptypes.none?(&:nil?)) }
+      return funcs.select { |f| live[f] } unless seams
+      # with seams, keep every fully typed function too (the resident compiler may call it later), and what they call
+      untyped = %i[eputs_v puts_v p_v print_v inspect_v mcall idx idx_set lshift_or_append to_s].freeze # ops Types resolves by operand type: left means never typed
+      typed = ->(f) { f.ptypes.size == f.params.size && f.ptypes.none?(&:nil?) && f.all.none? { |i| untyped.include?(i.op) || (i.ty.nil? && !i.term? && !%i[phi ret br condbr fld_set gset aset hset cell_set rawst rawst8 seam setslot retag try_push try_pop raise].include?(i.op)) } }
+      # a kept function must be typed, and so must everything it calls: an untyped callee drops its callers too
+      ok = {}
+      closure_typed = lambda do |f, seen|
+        return ok[f] if ok.key?(f)
+        return true if seen[f] || live[f]
+        seen[f] = true
+        ok[f] = typed.(f) && f.all.all? do |i|
+          cs = case i.op
+               when :call, :zcheck then [i.args[0]]
+               when :pcall, :sendsw then i.args[0].filter_map { |(_, kind, payload)| payload if kind == :call }
+               when :dsend then i.args.grep(Func)
+               when :setslot then [i.args[1]]
+               else [] end
+          cs.all? { closure_typed.(_1, seen) }
+        end
+      end
+      extra_roots = funcs.select { |f| !live[f] && closure_typed.(f, {}) }
+      work = extra_roots.dup
+      until work.empty?
+        f = work.pop
+        next if live[f]
+        live[f] = true
+        f.all.each do |i|
+          case i.op
+          when :call, :zcheck then work << i.args[0]
+          when :pcall, :sendsw then i.args[0].each { |(_, kind, payload)| work << payload if kind == :call }
+          when :dsend then i.args.each { |a| work << a if a.is_a?(Func) }
+          when :setslot then work << i.args[1]
+          end
+        end
+      end
+      funcs.select { |f| live[f] }
     end
 
     # dead phis (the value of an if whose arms are statements) and phis of one value: gone.
