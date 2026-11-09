@@ -579,6 +579,7 @@ def __arr_eq(a, b)
 end
 
 def __arr_inspect(a)
+  return "nil" if a.nil? # a container slot never filled (a method returning nil on one path)
   out = "["
   i = 0
   while i < a.length

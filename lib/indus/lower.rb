@@ -523,7 +523,14 @@ module Indus
     # arguments for a method call on an object whose class Types resolves later. Defaults, *rest
     # and keywords are shaped here, when the class is known or every class defining the name
     # agrees on the parameter shape
+    # a Hash.new(default) is a property of its home (the local or ivar), decided at compile time: passing it on
+    # would read misses as nil in the callee
+    def check_default_hash_args(args)
+      args.each { |a| raise "a Hash with a default (Hash.new(v) / Hash.new { }) passed as an argument: the default belongs to its home; not supported" if hash_default_of(a) }
+    end
+
     def object_args(n, args, klass, recv = nil)
+      check_default_hash_args(args)
       cands = klass ? [klass.find_method(n.name)].compact : @classes.values.filter_map { |k| k.methods[n.name] }
       cands = cands.select { @defs_by_func[_1] }
       needs = args.last.is_a?(Prism::KeywordHashNode) || cands.any? { |f| f.rest || @defs_by_func[f].parameters&.then { |ps| ps.optionals.any? || ps.keywords.any? } }
@@ -544,6 +551,7 @@ module Indus
     end
 
     def call_args_raw(f, args, skip)
+      check_default_hash_args(args)
       args = args.dup
       kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
       d = @defs_by_func[f]
@@ -604,7 +612,11 @@ module Indus
       when Prism::InstanceVariableOrWriteNode, Prism::InstanceVariableOperatorWriteNode then r # (@x ||= []) << v: the ivar is the home
       when Prism::CallNode
         return r if r.arguments.nil? && r.block.nil? && r.receiver # `obj.attr << v`: the slot becomes a cell (Types)
-        return r if r.name == :[] && r.receiver && r.arguments&.arguments&.size == 1 && r.block.nil? # `h[k] << v`: the slot is written back
+        if r.name == :[] && r.receiver && r.arguments&.arguments&.size == 1 && r.block.nil? # `h[k] << v`: the slot is written back
+          # ... when the container has a home. `h.first[1] << v` / `f(x)[0] << v`: the container is a call's result; the slot written is a copy's
+          raise "`<<` on an element of #{r.receiver.name}'s result: the container is a value here, the appended String would be shared with it in Ruby; not supported" if r.receiver.is_a?(Prism::CallNode) && !(r.receiver.arguments.nil? && r.receiver.block.nil? && r.receiver.receiver && kind_of(r.receiver.receiver).is_a?(Symbol) && @classes[kind_of(r.receiver.receiver)]) && kind_of(r.receiver) != :str
+          return r
+        end
         return r if r.arguments.nil? && r.block.nil? && r.receiver.nil? && @owner && @funcs[:"#{@owner}.#{r.name}"] # `registry << o` in a class method: the class object's ivar, through its reader
       when Prism::ConstantReadNode, Prism::GlobalVariableReadNode, Prism::ClassVariableReadNode then r # LIST << v: the global is rebound
       end
@@ -1401,7 +1413,7 @@ module Indus
       if n.block.is_a?(Prism::BlockNode) && n.receiver.nil? && (f = @funcs[n.name]) && (d = @defs_by_func[f]) && d.parameters&.block
         blk = n.block
         params = blk.parameters&.parameters&.requireds&.map(&:name) || []
-        c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
+        c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [], ie_self: ie_target(f))
         return emit(:call, [f, *call_args(f, args), c])
       end
       # a method taking &blk on self or on an object of a known class, called with a block literal: the block is a closure value
@@ -1527,7 +1539,7 @@ module Indus
         end
         r
       elsif n.name == :p && n.receiver.nil? && args.size > 1 # p a, b: every argument evaluated, then one line each
-        vals = args.map { |a| kind_of(a) == :array ? [:str, inspect_str(a)] : class_valued?(a) ? [:puts, expr(a)] : [:p, expr(a)] }
+        vals = args.map { |a| inline_inspect?(a) ? [:str, inspect_str(a)] : class_valued?(a) ? [:puts, expr(a)] : [:p, expr(a)] }
         vals.each { |(k, v)| emit(k == :str ? :puts_str : k == :puts ? :puts_v : :p_v, [v]) }; return const(0)
       elsif n.name == :p && n.receiver.nil? && args.size == 1 then p_one(args[0])
       elsif n.name == :inspect && args.empty? && n.receiver then inspect_str(n.receiver)
@@ -2564,8 +2576,14 @@ module Indus
       @locals[outv] = emit(:anew, [cap, (c = const(0); c.ty = :nil; c)]) if map
       counted_loop(const(0), cap, :lt, [], body) do |i, _ps, pfx|
         key = emit(:hkey_at, [h, i]); val = emit(:hval_at, [h, i])
-        @locals[:"#{pfx}#{params[0]}"] = key if params[0]
-        @locals[:"#{pfx}#{params[1]}"] = val if params[1]
+        if params.size == 1 && params[0] # { |pair| }: the [key, value] pair (a fresh two-element array)
+          pair = emit(:anew, [const(2), (c = const(0); c.ty = :nil; c)])
+          pair = emit(:aset, [pair, const(0), key]); pair = emit(:aset, [pair, const(1), val])
+          @locals[:"#{pfx}#{params[0]}"] = pair
+        else
+          @locals[:"#{pfx}#{params[0]}"] = key if params[0]
+          @locals[:"#{pfx}#{params[1]}"] = val if params[1]
+        end
         @map_target = [outv, i] if map
       end
       map ? @locals.delete(outv) : const(0)
@@ -2949,7 +2967,12 @@ module Indus
         node.compact_child_nodes.each { walk.(_1) }
       end
       walk.(d.body)
-      found ? f.cls || @classes[f.name.to_s.split(".")[0].to_sym] : nil
+      return nil unless found
+      return f.cls if f.cls
+      return @classes[f.name.to_s.split(".")[0].to_sym] if f.name.to_s.include?(".")
+      r = found.receiver # a top-level method: the receiver must name its class (`World.new.instance_eval(&b)`)
+      r = r.receiver while r.is_a?(Prism::CallNode) && r.name == :new && r.receiver
+      r.is_a?(Prism::ConstantReadNode) ? @classes[r.name] : nil
     end
 
     def free_locals(node, bound, out = []) = free_locals_plain(node, bound, out)
@@ -3387,8 +3410,12 @@ module Indus
       a.is_a?(Prism::CallNode) && a.name == :class && a.arguments.nil? && a.receiver
     end
 
+    # an array expression whose inspect can be built inline: not a user method's result (nil on some path is possible there; Types' by-type inspect checks)
+    def inline_inspect?(a) = kind_of(a) == :array && !(a.is_a?(Prism::CallNode) && a.receiver.nil? && !a.block && @funcs[a.name] && !prelude?(a.name))
+    def prelude?(name) = name.to_s.start_with?("__")
+
     def p_one(a)
-      if kind_of(a) == :array then emit(:puts_str, [inspect_str(a)])
+      if inline_inspect?(a) then emit(:puts_str, [inspect_str(a)])
       elsif class_valued?(a) then emit(:puts_v, [expr(a)]) # p x.class: the class name, unquoted (classes are names at run time)
       else emit(:p_v, [expr(a)]) end       # inspect form: strings quoted, nil as "nil"
     end

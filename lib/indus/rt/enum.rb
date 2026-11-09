@@ -608,6 +608,7 @@ def __num_infinite_p(f) = (f > 1.0e308 || f < -1.0e308) ? (f > 0.0 ? 1 : -1) : n
 def __num_finite_p(f) = !(f > 1.0e308 || f < -1.0e308) && f == f
 
 def __hash_inspect(h)
+  return "nil" if h.nil? # a container slot never filled
   out = "{"
   i = 0
   while i < __hcount(h)
@@ -620,6 +621,7 @@ end
 
 # symbol keys print as `name: value`
 def __hash_inspect_sym(h)
+  return "nil" if h.nil?
   out = "{"
   i = 0
   while i < __hcount(h)
@@ -632,6 +634,7 @@ end
 
 # tagged keys: a symbol prints as `name:`, anything else as inspect =>
 def __hash_inspect_dyn(h)
+  return "nil" if h.nil?
   out = "{"
   i = 0
   while i < __hcount(h)

@@ -32,6 +32,16 @@ module Indus
       raise "type clash: #{a.inspect} vs #{b.inspect}"
     end
     # container elements keep their identity: an Integer stored next to a Float stays an Integer
+    # do values of these element types share one word representation (so a container of one may be read as the other)?
+    WORDS = %i[int int? bool sym nil].freeze
+    def self.same_representation?(x, y)
+      return true if x.nil? || y.nil? || x == y
+      return true if WORDS.include?(x) && WORDS.include?(y)
+      return true if classes_of(x) && classes_of(y) # objects: pointers with a class id in the header when they meet
+      return true if (x == :str || x == :strbuf) && (y == :str || y == :strbuf)
+      return same_representation?(x[1], y[1]) && (arr(x) || same_representation?(x[2], y[2])) if (arr(x) || hsh(x)) && (arr(y) || hsh(y)) && x[0] == y[0]
+      false
+    end
     def self.join_elem(a, b)
       return :dyn if (a == :int && b == :float) || (a == :float && b == :int)
       join(a, b)
@@ -359,12 +369,16 @@ module Indus
               end
               dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
               if i.op == :lshift_or_append && of(f, i.args[0]) == :dyn && @settled # v << x on a dynamic receiver: decided at run time
+                # the result must land back in the receiver's home (a local, ivar, element store); an append whose result nobody
+                # keeps (`h.first[1] << "!"`) would be lost when the value is a String (strings are values here, aliasing is not)
+                raise "#{f.name}: `<<` on a dynamic value read out of a container (#{i.args[0].op}): a String there would have to be shared with the container; not supported" if (f.count_uses!; i.uses.zero?) || %i[aget hget hval_at].include?(i.args[0].op) && i.args[0].args[0].op != :fld_get && i.args[0].args[0].op != :gget && i.args[0].args[0].op != :param && !(i.args[0].args[0].op == :phi)
                 x = i.args[1]
                 unless of(f, x) == :dyn then bx = Inst.new(:box, [x, of(f, x)]); bx.ty = :dyn; bx.block = i.block; i.block.insts.insert(i.block.insts.index(i), bx); x = bx end
                 i.op = :call; i.args = [fn(:__dyn_push), i.args[0], x]; i.ty = :dyn; changed = true
               end
               if %i[idx idx_set].include?(i.op) && of(f, i.args[0]) == :dyn && of(f, i.args[1]) # v[k] / v[k] = x on a tagged value: by tag at run time (string, array or hash)
                 kt = of(f, i.args[1])
+
                 if kt != :int && kt != :int? && kt != :dyn # a non-integer key: a hash (a tagged key is decided at run time)
                   c = Inst.new(:call, [fn(:__dyn_hash), i.args[0]]); c.ty = [:hash, :dyn, :dyn]; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
                   i.args[0] = c
@@ -597,6 +611,20 @@ module Indus
           raise "type moved after the by-type rewrite of #{i.op} in #{f.name}: assumed #{kind}, now #{t.inspect} (compiler bug: a rewrite fired on a provisional type)" unless ok
         end
       end
+      # a container reaching a parameter typed as a differently-shaped container (two callers pass {str=>str} and
+      # {sym=>str}): the callee's loads would read the wrong representation. Scalars are boxed at the call; containers cannot be.
+      funcs.each do |f|
+        f.all.each do |i|
+          next unless i.op == :call && !generic?(i.args[0]) && !i.args[0].name.to_s.start_with?("__") # user methods (the library's helpers box as they declare)
+          callee = i.args[0]
+          i.args[1..].each_with_index do |v, k|
+            at, pt = of(f, v), callee.ptypes[k]
+            next unless (arr(at) || hsh(at)) && (arr(pt) || hsh(pt)) && at != pt && !cell?(at) && !cell?(pt)
+            next if at[1..2].zip(pt[1..2]).all? { |x, y| same_representation?(x, y) }
+            raise "#{f.name}: #{at.inspect} passed to #{callee.name} parameter #{k} which other callers shaped as #{pt.inspect}; a method receiving containers of different element types is not supported (call it with one shape, or box the elements)"
+          end
+        end
+      end
       funcs.each { drop_dead_phis(_1) } # a statement-valued merge nobody reads: boxing its arms would keep dead values alive
       funcs.each { convert(_1) }
       funcs.each { |f| f.all.each { |i| i.op = :hset if i.op == :hset_raw } }
@@ -606,6 +634,15 @@ module Indus
         f.all.each do |i|
           next unless i.op == :box
           (classes_of(i.args[1]) || []).each { |cn| related(@classes[cn]).each { |k| k.tagged = true; k.boxed = true } } # a class or a poly set of classes, with its hierarchy
+        end
+      end
+      # v[k] on a tagged value went to the builtin by-tag helpers; a user object with its own [] may be behind the tag
+      funcs.each do |f|
+        f.all.each do |i|
+          next unless i.op == :call && %i[__dyn_hash __dyn_idx __dyn_idx_dyn __dyn_idx_set __dyn_idx_set_dyn].include?(i.args[0].name.to_s.sub(/\$\d+$/, "").to_sym)
+          setter = i.args[0].name.to_s.include?("idx_set")
+          uk = @classes.values.select { |k| k.boxed && !k.closure && k.find_method(setter ? :[]= : :[]) }
+          raise "#{f.name}: #{setter ? "[]=" : "[]"} on a value that may be a Hash/Array/String or a #{uk.map(&:name).join("/")} (which defines its own); not supported" unless uk.empty?
         end
       end
       funcs.each { strings(_1) }
@@ -723,9 +760,10 @@ module Indus
     def self.alias_origin(v, seen = {})
       return nil if seen[v]; seen[v] = true
       case v.op
-      when :param, :fld_get, :aget, :hget, :gget then v
+      when :param, :fld_get, :aget, :hget, :hval_at, :gget then v
       when :phi then v.args.each { |(_, a)| (r = alias_origin(a, seen)) and return r }; nil
       when :lshift_or_append, :sappend, :bufappend then alias_origin(v.args[0], seen)
+      when :unbox then (o = alias_origin(v.args[0], seen)) && %i[aget hget hval_at].include?(o.op) ? o : nil # a narrowed element (v.is_a?(String)) is still the container's
       end
     end
 
@@ -926,8 +964,12 @@ module Indus
       when :fld_get
         k = of(f, o.args[0]); @ivars[k][o.args[1]] = :strbuf if k
         o.ty = :strbuf; bufferize(f, o); return o
-      when :aget, :hget, :apop
+      when :aget, :hget, :apop, :hval_at
         a = o.args[0]; a = a.args[0] while %i[aset hset].include?(a.op)
+        root = a; root = root.args[0] while %i[aset hset aget hget hval_at apop unbox].include?(root.op)
+        if %i[call pcall sendsw dsend].include?(root.op) # a container a library call built (values, to_a, map ...): its elements are not cells; the String is shared with the source
+          raise "#{f.name}: `<<` on an element of a container returned by #{root.op == :call ? root.args[0].name.to_s.sub(/\$\d+$/, "") : "a call"}: the String is shared with the source container (aliasing); not supported"
+        end
         t = of(f, a); nt = arr(t) ? [:arr, :strbuf] : [:hash, t[1], :strbuf]
         case a.op # the container's home learns the element type too, else another load of it keeps the old one
         when :param then f.ptypes[f.params.index(a)] = nt
