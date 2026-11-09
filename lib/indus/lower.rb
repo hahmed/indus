@@ -1643,12 +1643,10 @@ module Indus
         # They are called through a slot from here on; nothing else changes.
         k = @classes[n.receiver.name]
         src = args[0]
-        raise "class_eval needs a string literal (a computed string would make every method of #{k.name} patchable)" unless src.is_a?(Prism::StringNode)
-        Prism.parse(src.unescaped).value.statements.body.grep(Prism::DefNode).each do |d|
-          m = k.find_method(d.name) or raise "class_eval defining a new method #{d.name} (only redefinition for now)"
-          m.patchable = true
-        end
-        emit(:seam, [k, src.unescaped])
+        # a computed string: the code arrives at run time. Every method of the class becomes redefinable (a slot
+        # each); the resident compiler parses, types and compiles the string's defs against the running program.
+        k.methods.each_value { |m| m.patchable = true unless m.primary }
+        emit(:seam, [k, nil, expr(src)])
       elsif n.name == :sqrt && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
         emit(:fsqrt, [expr(args[0])])
       elsif %i[sin cos].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math

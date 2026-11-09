@@ -37,21 +37,24 @@ module Indus
       end
       unless unit.seams.empty?
         # the resident compiler, reachable from machine code
-        cb = Fiddle::Closure::BlockCaller.new(Fiddle::TYPE_LONG, [Fiddle::TYPE_LONG]) do |id|
+        cb = Fiddle::Closure::BlockCaller.new(Fiddle::TYPE_LONG, [Fiddle::TYPE_LONG, Fiddle::TYPE_LONG]) do |id, strh|
           klass, src = unit.seams[id]
+          src ||= Fiddle::Pointer.new(strh)[0, Fiddle::Pointer.new(strh - 8)[0, 8].unpack1("Q")] # the code string's bytes: [-8] len, bytes at the handle
           t = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          code, off, f, tables_off = Indus.compile_method(unit, mem.to_i, klass, src)
-          blob = place(code).to_i
-          addr = blob + off
-          if tables_off # link this unit's GC tables into the collector's chain
-            rec = MMAP.call(nil, 4096, 3, 0x1002, -1, 0)
-            rec[0, 24] = [heap[unit.globals.fetch(:__gc_extra), 8].unpack1("Q"), blob, blob + tables_off].pack("QQQ")
-            heap[unit.globals.fetch(:__gc_extra), 8] = [rec.to_i].pack("Q")
-            @keep_recs = (@keep_recs || []) << rec
+          Prism.parse(src).value.statements.body.grep(Prism::DefNode).each do |d|
+            code, off, f, tables_off = Indus.compile_method(unit, mem.to_i, klass, d)
+            blob = place(code).to_i
+            addr = blob + off
+            if tables_off # link this unit's GC tables into the collector's chain
+              rec = MMAP.call(nil, 4096, 3, 0x1002, -1, 0)
+              rec[0, 24] = [heap[unit.globals.fetch(:__gc_extra), 8].unpack1("Q"), blob, blob + tables_off].pack("QQQ")
+              heap[unit.globals.fetch(:__gc_extra), 8] = [rec.to_i].pack("Q")
+              @keep_recs = (@keep_recs || []) << rec
+            end
+            method = f.name.to_s.split("@").first # Greeter#hello
+            heap[unit.globals.fetch(:"m_#{method}"), 8] = [addr].pack("Q")
+            $stderr.puts "indus: seam #{id}: recompiled #{method} (#{code.bytesize} bytes) in #{((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round(2)} ms; slot rewritten, world moved on" if ENV["SEAM_LOG"]
           end
-          method = f.name.to_s.split("@").first # Greeter#hello
-          heap[unit.globals.fetch(:"m_#{method}"), 8] = [addr].pack("Q")
-          $stderr.puts "indus: seam #{id}: recompiled #{method} (#{code.bytesize} bytes) in #{((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t) * 1000).round(2)} ms; slot rewritten, world moved on" if ENV["SEAM_LOG"]
           0
         end
         heap[unit.globals.fetch(:__seam_cb), 8] = [cb.to_i].pack("Q")

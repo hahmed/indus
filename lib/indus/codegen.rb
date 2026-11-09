@@ -507,8 +507,9 @@ module Indus
         when :setslot # a redefinition point: the method's slot takes the version defined here
           primary, version = i.args
           @asm.adr(16, version.name); @asm.str_off(16, Asm::GBASE, @asm.global(:"m_#{primary.name}"))
-        when :seam # call the resident compiler with the seam id; it patches the slots
-          @asm.seams << i.args
+        when :seam # call the resident compiler with the seam id (and the code string's handle); it patches the slots
+          @asm.seams << i.args[0, 2]
+          @asm.mov(1, reg(i.args[2], 1)) if i.args[2]
           @asm.mov_imm(0, @asm.seams.size - 1)
           @asm.ldr_off(16, Asm::GBASE, @asm.global(:__seam_cb)); @asm.blr(16)
         when :puts_i

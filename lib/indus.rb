@@ -116,9 +116,9 @@ module Indus
   # The resident compiler: compile one redefined method against the running
   # program's types, place it in new executable memory, return its address.
   # Calls out of the new code go through absolute addresses into the old.
-  def self.compile_method(unit, base, klass, src)
-    d = Prism.parse(src).value.statements.body.grep(Prism::DefNode).first
-    old = klass.find_method(d.name)
+  def self.compile_method(unit, base, klass, d)
+    old = klass.find_method(d.name) or raise "class_eval at run time: #{klass.name}##{d.name} is new; only a method the program already has can be redefined (nothing could call a new one)"
+    old = old.primary || old
     f = unit.lower.lower_method(klass, d, old)
     Passes.trivial_phis(f)
     before = Types.snapshot
