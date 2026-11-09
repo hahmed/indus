@@ -533,7 +533,7 @@ module Indus
       check_default_hash_args(args)
       cands = klass ? [klass.find_method(n.name)].compact : @classes.values.filter_map { |k| k.methods[n.name] }
       cands = cands.select { @defs_by_func[_1] }
-      needs = args.last.is_a?(Prism::KeywordHashNode) || cands.any? { |f| f.rest || @defs_by_func[f].parameters&.then { |ps| ps.optionals.any? || ps.keywords.any? } }
+      needs = args.last.is_a?(Prism::KeywordHashNode) || cands.any? { |f| f.rest || @defs_by_func[f].parameters&.then { |ps| ps.optionals.any? || ps.keywords.any? || ps.keyword_rest.is_a?(Prism::KeywordRestParameterNode) } }
       return args.map { expr(_1) } unless needs
       raise "#{n.name}: a default that reads self needs the receiver evaluated first" if klass.nil? && recv.nil? && cands.any? { |f| @defs_by_func[f].parameters.then { |ps| (ps.optionals + ps.keywords).any? { |o| o.respond_to?(:value) && o.value && !o.value.is_a?(Prism::IntegerNode) && !o.value.is_a?(Prism::StringNode) && !o.value.is_a?(Prism::NilNode) && !o.value.is_a?(Prism::TrueNode) && !o.value.is_a?(Prism::FalseNode) && !o.value.is_a?(Prism::FloatNode) && !o.value.is_a?(Prism::SymbolNode) && !o.value.is_a?(Prism::ArrayNode) && !o.value.is_a?(Prism::HashNode) } } }
       shapes = cands.map { |f| @defs_by_func[f].parameters&.slice.to_s }.uniq
@@ -1121,7 +1121,7 @@ module Indus
           next if t.is_a?(Prism::SplatNode) && t.expression.nil? # a, * = arr
           t = t.expression if t.is_a?(Prism::SplatNode)
           case t
-          when Prism::LocalVariableTargetNode then @locals[lname(t.name)] = v
+          when Prism::LocalVariableTargetNode then shared?(t.name) ? write_shared(t.name, v) : @locals[lname(t.name)] = v # a captured local: through its cell
           when Prism::InstanceVariableTargetNode
             if (ow = ivar_owner) then emit(:gset, [:"#{ow}#{t.name}", v])
             else emit(:fld_set, [me_val, @klass.ivar(t.name), v]) end
@@ -1942,7 +1942,9 @@ module Indus
         me = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
         emit(:call, [@klass.find_method(n.name), me, *method_args(@klass.find_method(n.name), args, me)])
       elsif @klass && args.empty? && n.receiver.nil? && (iv = @klass.find_reader(n.name))
-        emit(:fld_get, [me_val, @klass.ivar(iv)]) # a bare attr_reader call inside a method
+        if @classes.each_value.any? { |k| k.methods.key?(n.name) && (c = k.superclass; c = c.superclass while c && !c.equal?(@klass); c) } # a descendant overrides the reader with a def: dispatch
+          emit(:mcall, [n.name, me_val])
+        else emit(:fld_get, [me_val, @klass.ivar(iv)]) end # a bare attr_reader call inside a method
       elsif n.receiver.nil? && (y = @yielders[n.name]) && (y[0].nil? || @klass && (y[0].name == @klass.name)) # a yielding method called without a block: inlined, block_given? false
         inline_yielder(y, nil, args, nil, :none)
       else
@@ -1998,7 +2000,8 @@ module Indus
       if ps.keyword_rest.is_a?(Prism::KeywordRestParameterNode) # **rest: the keywords no parameter names, as a symbol-keyed hash
         idx = ps.requireds.size + ps.optionals.size + (ps.rest.is_a?(Prism::RestParameterNode) ? 1 : 0) + ps.keywords.size
         named = ps.keywords.map(&:name)
-        h = emit(:hnew, [])
+        raise "**hash with several splats into **rest: not supported" if splats.size > 1
+        h = splats.empty? ? emit(:hnew, []) : emit(:mcall, [:dup, splats[0]]) # m(**other): a copy of other's pairs (its type is other's)
         given.each { |nm, node| h = emit(:hset, [h, (c = const(sym_id(nm.to_s)); c.ty = :sym; c), expr(node)]) unless named.include?(nm) }
         vals[idx] = h
       end
@@ -2827,7 +2830,7 @@ module Indus
     def pattern_match(pat, v, fail_b, vnode = nil)
       check = ->(cond) { ok = @f.new_block(:pok); emit(:condbr, [cond, ok, fail_b]); @cur = ok }
       case pat
-      when Prism::LocalVariableTargetNode then @locals[lname(pat.name)] = v
+      when Prism::LocalVariableTargetNode then shared?(pat.name) ? write_shared(pat.name, v) : @locals[lname(pat.name)] = v
       when Prism::CapturePatternNode then pattern_match(pat.value, v, fail_b); @locals[lname(pat.target.name)] = v
       when Prism::ConstantReadNode then check.(emit(:isa, [v, pat.name]))
       when Prism::NilNode then check.(emit(:cmp, [v, nil_const], :eq))
@@ -2932,7 +2935,9 @@ module Indus
     def lambda_value(n)
       params = n.parameters&.parameters&.requireds&.map(&:name) || []
       captured = free_locals(n.body, params).select { |nm| @locals.key?(lname(nm)) }
-      closure_value(params, captured, n.body&.body || [])
+      c = closure_value(params, captured, n.body&.body || [])
+      @deferred_lambdas.last[1].strict_arity = true if @deferred_lambdas.last[0].equal?(c.args[0]) # ->(){} checks its argument count
+      c
     end
 
     def closure_value(params, captured, stmts, ie_self: nil)
@@ -3330,6 +3335,7 @@ module Indus
 
     def inline_lambda(lam, args)
       params = lam.parameters&.parameters&.requireds&.map(&:name) || []
+      raise "a lambda taking #{params.size} argument#{"s" if params.size != 1} called with #{args.size} (ArgumentError in Ruby)" if params.size != args.size && !lam.parameters&.parameters&.optionals&.any? && !lam.parameters&.parameters&.rest
       pfx = :"lam#{@f.blocks.size}:"
       params.each_with_index { |p, k| @locals[:"#{pfx}#{p}"] = expr(args[k]) }
       @blk_pfx = (@blk_pfx || []) << pfx

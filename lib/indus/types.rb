@@ -467,9 +467,9 @@ module Indus
             when :call
               callee = i.args[0]
               # a hash printed before its keys were known (a writer typed after settle): the variant follows the key type
-              if %i[__hash_inspect __hash_inspect_sym __hash_inspect_dyn].include?(callee.name) && (ht = of(f, i.args[1])) && hsh(ht) && ht[1]
+              if %i[__hash_inspect __hash_inspect_sym __hash_inspect_dyn].include?(base = callee.name.to_s.sub(/\$\d+\z/, "").to_sym) && (ht = of(f, i.args[1])) && hsh(ht) && ht[1]
                 want = ht[1] == :sym ? :__hash_inspect_sym : ht[1] == :dyn ? :__hash_inspect_dyn : :__hash_inspect
-                if callee.name != want then callee = i.args[0] = fn(want); changed = true end
+                if base != want then callee = i.args[0] = fn(want); changed = true end # (an instance of the right family stays)
               end
               if generic?(callee) && clashes?(callee, i.args[1..].map { of(f, _1) }) # a call rewritten into a generic this very visit
                 callee = i.args[0] = instance_for(callee, i.args[1..].map { of(f, _1) }, funcs); changed = true
@@ -647,6 +647,18 @@ module Indus
         f.all.each do |i|
           next unless i.op == :box
           (classes_of(i.args[1]) || []).each { |cn| related(@classes[cn]).each { |k| k.tagged = true; k.boxed = true } } # a class or a poly set of classes, with its hierarchy
+        end
+      end
+      # a dispatch whose arms answer in different representations (a float from one class, a tagged value from another):
+      # the arms would need boxing per class; refused rather than read a float as a tagged word
+      funcs.each do |f|
+        f.all.each do |i|
+          next unless i.op == :pcall && i.ty
+          i.args[0].each do |arm|
+            at = arm_type(f, i, arm)
+            next if at.nil? || at == i.ty || same_representation?(at, i.ty) || arm[1] == :trap
+            raise "#{f.name}: #{arm[0].name}##{arm[1] == :call ? arm[2].name.to_s.split("#").last : "attr"} answers #{at.inspect} where other classes answer #{i.ty.inspect}; a dispatch mixing representations is not supported"
+          end
         end
       end
       # v[k] on a tagged value went to the builtin by-tag helpers; a user object with its own [] may be behind the tag
@@ -1382,6 +1394,14 @@ module Indus
         i.op = :const; i.args = [0]; i.ty = :nil; return # the value after a trap: never read
       end
       kind, payload = resolve(klass, name, args.size, allow_missing: true)
+      if kind == :call && klass.closure && name == :call && !payload.rest && args.size != payload.params.size - 1 # proc arity: missing args are nil, extras dropped
+        want = payload.params.size - 1
+        if payload.strict_arity then raise "#{f.name}: a lambda called with #{args.size} arguments, takes #{want} (ArgumentError in Ruby)" end
+        args = args[0, want]
+        while args.size < want
+          c = Inst.new(:const, [0]); c.ty = :nil; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); args << c
+        end
+      end
       case kind
       when :fld_get then i.op = :fld_get; i.args = [recv, payload]
       when :fld_set then i.op = :fld_set; i.args = [recv, payload, args[0]]
@@ -1512,6 +1532,14 @@ module Indus
     end
 
     def self.resolve(klass, name, nargs, allow_missing: false, trap_missing: false)
+      # the nearest definition up the chain wins, whether a def or an attr_*: a subclass's `def s` overrides an inherited reader
+      k = klass
+      while k
+        if k.methods[name] then return [:call, k.methods[name]] end
+        if (iv = k.readers[name]) && nargs == 0 then return [:fld_get, klass.ivar(iv)] end
+        if (iv = k.writers[name]) && nargs == 1 then return [:fld_set, klass.ivar(iv)] end
+        k = k.superclass
+      end
       if (iv = klass.find_reader(name)) && nargs == 0 then [:fld_get, klass.ivar(iv)]
       elsif (iv = klass.find_writer(name)) && nargs == 1 then [:fld_set, klass.ivar(iv)]
       elsif (m = klass.find_method(name)) then [:call, m]
