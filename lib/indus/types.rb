@@ -1506,7 +1506,7 @@ module Indus
       when :pcall then a[0].map { arm_type(f, i, _1) }.reduce(nil) { join(_1, _2) }
       when :sendsw then a[0].map { |(_, kind, payload)| sw_arm_type(f, i, kind, payload) }.reduce(nil) { join(_1, _2) }
       when :dsend then nil
-      when :gc_now, :raise_any, :setslot then :int
+      when :gc_now, :raise_any, :setslot, :retag then :int
       when :respond_to_q then :bool
       when :str_or_empty then :str
       when :to_f, :fsqrt, :libm, :clock then :float
@@ -1534,7 +1534,7 @@ module Indus
         generic?(a[0]) && (a[1..].any? { |v| of(f, v).nil? } || deferred_generic?(a[0], a[1..].map { of(f, _1) })) ? nil : a[0].rtype
       when :todyn then :dyn
       when :itof, :ffrom then :float
-      when :onew then a[0].name
+      when :onew then (subs = @classes.values.select { |c| c.superclass.equal?(a[0]) && c.name.to_s.include?("$") }).empty? ? a[0].name : [:poly, [a[0].name, *subs.map(&:name)].sort] # an object that may be retagged to a hidden subclass (def x.m): the set
       when :fld_get then (k = of(f, a[0])) && ivar_type(k, a[1])
       when :fld_set then of(f, a[2])
       when :gget then @consts[a[0]]

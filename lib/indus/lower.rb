@@ -90,7 +90,7 @@ module Indus
       @module_defs = mods.to_h { |m| [m.constant_path.name, (m.body&.body || []).grep(Prism::DefNode).reject { _1.receiver.is_a?(Prism::SelfNode) }] }
       mod_classes = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ClassNode) }
       mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
-      defs = body.grep(Prism::DefNode)
+      defs = body.grep(Prism::DefNode).reject { _1.receiver && !_1.receiver.is_a?(Prism::SelfNode) } # def x.m stays a statement (a singleton site)
       # top-level define_method(:name) { |params| body } with a literal symbol and block: a def
       dm = body.select { |st| st.is_a?(Prism::CallNode) && st.name == :define_method && st.receiver.nil? && st.block.is_a?(Prism::BlockNode) && st.arguments&.arguments&.first.is_a?(Prism::SymbolNode) }
       body = body - dm
@@ -341,6 +341,31 @@ module Indus
         end
       end
       @pre = Pretype.new(@ast, @classes) # receiver kinds for the structural decisions below
+      # a method on one object (`def x.m`, `x.extend(M)`, `x.define_singleton_method(:m) { }`): the object is
+      # retagged to a hidden subclass of its class carrying that method; dispatch by class id does the rest
+      @singletons = {} # node -> hidden Klass
+      scan_singletons(body) do |node, recv_node, defs|
+        kd = kind_of(recv_node)
+        raise "a singleton method on #{recv_node.class}: the object's class must be known at compile time" unless kd.is_a?(Symbol) && @classes[kd]
+        base = @classes[kd]
+        # one hidden subclass per receiver expression (`x`): several singleton defs on x accumulate on it
+        key = [kd, recv_node.respond_to?(:name) ? recv_node.name : recv_node.location.start_offset]
+        @single_subs ||= {}
+        sub = @single_subs[key] ||= begin
+          @single_count = (@single_count || 0) + 1
+          s = @classes[:"#{base.name}$#{@single_count}"] = Klass.new(:"#{base.name}$#{@single_count}", base); s.id = @classes.size; s
+        end
+        defs.each do |d|
+          f = Func.new(:"#{sub.name}##{d.name}#{sub.methods[d.name] ? "@v#{(sub.methods[d.name].versions || []).size + 1}" : ""}", 1 + def_param_names(d).size)
+          f.rest = true if d.parameters&.rest.is_a?(Prism::RestParameterNode)
+          f.cls = sub; @defs_by_func[f] = d
+          if (prev = sub.methods[d.name]) then f.primary = prev; (prev.versions ||= []) << f; prev.patchable = true; @def_versions[d] = [prev, f]
+          else sub.methods[d.name] = f end
+          methods << [sub, d, f]
+        end
+        base.tagged = true; sub.tagged = true # the class id sits in word 0 from the start
+        @singletons[node] = sub
+      end
       main = Func.new(:main, 0)
       lower_body(main, [], top)
       # prelude functions are lowered only when something names them (most of the prelude is
@@ -1141,6 +1166,7 @@ module Indus
         l.ty == :nil ? l : and_value(l) { expr(n.right) }
       when Prism::IndexTargetNode then raise "unsupported index target"
       when Prism::DefNode # a def reached as a statement: a later definition writes the method's slot; the first is already compiled
+        if (sub = @singletons&.[](n)) then emit(:retag, [expr(n.receiver), sub]); return (c = const(sym_id(n.name.to_s)); c.ty = :sym; c) end # def x.m: x joins the hidden subclass
         if (pv = @def_versions[n]) then emit(:setslot, pv) end
         c = const(sym_id(n.name.to_s)); c.ty = :sym; c
       when Prism::ClassNode # a class body reached at run time (under an if, inside a method): its defs' slot writes
@@ -1148,6 +1174,29 @@ module Indus
         nil_const
       else raise "unsupported: #{n.class}"
       end
+    end
+
+    # singleton sites: yields [node, receiver node, [DefNodes]] for `def x.m`, `x.extend(M)`, `x.define_singleton_method(:m) { }`
+    def scan_singletons(node, &blk)
+      return node.each { scan_singletons(_1, &blk) } if node.is_a?(Array)
+      return unless node.is_a?(Prism::Node)
+      case node
+      when Prism::ClassNode, Prism::ModuleNode, Prism::SingletonClassNode then return
+      when Prism::DefNode
+        if node.receiver && !node.receiver.is_a?(Prism::SelfNode) then blk.call(node, node.receiver, [node.copy(receiver: nil)]); return end
+      when Prism::CallNode
+        if node.name == :extend && node.receiver && !node.receiver.is_a?(Prism::ConstantReadNode) && node.arguments
+          defs = node.arguments.arguments.flat_map { |m| m.is_a?(Prism::ConstantReadNode) ? (@module_defs[m.name] || raise("extend #{m.name}: no such module")) : raise("extend: a module name") }
+          blk.call(node, node.receiver, defs); return
+        end
+        if node.name == :define_singleton_method && node.receiver && node.block.is_a?(Prism::BlockNode) && node.arguments&.arguments&.first.is_a?(Prism::SymbolNode)
+          src = node.send(:source); loc = node.location; b = node.block
+          ps = b.parameters.is_a?(Prism::BlockParametersNode) ? b.parameters.parameters : nil
+          d = Prism::DefNode.new(src, 0, loc, 0, node.arguments.arguments.first.unescaped.to_sym, loc, nil, ps, b.body, b.locals, loc, nil, nil, nil, nil, nil)
+          blk.call(node, node.receiver, [d]); return
+        end
+      end
+      node.compact_child_nodes.each { scan_singletons(_1, &blk) }
     end
 
     # a string known at compile time: a literal, a heredoc, or an interpolation of literals and constants
@@ -1314,7 +1363,7 @@ module Indus
       if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && (y = @yielders[n.name]) && y[0] && (k == y[0].name)
         return inline_yielder(y, n.receiver, args, nil, :none) # obj.m without a block, m yields: inlined with block_given? false
       end
-      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send respond_to? instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
+      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send respond_to? extend define_singleton_method instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
         rv = expr(n.receiver)
         return emit(:mcall, [n.name, rv, *object_args(n, args, @classes[k], rv)])
       end
@@ -1346,7 +1395,7 @@ module Indus
         bv = n.block.expression ? expr(n.block.expression) : @locals.fetch(@block_param || :__blk) { raise "anonymous & outside a method taking a block" }
         return block_arg_call(n, args, bv)
       end
-      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash) && !(%i[class_eval class_exec].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode)) && !(n.name == :define_method && @define_method_defs&.key?(n)) && !(%i[instance_eval instance_exec].include?(n.name) && n.receiver)
+      return block_call(n, args) if n.block.is_a?(Prism::BlockNode) && !(n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash) && !(%i[class_eval class_exec].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode)) && !(n.name == :define_method && @define_method_defs&.key?(n)) && !(%i[instance_eval instance_exec].include?(n.name) && n.receiver) && !@singletons&.key?(n)
       if n.name == :<< && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] && args.size == 1 # obj << v: the class's own method
         rv = expr(n.receiver)
         return emit(:mcall, [:<<, rv, expr(args[0])])
@@ -1506,7 +1555,7 @@ module Indus
       elsif n.name == :name && args.empty? && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :class && n.receiver.arguments.nil? && n.receiver.receiver
         expr(n.receiver) # obj.class.name: the class is already its name (no class objects)
       elsif n.name == :ancestors && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) then raise "ancestors: no class objects at run time"
-      elsif n.name == :extend && args.size == 1 && n.receiver then raise "extend on an instance: singleton methods are not supported (every object of a class shares its methods)"
+      elsif n.name == :extend && args.size == 1 && n.receiver && !@singletons&.key?(n) then raise "extend on #{n.receiver.class}: the object's class must be known at compile time"
       elsif %i[is_a? kind_of? instance_of?].include?(n.name) && args.size == 1 && n.receiver && args[0].is_a?(Prism::ConstantReadNode)
         emit(:isa, [expr(n.receiver), args[0].name])
       elsif n.name == :=== && args.size == 1 && n.receiver.is_a?(Prism::ConstantReadNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name) || %i[Integer Float String Array Hash Symbol NilClass Numeric Comparable].include?(n.receiver.name))
@@ -1619,6 +1668,8 @@ module Indus
           when :instance_variable_set then (k.ivar(iv); v = expr(args[1]); emit(:fld_set, [rv, k.ivar(iv), v]); v)
           else (c = const(k.ivars.include?(iv) ? 1 : 0); c.ty = :bool; c) end
         end
+      elsif (sub = @singletons&.[](n)) # x.extend(M) / x.define_singleton_method: the object joins the hidden subclass
+        rv = expr(n.receiver); emit(:retag, [rv, sub]); rv
       elsif n.name == :define_method && (d = @define_method_defs&.[](n)) # a run-time define_method site: the slot write
         expr(d)
       elsif %i[instance_eval instance_exec].include?(n.name) && n.receiver && n.block.is_a?(Prism::BlockNode) && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd]

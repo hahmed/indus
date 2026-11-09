@@ -504,6 +504,7 @@ module Indus
             @asm.bl(f.name)
           end
           i.float? ? @asm.fmov(d, 0) : @asm.mov(d, 0)
+        when :retag then @asm.mov_imm(16, i.args[1].id); @asm.str_off(16, reg(i.args[0]), 0) # the object now belongs to a hidden subclass (its word 0)
         when :setslot # a redefinition point: the method's slot takes the version defined here
           primary, version = i.args
           @asm.adr(16, version.name); @asm.str_off(16, Asm::GBASE, @asm.global(:"m_#{primary.name}"))
