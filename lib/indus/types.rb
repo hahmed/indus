@@ -76,6 +76,7 @@ module Indus
       # program-wide state; the resident compiler re-runs inference for one
       # function against the tables the whole program built
       @ivars ||= Hash.new { |h, k| h[k] = {} } # class name -> ivar index -> type
+      classes.each_value { |k| (k.nullable_ivars || []).each { |iv| ix = k.ivars.index(iv); @ivars[k.name][ix] = join(@ivars[k.name][ix], :nil) if ix } } # @x ||= v: nil until then
       @consts ||= {}
       @funcs_live = funcs
       funcs.each { |f| next if f.ptypes; f.ptypes = Array.new(f.params.size); f.rtype = nil; f.ptypes[0] = self_type(f.cls) if f.cls }

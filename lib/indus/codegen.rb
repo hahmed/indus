@@ -205,6 +205,8 @@ module Indus
             (@asm.mov_imm(TMP, k.id); @asm.str_off(TMP, 0, 0)) if k.tagged # class id in word 0
             @asm.mov(d, 0)
           end
+          # a nullable Integer field (@x ||= v somewhere) starts as nil: the sentinel, not 0
+          k.ivars.each_index { |ix| (@asm.emit(0xD2F00000 | 16); @asm.str_off(16, d, k.base + ix * 8)) if Types.ivar_type(k.name, ix) == :int? }
         when :mkbuf # a one-word cell holding the current string handle
           @asm.emit(0xF81F0FE0 | reg(i.args[0], 9)) # str v, [sp, #-16]!  (survives the allocation call)
           @asm.mov_imm(0, 8); @asm.bl(:__onew)

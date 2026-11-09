@@ -95,6 +95,7 @@ module Indus
       f.blocks.dup.each do |b|
         r = b.term
         next unless r&.op == :ret && (p = r.args[0]).op == :phi && p.block == b && b.insts.size == 1 && b.phis == [p]
+        next unless p.args.all? { |(pred, _)| pred.term&.op == :br && pred.term.args[0] == b } # every predecessor jumps here unconditionally (a condbr edge cannot take the ret)
         p.args.each { |(pred, v)| pred.insts.pop; pred << Inst.new(:ret, [v]) }
         f.blocks.delete(b)
       end

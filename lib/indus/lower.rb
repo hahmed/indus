@@ -24,6 +24,25 @@ module Indus
 
     # `def m ... rescue ... end` is a def whose body is a begin: give it the statements body
     # every def site expects, so one shape reaches the lowering
+    # a method body lifted out of a builtin's class: `self` is the parameter, a bare call is a call on it
+    def self.onto_receiver(node, d, pname)
+      return node.map { onto_receiver(_1, d, pname) } if node.is_a?(Array)
+      return node unless node.is_a?(Prism::Node)
+      src = node.send(:source); loc = node.location
+      return Prism::LocalVariableReadNode.new(src, 0, loc, 0, pname, 0) if node.is_a?(Prism::SelfNode)
+      if node.is_a?(Prism::CallNode) && node.receiver.nil? && !node.name.to_s.end_with?("=") && !%i[puts p print raise require loop lambda proc format sprintf rand block_given? yield].include?(node.name) && !d.locals.include?(node.name) && !(d.parameters && (d.parameters.requireds.map(&:name) + d.parameters.optionals.map(&:name)).include?(node.name))
+        node = node.copy(receiver: Prism::LocalVariableReadNode.new(src, 0, loc, 0, pname, 0))
+      end
+      fields = node.class.instance_method(:initialize).parameters.map(&:last).reject { %i[source node_id location flags].include?(_1) }
+      changes = {}
+      fields.each do |fl|
+        next unless node.respond_to?(fl)
+        v = node.public_send(fl); nv = onto_receiver(v, d, pname)
+        changes[fl] = nv unless nv.equal?(v) || v.is_a?(Array) && nv == v
+      end
+      changes.empty? ? node : node.copy(**changes)
+    end
+
     def self.normalize(node)
       return node.map { normalize(_1) } if node.is_a?(Array)
       return node unless node.is_a?(Prism::Node)
@@ -70,6 +89,39 @@ module Indus
       walk = ->(c) { (c.body&.body || []).grep(Prism::ClassNode).each { |inner| nested << inner; walk.(inner) } }
       cdefs.each { walk.(_1) }
       cdefs += nested
+      # a class opened several times (class A; ...; end ... class A; ...; end) is one class: the bodies
+      # concatenated in order, the superclass from whichever body names it. (Whole program: every body is known.)
+      by_name = {}
+      cdefs = cdefs.each_with_object([]) do |c, out|
+        nm = c.constant_path.name
+        if (first = by_name[nm])
+          merged_body = (first.body&.body || []) + (c.body&.body || [])
+          src = first.send(:source); loc = first.location
+          merged = first.copy(body: Prism::StatementsNode.new(src, 0, loc, 0, merged_body), superclass: first.superclass || c.superclass)
+          out[out.index(first)] = merged; by_name[nm] = merged
+        else
+          by_name[nm] = c; out << c
+        end
+      end
+      @reopened = by_name.keys.select { |nm| body.grep(Prism::ClassNode).count { _1.constant_path.name == nm } > 1 }
+      # reopening a builtin (class String; def shout = upcase + "!"; end): each def becomes a family
+      # function __str_shout(self__, ...) with self and bare calls rewritten onto the receiver; the
+      # call `"hi".shout` then routes like any String method
+      builtin_fams = { String: "str", Integer: "num", Float: "num", Numeric: "num", Array: "arr", Hash: "hash" }
+      cdefs, builtin_bodies = cdefs.partition { !builtin_fams.key?(_1.constant_path.name) }
+      builtin_bodies.each do |c|
+        fam = builtin_fams[c.constant_path.name]
+        (c.body&.body || []).each do |st|
+          raise "class #{c.constant_path.name}: only `def` is supported in a reopened builtin (got #{st.class})" unless st.is_a?(Prism::DefNode) && st.receiver.nil?
+          src = st.send(:source); loc = st.location
+          selfp = Prism::RequiredParameterNode.new(src, 0, loc, 0, :self__)
+          ps = st.parameters || Prism::ParametersNode.new(src, 0, loc, 0, [], [], nil, [], [], nil, nil)
+          ps = ps.copy(requireds: [selfp] + ps.requireds)
+          body_ = Lower.onto_receiver(st.body, st, :self__)
+          defs_extra = Prism::DefNode.new(src, 0, loc, 0, :"__#{fam}_#{st.name.to_s.sub('?', '_p').sub('!', '_bang')}", loc, nil, ps, body_, [:self__] + st.locals, loc, nil, nil, nil, nil, nil)
+          body << defs_extra; defs << defs_extra
+        end
+      end
       mod_ivars = (mods + cdefs).flat_map { |m| (m.body&.body || []).grep(Prism::InstanceVariableWriteNode).map { [m.constant_path.name, _1] } } # `@x = v` in a module or class body: the class object's own ivar, set before the program runs
       # `def self.m` in a class or module body: a function named Owner.m, no self
       @modules = mods.map { _1.constant_path.name }
@@ -152,7 +204,7 @@ module Indus
       class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).map { |w| w.copy(name: :"#{c.constant_path.name}::#{w.name}") } + (c.body&.body || []).grep(Prism::ClassVariableWriteNode) } # @@x = v in a class body: run first, like a constant
       # Name = Struct.new(:a, :b) defines a class with accessors and an initialize
       structs = body.select { |st| st.is_a?(Prism::ConstantWriteNode) && struct_new?(st.value) }
-      top = (body - defs - cdefs - mods - structs)
+      top = (body - defs - body.grep(Prism::ClassNode) - mods - structs) # every class body (merged or not) leaves the top level
       top = class_consts + mod_consts + top
       @mod_ivars = mod_ivars
       # methods that take a block (contain yield) are inlined at call sites with a literal block;
@@ -562,6 +614,7 @@ module Indus
       (k.mixins ||= []).concat(included + prepended)
       mixed_in, prepended_defs = included.flat_map(&mod_defs), prepended.flat_map(&mod_defs)
       (mixed_in + stmts.grep(Prism::DefNode) + prepended_defs).each { |d| assigned_ivars(d).each { k.ivar(_1) } } # every field known before any method is lowered
+      (k.nullable_ivars ||= []).concat((mixed_in + stmts.grep(Prism::DefNode) + prepended_defs).flat_map { or_written_ivars(_1) }).uniq!
       @visibility = nil
       (mixed_in + stmts + prepended_defs).each do |st|
         case st
@@ -3030,6 +3083,13 @@ module Indus
       last = nil; body.each { last = expr(_1) }; last
     ensure
       @recv_value = saved
+    end
+
+    def or_written_ivars(node, out = []) # @x ||= v / @x &&= v: read before any sure write
+      return out unless node.is_a?(Prism::Node)
+      out << node.name if (node.is_a?(Prism::InstanceVariableOrWriteNode) || node.is_a?(Prism::InstanceVariableAndWriteNode)) && !out.include?(node.name)
+      node.compact_child_nodes.each { or_written_ivars(_1, out) }
+      out
     end
 
     def assigned_ivars(node, out = [])
