@@ -382,7 +382,37 @@ def __str_swapcase(s)
   out
 end
 
-def __str_ord(s) = __ld8(s, 0)
+# the first character's codepoint (UTF-8 decoded)
+def __str_ord(s)
+  b = __ld8(s, 0)
+  return b if b < 128
+  n = __utf8_len(b)
+  cp = n == 2 ? b & 31 : (n == 3 ? b & 15 : b & 7)
+  k = 1
+  while k < n && k < s.length
+    cp = (cp << 6) | (__ld8(s, k) & 63)
+    k = k + 1
+  end
+  cp
+end
+# the first character (one UTF-8 sequence), "" for an empty string
+def __str_chr(s)
+  return "" if s.length == 0
+  n = __utf8_len(__ld8(s, 0))
+  n = s.length if n > s.length
+  s[0, n]
+end
+# a codepoint as its UTF-8 bytes
+def __utf8_encode(cp)
+  return cp.chr if cp < 128
+  if cp < 2048
+    return (192 | (cp >> 6)).chr + (128 | (cp & 63)).chr
+  end
+  if cp < 65536
+    return (224 | (cp >> 12)).chr + (128 | ((cp >> 6) & 63)).chr + (128 | (cp & 63)).chr
+  end
+  (240 | (cp >> 18)).chr + (128 | ((cp >> 12) & 63)).chr + (128 | ((cp >> 6) & 63)).chr + (128 | (cp & 63)).chr
+end
 
 def __str_empty_p(s) = s.length == 0
 

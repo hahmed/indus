@@ -80,7 +80,7 @@ def __format(fmt, args)
           body = __dyn_to_s(arg)
           body = body[0, prec] if prec >= 0 && prec < body.length
         elsif conv == 99 # c: a codepoint, or the first character of a string
-          body = __tag(arg) == 2 ? __dyn_to_s(arg)[0, 1] : __dyn_to_int(arg).chr
+          body = __tag(arg) == 2 ? __str_chr(__dyn_to_s(arg)) : __utf8_encode(__dyn_to_int(arg))
         else
           __trap
         end

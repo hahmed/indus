@@ -1801,6 +1801,8 @@ module Indus
       elsif %i[length size bytesize].include?(n.name) && args.empty? && n.receiver then emit(:alen, [expr(n.receiver)])
       elsif (n.name == :even? || n.name == :odd?) && args.empty? && n.receiver
         emit(:cmp, [emit(:and, [expr(n.receiver), const(1)]), const(0)], n.name == :even? ? :eq : :ne)
+      elsif n.name == :chr && args.empty? && n.receiver && (kind_of(n.receiver) == :str || n.receiver.is_a?(Prism::StringNode)) then emit(:call, [demand(:__str_chr), expr(n.receiver)])
+      elsif n.name == :chr && args.size == 1 && n.receiver then emit(:call, [demand(:__utf8_encode), expr(n.receiver)]) # n.chr("UTF-8") / n.chr(Encoding::UTF_8)
       elsif n.name == :chr && args.empty? && n.receiver then emit(:chr, [expr(n.receiver)])
       elsif n.name == :pass && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Thread then const(0) # no preemption: nothing to yield to
       elsif %i[lock synchronize sleep].include?(n.name) || n.receiver.is_a?(Prism::ConstantReadNode) && %i[Mutex Queue].include?(n.receiver.name)
@@ -1883,7 +1885,7 @@ module Indus
         counted_loop(const(0), len, :lt, [], []) { |i, _ps, _pfx| @locals[outv] = emit(:aset, [@locals[outv], i, emit(:add, [lo, i])]) }
         @locals.delete(outv)
       elsif n.name == :insert && args.size == 2 && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode) || n.receiver.is_a?(Prism::ArrayNode))
-        r = emit(:call, [demand(:__arr_insert), expr(n.receiver), expr(args[0]), expr(args[1])]) # grows: rebind the home, as push does
+        r = emit(:call, [demand(:__arr_insert), expr(n.receiver), expr(args[0]), expr(args[1])]); r.routed = :insert # grows: rebind the home, as push does (Types reroutes a String to __str_insert)
         if n.receiver.is_a?(Prism::LocalVariableReadNode) then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
         elsif n.receiver.is_a?(Prism::InstanceVariableReadNode) then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
         r
@@ -2022,6 +2024,9 @@ module Indus
       when :__byte_at then emit(:rawld8, [expr(args[0]), expr(args[1])])
       when :__st8 then (a = expr(args[0]); ix = expr(args[1]); v = expr(args[2]); emit(:rawst8, [a, ix, v]); v)
       when :__sdup then emit(:sdup, [expr(args[0])])
+      when :__ascii_p then emit(:sascii, [expr(args[0])])   # every byte < 0x80 (eight bytes a step)
+      when :__blen then emit(:alen, [expr(args[0])])        # the byte length, whatever the Types rule for .length
+      when :__clen then emit(:sclen, [expr(args[0])])       # the UTF-8 character count
       when :__is_arr then emit(:is_arr, [expr(args[0])]) # folded by Types from the operand's type
       when :__to_dyn then emit(:todyn, [expr(args[0])])  # tag by the operand's type (Types fills it in)
       when :__is_sym then emit(:is_sym, [expr(args[0])]) # true when the value's static type is Symbol (Types folds it)

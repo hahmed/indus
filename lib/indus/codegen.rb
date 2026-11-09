@@ -447,6 +447,8 @@ module Indus
           raise "to_i on #{i.args[0].ty.inspect}" unless i.args[0].float? || %i[int int?].include?(i.args[0].ty) || i.args[0].ty.nil?
           i.args[0].float? ? @asm.fcvtzs(d, freg(i.args[0])) : @asm.mov(d, reg(i.args[0]))
         when :stoi then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_str_to_i); @asm.mov(d, 0)
+        when :sascii then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_str_ascii); @asm.mov(d, 0)
+        when :sclen then @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:rt_str_clen); @asm.mov(d, 0)
         when :putc
           @asm.mov(0, reg(i.args[0], 0)); @asm.bl(:__putc)
         when :and then @asm.and_(d, reg(i.args[0]), reg(i.args[1], 9))

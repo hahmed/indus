@@ -1084,6 +1084,45 @@ rt_str_cmp:
 9:      mov     x0, #1
         ret
 
+// rt_str_ascii(x0 s) -> 1 if every byte is < 0x80 (eight bytes a step), else 0.
+// Strings are UTF-8 bytes; character positions equal byte positions only when this holds.
+rt_str_ascii:
+        ldur    x2, [x0, #-8]           // len
+        mov     x3, #0x8080
+        movk    x3, #0x8080, lsl #16
+        movk    x3, #0x8080, lsl #32
+        movk    x3, #0x8080, lsl #48
+0:      cmp     x2, #8
+        b.lo    1f
+        ldr     x4, [x0], #8
+        tst     x4, x3
+        b.ne    9f
+        sub     x2, x2, #8
+        b       0b
+1:      cbz     x2, 2f
+        ldrb    w4, [x0], #1
+        tbnz    w4, #7, 9f
+        sub     x2, x2, #1
+        b       1b
+2:      mov     x0, #1
+        ret
+9:      mov     x0, #0
+        ret
+
+// rt_str_clen(x0 s) -> number of UTF-8 characters (bytes that are not continuation bytes 10xxxxxx)
+rt_str_clen:
+        ldur    x2, [x0, #-8]
+        mov     x3, #0
+0:      cbz     x2, 1f
+        ldrb    w4, [x0], #1
+        and     w4, w4, #0xC0
+        cmp     w4, #0x80
+        cinc    x3, x3, ne
+        sub     x2, x2, #1
+        b       0b
+1:      mov     x0, x3
+        ret
+
 // rt_str_to_i(x0 s) -> integer. Ruby's String#to_i: skip leading whitespace,
 // optional sign, digits (underscores allowed between digits), stop at anything else; 0 if none.
 rt_str_to_i:

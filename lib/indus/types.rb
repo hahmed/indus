@@ -1662,6 +1662,8 @@ module Indus
       when :and, :or then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int # nil is the word 0, false: nil & x, nil | x are booleans
       when :xor then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int
       when :mod then i.args.any? { of(f, _1) == :float } ? :float : :int
+      when :sascii then :bool
+      when :sclen then :int
       when :shl, :shr, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :rawmunmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub, :handle then :int
       when :cmp, :ucmp, :isa, :isa_dyn then :bool
       when :box then :dyn
