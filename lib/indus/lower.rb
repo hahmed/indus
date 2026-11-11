@@ -26,6 +26,22 @@ module Indus
     # `def m ... rescue ... end` is a def whose body is a begin: give it the statements body
     # every def site expects, so one shape reaches the lowering
     # a method body lifted out of a builtin's class: `self` is the parameter, a bare call is a call on it
+    # reads of the given locals become constant reads (an anonymous module/class held in a local)
+    def self.rename_locals(node, names)
+      return node.map { rename_locals(_1, names) } if node.is_a?(Array)
+      return node unless node.is_a?(Prism::Node)
+      return node if node.is_a?(Prism::DefNode) || node.is_a?(Prism::ClassNode) || node.is_a?(Prism::ModuleNode) # a top-level local is not visible in a def / class body
+      return Prism::ConstantReadNode.new(node.send(:source), 0, node.location, 0, names[node.name]) if node.is_a?(Prism::LocalVariableReadNode) && names.key?(node.name)
+      fields = node.class.instance_method(:initialize).parameters.map(&:last) - %i[source node_id location flags]
+      changed = false
+      vals = fields.map do |fl|
+        next nil unless node.respond_to?(fl)
+        v = node.public_send(fl); nv = rename_locals(v, names)
+        changed ||= !nv.equal?(v); [fl, nv]
+      end.compact
+      changed ? node.copy(**vals.to_h) : node
+    end
+
     def self.onto_receiver(node, d, pname)
       return node.map { onto_receiver(_1, d, pname) } if node.is_a?(Array)
       return node unless node.is_a?(Prism::Node)
@@ -72,17 +88,34 @@ module Indus
 
     def run
       body = @ast.statements.body
-      # A = Class.new(Base) { ... } / A = Module.new { } at the top level: the same as `class A < Base ... end`
+      # A = Class.new(Base) { ... } / A = Module.new { } at the top level: the same as `class A < Base ... end`.
+      # mod = Module.new { } in a local likewise: an anonymous module named after the local (`__anon_mod`), and
+      # every later read of that local as a module/class argument (include, extend, prepend, raise, <) is the constant
+      anon_locals = {}
       body = body.map do |st|
-        next st unless st.is_a?(Prism::ConstantWriteNode) && st.value.is_a?(Prism::CallNode) && st.value.name == :new && st.value.receiver.is_a?(Prism::ConstantReadNode) && %i[Class Module].include?(st.value.receiver.name) && st.value.block.is_a?(Prism::BlockNode)
+        is_anon = st.value.is_a?(Prism::CallNode) && st.value.name == :new && st.value.receiver.is_a?(Prism::ConstantReadNode) && %i[Class Module].include?(st.value.receiver.name) && st.value.block.is_a?(Prism::BlockNode) if st.is_a?(Prism::ConstantWriteNode) || st.is_a?(Prism::LocalVariableWriteNode)
+        next st unless is_anon
+        cname = st.is_a?(Prism::ConstantWriteNode) ? st.name : (anon_locals[st.name] = :"__anon_#{st.name}")
         v = st.value; src = st.send(:source); loc = st.location
-        path = Prism::ConstantReadNode.new(src, 0, loc, 0, st.name)
+        path = Prism::ConstantReadNode.new(src, 0, loc, 0, cname)
         if v.receiver.name == :Module
-          Prism::ModuleNode.new(src, 0, loc, 0, [], loc, path, v.block.body, loc, st.name)
+          Prism::ModuleNode.new(src, 0, loc, 0, [], loc, path, v.block.body, loc, cname)
         else
           sup = v.arguments&.arguments&.first
-          Prism::ClassNode.new(src, 0, loc, 0, [], loc, path, sup && loc, sup, v.block.body, loc, st.name)
+          Prism::ClassNode.new(src, 0, loc, 0, [], loc, path, sup && loc, sup, v.block.body, loc, cname)
         end
+      end
+      unless anon_locals.empty?
+        body = Lower.rename_locals(body, anon_locals)
+        @ast = @ast.copy(statements: @ast.statements.copy(body: body)) # the pre-typing and every later walk see the constants
+      end
+      # X.include(Module.new { }) / obj.extend(Module.new { }): the anonymous module gets a name and a declaration
+      anon_n = 0
+      body = body.flat_map do |st|
+        next [st] unless st.is_a?(Prism::CallNode) && %i[include prepend extend].include?(st.name) && (a = st.arguments&.arguments) && a.size == 1 && a[0].is_a?(Prism::CallNode) && a[0].name == :new && a[0].receiver.is_a?(Prism::ConstantReadNode) && a[0].receiver.name == :Module && a[0].block.is_a?(Prism::BlockNode)
+        src = st.send(:source); loc = st.location; cname = :"__anon_mod#{anon_n += 1}"
+        path = Prism::ConstantReadNode.new(src, 0, loc, 0, cname)
+        [Prism::ModuleNode.new(src, 0, loc, 0, [], loc, path, a[0].block.body, loc, cname), st.copy(arguments: st.arguments.copy(arguments: [path]))]
       end
       # modules are namespaces: hoist their classes and constants to the top level
       mods = body.grep(Prism::ModuleNode)
@@ -102,6 +135,14 @@ module Indus
       walk = ->(c) { (c.body&.body || []).grep(Prism::ClassNode).each { |inner| nested << inner; walk.(inner) } }
       cdefs.each { walk.(_1) }
       cdefs += nested
+      # `A.include(M)` / `A.prepend(M)` / `A.extend(M)` as a top-level statement: the same as inside A's body (a re-opening)
+      body = body.flat_map do |st|
+        next [st] unless st.is_a?(Prism::CallNode) && %i[include prepend extend].include?(st.name) && st.receiver.is_a?(Prism::ConstantReadNode) && st.arguments&.arguments&.all? { _1.is_a?(Prism::ConstantReadNode) } && cdefs.any? { _1.constant_path.name == st.receiver.name }
+        src = st.send(:source); loc = st.location
+        inner = st.copy(receiver: nil)
+        [Prism::ClassNode.new(src, 0, loc, 0, [], loc, st.receiver, nil, nil, Prism::StatementsNode.new(src, 0, loc, 0, [inner]), loc, st.receiver.name)]
+      end
+      cdefs = body.grep(Prism::ClassNode) + mod_classes + nested
       # a class opened several times (class A; ...; end ... class A; ...; end) is one class: the bodies
       # concatenated in order, the superclass from whichever body names it. (Whole program: every body is known.)
       by_name = {}
@@ -778,7 +819,14 @@ module Indus
         emit(:condbr, [test, tb, nb])
         @cur = tb; @locals = before.dup
         if ref.is_a?(Prism::LocalVariableTargetNode) # the bound exception is narrowed to the rescued class (one class; several stay the union)
-          @locals[lname(ref.name)] = classes.size == 1 && @classes[classes[0]] ? emit(:unbox, [exc, classes[0]]) : exc
+          # one class with descendants that override its methods (`def message`): the set, so e.message dispatches
+          if classes.size == 1 && (rk = @classes[classes[0]])
+            descendants = @classes.values.select { |c| !c.equal?(rk) && !c.closure && (a = c.superclass; a = a.superclass while a && !a.equal?(rk); a) }
+            overriding = descendants.select { |c| c.methods.keys.any? { |m| rk.find_method(m) } }
+            @locals[lname(ref.name)] = overriding.empty? ? emit(:unbox, [exc, classes[0]]) : (u = emit(:unbox, [exc, [:poly, [rk.name, *descendants.map(&:name)].sort]]); u)
+          else
+            @locals[lname(ref.name)] = exc
+          end
         end
         rv = body.map { expr(_1) }.last || const(0)
         ensure_body.each { expr(_1) }
