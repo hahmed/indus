@@ -1556,7 +1556,7 @@ module Indus
       if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && (y = @yielders[n.name]) && y[0] && (k == y[0].name)
         return inline_yielder(y, n.receiver, args, nil, :none) # obj.m without a block, m yields: inlined with block_given? false
       end
-      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send respond_to? extend define_singleton_method instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
+      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send respond_to? extend define_singleton_method methods public_methods instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
         rv = expr(n.receiver)
         return emit(:mcall, [n.name, rv, *object_args(n, args, @classes[k], rv)])
       end
@@ -1747,7 +1747,15 @@ module Indus
         emit(:sconst, [n.receiver.name.to_s]) # Klass.name
       elsif n.name == :class && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name))
         emit(:sconst, [@modules.include?(n.receiver.name) ? "Module" : "Class"])
-      elsif %i[instance_methods public_instance_methods singleton_methods methods].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && ((kk = @classes[n.receiver.name]) || @modules.include?(n.receiver.name))
+      elsif %i[methods public_methods].include?(n.name) && n.receiver && !n.receiver.is_a?(Prism::ConstantReadNode) && (kd = kind_of(n.receiver)).is_a?(Symbol) && (kk = @classes[kd])
+        # obj.methods / obj.public_methods(false): the class's instance methods (its own only with false)
+        expr(n.receiver)
+        own_only = args[0].is_a?(Prism::FalseNode)
+        chain = []; c = kk; while c; chain << c; c = c.superclass; end
+        chain = [kk] if own_only
+        names = chain.flat_map { |c| c.methods.keys.reject { _1 == :initialize || _1.to_s.start_with?("__") || c.hidden&.[](_1) } + c.readers.keys + c.writers.keys }.uniq
+        pack_values(names.map { |nm| c = const(sym_id(nm.to_s)); c.ty = :sym; c })
+      elsif %i[instance_methods public_instance_methods singleton_methods methods public_methods].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && ((kk = @classes[n.receiver.name]) || @modules.include?(n.receiver.name))
         own_only = args[0].is_a?(Prism::FalseNode)
         names = if n.name == :singleton_methods || n.name == :methods # the class object's methods (inherited class methods too, unless (false))
                   chain = []; c = kk; while c; chain << c.name; c = c.superclass && @classes[c.superclass]; end
@@ -1759,6 +1767,12 @@ module Indus
                   chain.flat_map { |c| c.methods.keys.reject { _1 == :initialize || _1.to_s.start_with?("__") } + c.readers.keys + c.writers.keys }.uniq
                 end
         pack_values(names.map { |nm| c = const(sym_id(nm.to_s)); c.ty = :sym; c })
+      elsif %i[owner name arity].include?(n.name) && args.empty? && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :instance_method && n.receiver.receiver.is_a?(Prism::ConstantReadNode) && (uk = @classes[n.receiver.receiver.name]) && n.receiver.arguments&.arguments&.first.is_a?(Prism::SymbolNode)
+        um = n.receiver.arguments.arguments.first.unescaped.to_sym
+        case n.name
+        when :owner then (c = uk; c = c.superclass while c && !c.methods.key?(um) && !c.readers.key?(um) && !c.writers.key?(um); emit(:sconst, [(c || uk).name.to_s]))
+        when :name then (c = const(sym_id(um.to_s)); c.ty = :sym; c)
+        else (m = uk.find_method(um)) ? const(m.params.size - 1) : const(uk.find_reader(um) ? 0 : 1) end
       elsif %i[call bind_call].include?(n.name) && n.receiver.is_a?(Prism::CallNode) && (um = unbound_method_of(n.receiver, n.name == :bind_call ? args[0] : nil))
         kname, mname, obj = um
         rest = n.name == :bind_call ? args[1..] : args
@@ -1798,16 +1812,26 @@ module Indus
         emit(:sconst, [{ int: "Integer", float: "Float", str: "String", array: "Array", hash: "Hash", range: "Range", sym: "Symbol", bool: n.receiver.is_a?(Prism::TrueNode) ? "TrueClass" : "FalseClass", nil: "NilClass" }[bk]]) # a builtin's class: its name (no class objects at run time)
       elsif n.name == :method && args.size == 1 && args[0].is_a?(Prism::SymbolNode) # method(:m): a closure over the call
         mname = args[0].unescaped.to_sym; src = n.send(:source); loc = n.location
-        target = n.receiver.nil? ? (@funcs[mname] || @yielders[mname] || (@klass && @klass.find_method(mname))) : nil
+        target = n.receiver.nil? ? (@funcs[mname] || @yielders[mname] || (@klass && @klass.find_method(mname))) : ((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] ? @classes[kd].find_method(mname) : nil)
         d = target.is_a?(Func) ? @defs_by_func[target] : (target.is_a?(Array) ? target[1] : nil)
         zero_arity = %i[upcase downcase size length to_s to_i to_f reverse strip chars bytes sum min max first last sort uniq inspect succ abs even? odd? zero? empty? keys values to_a to_sym capitalize swapcase chomp chop hash].include?(mname)
         nparams = d ? def_param_names(d).size : (n.receiver ? (zero_arity ? 0 : (mname == :pow ? 2 : 1)) : (%i[puts p print String Integer Float Array].include?(mname) ? 1 : raise("method(:#{mname}): unknown method")))
         params = (0...nparams).map { :"a#{_1}__" }
         arg_nodes = params.map { Prism::LocalVariableReadNode.new(src, 0, loc, 0, _1, 0) }
         recv_node = n.receiver
+        if recv_node && !recv_node.is_a?(Prism::LocalVariableReadNode) && !recv_node.is_a?(Prism::IntegerNode) && !recv_node.is_a?(Prism::StringNode) && !recv_node.is_a?(Prism::ConstantReadNode)
+          # obj_expr.method(:m): the receiver is evaluated once, into a hidden local the Method object captures
+          hidden = :"__mrecv#{@f.blocks.size}_#{@lambda_count || 0}"
+          @locals[lname(hidden)] = expr(recv_node)
+          recv_node = Prism::LocalVariableReadNode.new(src, 0, loc, 0, hidden, 0)
+        end
         captured = recv_node.is_a?(Prism::LocalVariableReadNode) ? [recv_node.name] : []
         call_node = Prism::CallNode.new(src, 0, loc, 0, recv_node, nil, mname, loc, nil, arg_nodes.empty? ? nil : Prism::ArgumentsNode.new(src, 0, loc, 0, arg_nodes), nil, nil, nil)
-        closure_value(params, captured, [call_node])
+        c = closure_value(params, captured, [call_node])
+        owner = n.receiver.nil? ? (target.is_a?(Func) && target.cls ? target.cls.name : (@klass&.name || :Object)) : ((kd = kind_of(recv_node)).is_a?(Symbol) && @classes[kd] ? kd : { int: :Integer, str: :String, float: :Float, array: :Array, hash: :Hash }[kd])
+        c.args[0].method_of = [owner, mname, nparams, recv_node ? captured.first : nil]
+        sym_id(mname.to_s) # .name answers with the symbol: in the table now
+        c
       elsif n.name == :block_given? && args.empty? && n.receiver.nil?
         if @block == :none then (c = const(0); c.ty = :bool; c)
         elsif @block then (c = const(1); c.ty = :bool; c)
@@ -3615,6 +3639,7 @@ module Indus
         return class_valued?(a.rescue_expression) && ![:str, :sym].include?(kind_of(a.expression)) && !kind_of(a.expression).is_a?(Array) && !a.expression.is_a?(Prism::StringNode) && !a.expression.is_a?(Prism::SymbolNode) && !a.expression.is_a?(Prism::ArrayNode) && !a.expression.is_a?(Prism::HashNode)
       end
       return true if a.is_a?(Prism::ConstantReadNode) && (@classes[a.name] || %i[Integer Float String Array Hash Symbol NilClass].include?(a.name))
+      return true if a.is_a?(Prism::CallNode) && %i[owner superclass].include?(a.name) && a.arguments.nil? && a.receiver # Method#owner, Class#superclass: a class
       a.is_a?(Prism::CallNode) && a.name == :class && a.arguments.nil? && a.receiver
     end
 

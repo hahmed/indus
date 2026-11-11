@@ -1344,6 +1344,23 @@ module Indus
         i.op = :sconst; i.args = [cn]; i.ty = :str; return
       end
       if t == :str && args.empty? && name == :name then i.op = :nop; i.args = [recv]; i.ty = :str; return end # a class value is its name (no class objects at run time)
+      if (k = @classes[t]) && k.closure && k.method_of && args.empty? && %i[arity name owner receiver to_proc unbind lambda? parameters].include?(name)
+        owner, mname, nparams, recv_local = k.method_of
+        case name
+        when :arity then i.op = :const; i.args = [nparams]; i.ty = :int
+        when :name then i.op = :const; i.args = [@lower.sym_id(mname.to_s)]; i.ty = :sym
+        when :owner then i.op = :sconst; i.args = [owner.to_s]; i.ty = :str # classes are names at run time
+        when :to_proc, :unbind then i.op = :nop; i.args = [recv]; i.ty = t # the same callable
+        when :lambda? then i.op = :const; i.args = [1]; i.ty = :bool
+        when :receiver
+          return unless recv_local # a bare method(:m): self is not held
+          f_ = Inst.new(:fld_get, [recv, k.ivar(:"@#{recv_local}")]); f_.ty = ivar_type(k.name, k.ivar(:"@#{recv_local}")); f_.block = i.block; i.block.insts.insert(i.block.insts.index(i), f_)
+          i.op = :nop; i.args = [f_]; i.ty = f_.ty
+        when :parameters then return
+        end
+        return
+      end
+      if (k = @classes[t]) && k.closure && k.method_of && name == :bind && args.size == 1 then i.op = :nop; i.args = [recv]; i.ty = t; return end # unbind.bind(obj): the object is the captured receiver already
       if t == :dyn && args.empty? && %i[to_s inspect].include?(name)
         # user classes defining to_s/inspect may be behind the tag: tag 8 (object) dispatches to them, anything else is the builtin
         return unless @settled # the set of such classes must be final
