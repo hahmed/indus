@@ -119,6 +119,11 @@ module Indus
       end
       # modules are namespaces: hoist their classes and constants to the top level
       mods = body.grep(Prism::ModuleNode)
+      # modules nested in modules (module Tr; module CM; end; end) are hoisted: the inner name resolves on its own
+      nested_mods = []
+      walk_mods = ->(m) { (m.body&.body || []).grep(Prism::ModuleNode).each { |inner| nested_mods << inner; walk_mods.(inner) } }
+      mods.each { walk_mods.(_1) }
+      mods += nested_mods
       # a module's instance methods: `include M` in a class body compiles them as that class's own
       # (one copy per including class -- typed for that class, like everything else here)
       @module_defs = mods.to_h { |m| [m.constant_path.name, (m.body&.body || []).grep(Prism::DefNode).reject { _1.receiver.is_a?(Prism::SelfNode) }] }
@@ -185,6 +190,25 @@ module Indus
       # `def self.m` in a class or module body: a function named Owner.m, no self
       @modules = mods.map { _1.constant_path.name }
       sdefs = (cdefs + mods).flat_map { |c| (c.body&.body || []).grep(Prism::DefNode).select { _1.receiver.is_a?(Prism::SelfNode) }.map { [c.constant_path.name, _1] } }
+      # `include M` where M's `def self.included(base)` is `base.extend(CM)` (the Concern idiom): the including class also
+      # extends CM -- rewritten into its body as `extend CM` before the extend pass below
+      concern_extends = {}
+      mods.each do |m|
+        hook = (m.body&.body || []).find { |d| d.is_a?(Prism::DefNode) && d.receiver.is_a?(Prism::SelfNode) && d.name == :included }
+        next unless hook && (bp = hook.parameters&.requireds&.first)
+        ext = (hook.body&.body || []).filter_map { |s| s.is_a?(Prism::CallNode) && s.name == :extend && s.receiver.is_a?(Prism::LocalVariableReadNode) && s.receiver.name == bp.name && s.arguments&.arguments&.size == 1 && s.arguments.arguments[0].is_a?(Prism::ConstantReadNode) ? s.arguments.arguments[0] : nil }
+        concern_extends[m.constant_path.name] = ext unless ext.empty?
+        (@structural_hooks ||= []) << hook if !ext.empty? && (hook.body.body.size == ext.size) # every statement applied structurally: the hook is not a function
+      end
+      unless concern_extends.empty?
+        cdefs = cdefs.map do |c|
+          adds = (c.body&.body || []).flat_map { |st| st.is_a?(Prism::CallNode) && st.name == :include && st.receiver.nil? && st.arguments ? st.arguments.arguments.flat_map { |a| a.is_a?(Prism::ConstantReadNode) ? (concern_extends[a.name] || []) : [] } : [] }
+          next c if adds.empty?
+          src = c.send(:source); loc = c.location
+          extends = adds.map { |path| Prism::CallNode.new(src, 0, loc, 0, nil, nil, :extend, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, [path]), nil, nil, nil) }
+          c.copy(body: Prism::StatementsNode.new(src, 0, loc, 0, (c.body&.body || []) + extends))
+        end
+      end
       # `extend M` in a class body: M's methods are class methods of that class
       (cdefs + mods).each do |c|
         (c.body&.body || []).each do |st|
@@ -286,9 +310,14 @@ module Indus
       # (the first declaration of each class only), with the subclass's name as the class value
       seen_decl = {}
       inherited_hook = lambda do |st|
-        next [] unless st.superclass && !seen_decl[st.constant_path.name]
+        out = []
+        out << [:inherited, st.constant_path.name] if st.superclass && !seen_decl[st.constant_path.name]
         seen_decl[st.constant_path.name] = true
-        [[:inherited, st.constant_path.name]] # resolved when lowered: the class methods are registered later
+        # `def self.method_added(m)` in this class: called once per def in the body, in order (the class body runs at its position)
+        (st.body&.body || []).each { |d| out << [:method_added, st.constant_path.name, d.name] if d.is_a?(Prism::DefNode) && !d.receiver && d.name != :method_added }
+        # `def self.extended(o)` / `self.included(b)` on a module named by `extend M` / `include M` in the body
+        (st.body&.body || []).each { |c| out << [:mod_hook, c.name == :extend ? :extended : :included, c.arguments.arguments[0].name, st.constant_path.name] if c.is_a?(Prism::CallNode) && %i[extend include].include?(c.name) && c.receiver.nil? && c.arguments&.arguments&.size == 1 && c.arguments.arguments[0].is_a?(Prism::ConstantReadNode) }
+        out
       end
       top = (body - (defs - @def_versions.keys) - mods - structs).flat_map { |st| st.is_a?(Prism::ClassNode) ? inherited_hook.(st) + (@redefine_markers[st] ? [[:redefine, *@redefine_markers[st]]] : []) : [st] } # a re-opening that redefines methods, or a second `def f`: a slot write at its position
       top = class_consts + mod_consts + top
@@ -304,6 +333,7 @@ module Indus
         f = @funcs[name] = Func.new(name, params.size)
         @dm_bodies[f] = [params, st.block.body&.body || []]
       end
+      sdefs.reject! { |(_, d)| @structural_hooks&.any? { _1.equal?(d) } } # a hook applied at compile time is not a function
       @sdef_nodes = Hash.new { |h, kk| h[kk] = [] }
       sdefs.each { |_, d| @sdef_nodes[d.name] << d }
       sdefs.each do |owner, d|
@@ -964,6 +994,16 @@ module Indus
       end
       last = nil
       stmts.each do |st|
+        if st.is_a?(Array) && st[0] == :method_added # A.method_added(:m) for each def, if the class (or an ancestor) defines the hook
+          anc = @classes[st[1]]
+          anc = anc.superclass while anc && !@funcs[:"#{anc.name}.method_added"]
+          emit(:call, [@funcs[:"#{anc.name}.method_added"], (c = const(sym_id(st[2].to_s)); c.ty = :sym; c)]) if anc
+          next
+        end
+        if st.is_a?(Array) && st[0] == :mod_hook # M.extended(o) / M.included(k) when a class body extends/includes M
+          emit(:call, [@funcs[:"#{st[2]}.#{st[1]}"], emit(:sconst, [st[3].to_s])]) if @funcs[:"#{st[2]}.#{st[1]}"]
+          next
+        end
         if st.is_a?(Array) && st[0] == :inherited # Parent.inherited(Sub) at the subclass's declaration, if an ancestor defines the hook
           anc = @classes[st[1]]&.superclass
           anc = anc.superclass while anc && !@funcs[:"#{anc.name}.inherited"]
