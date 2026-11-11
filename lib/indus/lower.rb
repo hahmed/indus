@@ -852,6 +852,12 @@ module Indus
 
     # a class body's statements, registered into k: defs, mixins, attr_* and friends
     def register_class_body(k, stmts, methods)
+      stmts = stmts.flat_map do |st| # `private def x = 1`: the def, then `private :x`
+        if st.is_a?(Prism::CallNode) && %i[private public protected module_function].include?(st.name) && st.receiver.nil? && st.arguments&.arguments&.size == 1 && st.arguments.arguments[0].is_a?(Prism::DefNode)
+          d = st.arguments.arguments[0]; src = st.send(:source); loc = st.location
+          [d, st.copy(arguments: st.arguments.copy(arguments: [Prism::SymbolNode.new(src, 0, loc, 0, nil, loc, nil, d.name.to_s)]))]
+        else [st] end
+      end
       assigned_ivars(stmts).each { k.ivar(_1) }
       # the method resolution order, flattened into this class: included modules first (a
       # later definition overrides an earlier one), the body, then prepended modules on top.
@@ -891,7 +897,7 @@ module Indus
           end
           f.shadowed = k.methods[st.name] if k.methods[st.name]&.cls == k
           f.cls = k; k.methods[st.name] = f; methods << [k, st, f]; @defs_by_func[f] = st
-          (k.hidden ||= {})[st.name] = true if @visibility && @visibility != :public
+          (k.hidden ||= {})[st.name] = @visibility if @visibility && @visibility != :public
         when Prism::ConstantWriteNode then nil # hoisted above
         when Prism::AliasMethodNode, Prism::CallNode # alias new old / alias_method :new, :old: the same Func under a second name (a yielder: a second inline site)
           if st.is_a?(Prism::CallNode)
@@ -901,7 +907,7 @@ module Indus
               next if st.name == :include || st.name == :prepend # mixed in above
               if %i[private public protected].include?(st.name) && st.receiver.nil?
                 if st.arguments.nil? then @visibility = st.name # a bare `private`: the defs below are not public
-                else (st.arguments.arguments).each { |a| nm = a.unescaped.to_sym; (k.methods[nm] || k.readers[nm]) && (k.hidden ||= {})[nm] = st.name != :public } end # private :m
+                else (st.arguments.arguments).each { |a| nm = a.unescaped.to_sym; (k.methods[nm] || k.readers[nm]) && (st.name == :public ? k.hidden&.delete(nm) : (k.hidden ||= {})[nm] = st.name) } end # private :m
                 next
               end
               next if %i[private_constant module_function freeze].include?(st.name) && st.receiver.nil? # visibility is not enforced (every call is resolved at compile time)
@@ -1405,6 +1411,7 @@ module Indus
       when Prism::ClassNode
         cname = node.constant_path.name
         (node.body&.body || []).each do |st|
+          st = st.arguments.arguments[0] if st.is_a?(Prism::CallNode) && %i[private public protected module_function].include?(st.name) && st.receiver.nil? && st.arguments&.arguments&.size == 1 && st.arguments.arguments[0].is_a?(Prism::DefNode) # `private def x`
           if st.is_a?(Prism::DefNode)
             out << [cname, st] if !top_level && !st.receiver # a class body reached at run time (under an if, in a method): its defs are versions
             collect_nested_defs(st.body, cname, out)
@@ -1417,6 +1424,9 @@ module Indus
         out << [owner, node] unless top_level
         collect_nested_defs(node.body, owner, out); return
       when Prism::CallNode
+        if %i[private public protected module_function].include?(node.name) && node.receiver.nil? && node.arguments&.arguments&.size == 1 && node.arguments.arguments[0].is_a?(Prism::DefNode)
+          return collect_nested_defs(node.arguments.arguments[0], owner, out, top_level: top_level) # `private def x`: the def itself, at this level
+        end
         if %i[send public_send __send__].include?(node.name) && node.receiver.is_a?(Prism::ConstantReadNode) && node.arguments&.arguments&.first.is_a?(Prism::SymbolNode) && node.arguments.arguments.first.unescaped == "define_method" && node.block
           sym, *rest = node.arguments.arguments # X.send(:define_method, :m) { }: the define_method call itself
           rewritten = node.copy(name: :define_method, arguments: node.arguments.copy(arguments: rest))
@@ -1555,6 +1565,15 @@ module Indus
       # all mean the class's own method, not the builtin shortcut below)
       if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && (y = @yielders[n.name]) && y[0] && (k == y[0].name)
         return inline_yielder(y, n.receiver, args, nil, :none) # obj.m without a block, m yields: inlined with block_given? false
+      end
+      if n.receiver && !n.receiver.is_a?(Prism::SelfNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && (kk = @classes[k]) && kk.hidden&.[](n.name) && !(kk.hidden[n.name] == :protected && @klass && (@klass.equal?(kk) || (c = @klass.superclass; c = c.superclass while c && !c.equal?(kk); c)))
+        # a private (or, from outside the class, protected) method called with an explicit receiver: NoMethodError
+        expr(n.receiver); args.each { expr(_1) }
+        src = n.send(:source); loc = n.location
+        msg = Prism::StringNode.new(src, 0, loc, 0, nil, loc, nil, "#{kk.hidden[n.name] == :protected ? "protected" : "private"} method '#{n.name}' called for an instance of #{kk.name}")
+        exc = new_exception(:NoMethodError, [msg])
+        emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc])
+        return nil_const
       end
       if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send respond_to? extend define_singleton_method methods public_methods instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
         rv = expr(n.receiver)
