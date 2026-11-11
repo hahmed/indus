@@ -263,6 +263,8 @@ module Indus
         f = @funcs[name] = Func.new(name, params.size)
         @dm_bodies[f] = [params, st.block.body&.body || []]
       end
+      @sdef_nodes = Hash.new { |h, kk| h[kk] = [] }
+      sdefs.each { |_, d| @sdef_nodes[d.name] << d }
       sdefs.each do |owner, d|
         ps = d.parameters
         f = @funcs[:"#{owner}.#{d.name}"] = Func.new(:"#{owner}.#{d.name}", def_param_names(d).size)
@@ -384,6 +386,10 @@ module Indus
       defs.each { |d| lower_body(@funcs[d.name], def_param_names(d), d.body&.body || []) if @funcs[d.name] && !@def_versions.key?(d) && !@lazy.key?(d.name) && !(@lowered_late || []).include?(@funcs[d.name]) } # a version lowers as its own function (deferred)
       @dm_bodies.each { |f, (params, stmts)| lower_body(f, params, stmts) }
       sdefs.each do |owner, d|
+        if macro_body?(d) # a class-level macro (define_method / attr_* from a class method): unrolled at its class-body call sites, never a function
+          f = @funcs.delete(:"#{owner}.#{d.name}"); @defs_by_func.delete(f); (@macro_defs ||= {})[:"#{owner}.#{d.name}"] = d
+          next
+        end
         @owner = owner
         lower_body(@funcs[:"#{owner}.#{d.name}"], def_param_names(d), d.body&.body || [])
         @owner = nil
@@ -471,6 +477,29 @@ module Indus
     # compile-time environment: block variables bound to literal symbols by
     # an unrolled `[:a, :b].each do |f| ... end`.
     def class_body_call(k, st, ct, methods)
+      # `attribute :email` in a class body, where `def self.attribute(n)` is a class method of this class or an ancestor
+      # and every argument is a compile-time value: a class-level macro -- the method's body is unrolled here with its
+      # parameters bound to the literals, so define_method / attr_* / instance_variable_get("@#{n}") in it resolve statically
+      if st.is_a?(Prism::CallNode) && st.receiver.nil? && !%i[attr_accessor attr_reader attr_writer define_method include extend prepend each each_with_index private public protected alias_method module_function].include?(st.name) && (d = class_macro_def(k, st.name))
+        args = (st.arguments&.arguments || []).dup
+        kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
+        ps = d.parameters
+        reqs = ps&.requireds&.map(&:name) || []
+        opts = ps&.optionals || []
+        raise "#{k.name}.#{st.name}: a class-level call with #{args.size} arguments for #{reqs.size} parameters" if args.size < reqs.size || args.size > reqs.size + opts.size && !ps&.rest
+        env = ct.dup
+        reqs.each_with_index { |nm, ix| env[nm] = ct_value(args[ix], ct) }
+        opts.each_with_index { |o, ix| env[o.name] = args[reqs.size + ix] ? ct_value(args[reqs.size + ix], ct) : ct_value(o.value, env) }
+        env[ps.rest.name] = args[(reqs.size + opts.size)..].map { ct_value(_1, ct) } if ps&.rest.is_a?(Prism::RestParameterNode) && ps.rest.name
+        given = (kw&.elements || []).to_h { |el| [el.key.unescaped.to_sym, el.value] }
+        (ps&.keywords || []).each { |kp| env[kp.name] = given.key?(kp.name) ? ct_value(given[kp.name], ct) : (kp.respond_to?(:value) && kp.value ? ct_value(kp.value, env) : raise("#{k.name}.#{st.name}: missing keyword #{kp.name}")) }
+        (@macro_depth = (@macro_depth || 0) + 1) < 8 or raise "#{k.name}.#{st.name}: class-level macros nest too deep"
+        body = d.body&.body || []
+        body = body.flat_map { |b| b.is_a?(Prism::ParenthesesNode) ? (b.body&.body || []) : [b] }
+        body.each { |inner| class_body_call(k, inner, env, methods) }
+        @macro_depth -= 1
+        return
+      end
       if st.is_a?(Prism::CallNode) && %i[send public_send __send__].include?(st.name) && st.arguments&.arguments&.first.is_a?(Prism::SymbolNode) # send(:define_method, ...) is the call itself
         sym, *rest = st.arguments.arguments
         st = st.copy(name: sym.unescaped.to_sym, arguments: st.arguments.copy(arguments: rest))
@@ -493,10 +522,12 @@ module Indus
       when :each, :each_with_index # [:a, :b].each do |f| ... end  -> unrolled at compile time
         recv = st.receiver
         recv = recv.receiver if recv.is_a?(Prism::CallNode) && recv.name == :each_with_index && recv.receiver.is_a?(Prism::ArrayNode) # a.each_with_index.each
-        raise "class-body each over a non-literal array" unless recv.is_a?(Prism::ArrayNode)
+        elements = if recv.is_a?(Prism::ArrayNode) then recv.elements
+                   elsif recv.is_a?(Prism::LocalVariableReadNode) && ct[recv.name].is_a?(Array) then ct[recv.name] # a macro's *rest or array parameter
+                   else raise "class-body each over a non-literal array" end
         blk = st.block; var, ivar = blk.parameters.parameters.requireds.map(&:name)
-        recv.elements.each_with_index do |el, ix|
-          env = ct.merge(var => (el.is_a?(Prism::StringNode) ? el.unescaped : ct_symbol(el, ct))) # a %w element stays a String in the body
+        elements.each_with_index do |el, ix|
+          env = ct.merge(var => (el.is_a?(Prism::Node) ? (el.is_a?(Prism::StringNode) ? el.unescaped : ct_symbol(el, ct)) : el)) # a %w element stays a String in the body; a ct value is itself
           env[ivar] = ix if ivar
           (blk.body&.body || []).each { |inner| class_body_call(k, inner, env, methods) }
         end
@@ -505,20 +536,84 @@ module Indus
       end
     end
 
+    # the DefNode of `def self.name` on k or an ancestor, when it is the kind of body a class-level macro has:
+    # define_method / attr_* / instance_variable_* / nested macro calls, and nothing that needs a run-time value
+    # a compile-time value as IR
+    def ct_materialize(v)
+      case v
+      when String then emit(:sconst, [v])
+      when Integer then const(v)
+      when Symbol then (c = const(sym_id(v)); c.ty = :sym; c)
+      when true, false then (c = const(v ? 1 : 0); c.ty = :bool; c)
+      when nil then nil_const
+      when Array then pack_values(v.map { ct_materialize(_1) })
+      else raise "a compile-time value of #{v.class} cannot be used at run time"
+      end
+    end
+
+    # an ivar named through a class-level macro's parameter: a real field of every instance, whether or not set yet
+    def macro_field?(iv) = @ct && !@ct.empty?
+
+    def class_macro_def(k, name)
+      c = k
+      while c
+        f = @funcs[:"#{c.name}.#{name}"]
+        return @defs_by_func[f] if f && @defs_by_func[f] && macro_body?(@defs_by_func[f])
+        c = c.superclass
+      end
+      nil
+    end
+    MACRO_CALLS = %i[define_method attr_accessor attr_reader attr_writer alias_method private public protected].freeze
+    def macro_body?(d, depth = 0)
+      stmts = (d.body&.body || []).flat_map { |b| b.is_a?(Prism::ParenthesesNode) ? (b.body&.body || []) : [b] }
+      !stmts.empty? && stmts.all? { |s| macro_stmt?(s, d, depth) }
+    end
+    def macro_stmt?(s, d, depth)
+      return false unless s.is_a?(Prism::CallNode)
+      return true if s.receiver.nil? && MACRO_CALLS.include?(s.name)
+      # names.each { |n| attribute(n) } over a parameter: unrolled over the compile-time array
+      if s.name == :each && s.receiver.is_a?(Prism::LocalVariableReadNode) && s.block.is_a?(Prism::BlockNode)
+        return (s.block.body&.body || []).all? { |b| macro_stmt?(b, d, depth) }
+      end
+      return false unless s.receiver.nil? && depth < 4
+      @sdef_nodes&.[](s.name)&.any? { |d2| !d2.equal?(d) && macro_body?(d2, depth + 1) } || false # a call to another class-level macro
+    end
+
     # a Symbol known at compile time: literal, interpolated from ct, or a ct variable
     def ct_symbol(node, ct)
       case node
       when Prism::SymbolNode then node.unescaped.to_sym
       when Prism::StringNode then node.unescaped.to_sym
       when Prism::LocalVariableReadNode then ct.fetch(node.name) { raise "#{node.name} is not a compile-time symbol" }.to_sym
-      when Prism::InterpolatedSymbolNode
+      when Prism::InterpolatedSymbolNode, Prism::InterpolatedStringNode
         node.parts.map do |part|
           case part
           when Prism::StringNode then part.unescaped
           when Prism::EmbeddedStatementsNode then ct_symbol(part.statements.body.last, ct).to_s
+          else raise "not a compile-time symbol: #{part.class} in interpolation"
           end
         end.join.to_sym
+      when Prism::CallNode # n.to_s / n.to_sym / "x".to_sym on a compile-time value
+        return ct_symbol(node.receiver, ct) if %i[to_s to_sym].include?(node.name) && node.arguments.nil? && node.receiver
+        raise "not a compile-time symbol: #{node.name}(...)"
       else raise "not a compile-time symbol: #{node.class}"
+      end
+    end
+
+    # a value known at compile time, for a class-method DSL unrolled into the class body: symbol, string, integer,
+    # true/false/nil, or an array of those
+    def ct_value(node, ct)
+      case node
+      when Prism::SymbolNode then node.unescaped.to_sym
+      when Prism::StringNode then node.unescaped
+      when Prism::IntegerNode then node.value
+      when Prism::TrueNode then true
+      when Prism::FalseNode then false
+      when Prism::NilNode then nil
+      when Prism::ArrayNode then node.elements.map { ct_value(_1, ct) }
+      when Prism::LocalVariableReadNode then ct.fetch(node.name) { raise "#{node.name} is not a compile-time value" }
+      when Prism::InterpolatedStringNode, Prism::InterpolatedSymbolNode then ct_symbol(node, ct).then { node.is_a?(Prism::InterpolatedStringNode) ? _1.to_s : _1 }
+      else raise "not a compile-time value: #{node.class}"
       end
     end
 
@@ -1089,7 +1184,7 @@ module Indus
         v = emit(ARITH.fetch(n.binary_operator), [emit(:gget, [n.name]), expr(n.value)]); emit(:gset, [n.name, v]); v
       when Prism::LocalVariableReadNode
         if @in_safe_nav && @in_safe_nav_node.equal?(n) then @in_safe_nav
-        elsif @ct&.key?(n.name) then (@ct[n.name].is_a?(String) ? emit(:sconst, [@ct[n.name]]) : @ct[n.name].is_a?(Integer) ? const(@ct[n.name]) : (c = const(sym_id(@ct[n.name])); c.ty = :sym; c)) # a compile-time symbol, string or index
+        elsif @ct&.key?(n.name) then ct_materialize(@ct[n.name]) # a compile-time value (a class-level macro's parameter), string or index
         elsif shared?(n.name) then emit(:cell_get, [@locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" }])
         else @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" } end
       when Prism::LocalVariableWriteNode
@@ -1755,15 +1850,21 @@ module Indus
           (a.left.value..(a.exclude_end? ? a.right.value - 1 : a.right.value)).map { |k| a.left.copy(value: k) }
         end
         expr(n.copy(arguments: n.arguments.copy(arguments: expanded)))
-      elsif %i[instance_variable_get instance_variable_set instance_variable_defined? instance_variables].include?(n.name) && n.receiver && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd]
-        k = @classes[kd]; rv = expr(n.receiver)
+      elsif %i[instance_variable_get instance_variable_set instance_variable_defined? instance_variables].include?(n.name) && (n.receiver ? (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] : @klass && !@klass.closure)
+        k = n.receiver ? @classes[kd] : @klass; rv = n.receiver ? expr(n.receiver) : me_val
         if n.name == :instance_variables then pack_values(k.ivars.reject { _1.to_s.start_with?("@__") }.map { |iv| c = const(sym_id(iv.to_s)); c.ty = :sym; c })
         else
-          iv = args[0].is_a?(Prism::SymbolNode) ? args[0].unescaped.to_sym : (args[0].is_a?(Prism::StringNode) ? args[0].unescaped.to_sym : raise("#{n.name}: the name must be a literal"))
+          iv = begin ct_symbol(args[0], @ct || {}) rescue raise("#{n.name}: the name must be known at compile time (a literal, or built from a class-level macro's parameter)") end
+          iv = :"@#{iv}" unless iv.to_s.start_with?("@")
+          # a name the class has not seen yet (a setter lowered later, a macro's field): registered now; the field reads nil until set.
+          # instance_variable_defined? is "the field is not nil" (an ivar assigned nil counts as undefined: an approximation)
           case n.name
-          when :instance_variable_get then k.ivars.include?(iv) ? emit(:fld_get, [rv, k.ivar(iv)]) : nil_const
+          when :instance_variable_get then (k.ivars.include?(iv) || macro_field?(iv)) ? emit(:fld_get, [rv, k.ivar(iv)]) : nil_const
           when :instance_variable_set then (k.ivar(iv); v = expr(args[1]); emit(:fld_set, [rv, k.ivar(iv), v]); v)
-          else (c = const(k.ivars.include?(iv) ? 1 : 0); c.ty = :bool; c) end
+          else
+            if k.ivars.include?(iv) || macro_field?(iv) then emit(:cmp, [emit(:fld_get, [rv, k.ivar(iv)]), nil_const], :ne)
+            else (c = const(0); c.ty = :bool; c) end
+          end
         end
       elsif %i[instance_eval instance_exec].include?(n.name) && n.block.is_a?(Prism::BlockArgumentNode) && n.block.expression
         # obj.instance_eval(&blk): the block was compiled with self = obj's class (ie_target at its call site); field 0 of the closure takes obj

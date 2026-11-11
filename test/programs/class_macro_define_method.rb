@@ -1,0 +1,1 @@
+class Base; def self.attribute(n) = (define_method(n) { instance_variable_get("@#{n}") }; define_method("#{n}=") { |v| instance_variable_set("@#{n}", v) }); end; class U < Base; attribute :email; end; u = U.new; u.email = "e"; p u.email
