@@ -354,6 +354,16 @@ module Indus
                 end
                 i.op = :raise; changed = true
               end
+              if %i[add sub mul div mod].include?(i.op) && numeric_coerce(f, i) then changed = true end # 5 + obj with obj.coerce: the protocol (before settle: the result's type changes)
+              if %i[add scat].include?(i.op) && of(f, i.args[0]) == :str && (cs = classes_of(of(f, i.args[1]))) # "s" + obj: obj.to_str, else TypeError
+                if cs.all? { @classes[_1].find_method(:to_str) }
+                  c = Inst.new(:mcall, [:to_str, i.args[1]]); c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); bind(f, c)
+                  i.args[1] = c; i.op = :scat; i.ty = :str; changed = true
+                elsif @settled
+                  w = Inst.new(:sconst, [cs.size == 1 ? cs[0].to_s : "Object"]); w.ty = :str; w.block = i.block; i.block.insts.insert(i.block.insts.index(i), w)
+                  i.op = :call; i.args = [fn(:__raise_no_implicit), w]; i.ty = :str; changed = true
+                end
+              end
               if @settled && %i[add sub mul div mod].include?(i.op) && coerce_error(f, i) then changed = true end # 1.5 + "s": TypeError at run time
               if @settled && %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :sym # puts :a -> "a"; p :a -> ":a"
                 c = Inst.new(:call, [fn(i.op == :p_v ? :__sym_inspect : :__sym_name), i.args[0]]); c.ty = :str; c.block = i.block
@@ -862,7 +872,8 @@ module Indus
           when :to_s, :puts_v, :p_v, :print_v, :inspect_v then read_name[:to_s] = read_name[:inspect] = true # printing an object calls its to_s / inspect once the types say so
           when :alen then read_name[:length] = read_name[:size] = true # a length guessed builtin may turn out to be an object's method
           when :apop then read_name[:pop] = true
-          when :add, :sub, :mul, :div, :mod, :lshift_or_append then %i[+ - * / % <<].each { read_name[_1] = true } # operators an object may define
+          when :add, :sub, :mul, :div, :mod, :lshift_or_append then %i[+ - * / % << coerce].each { read_name[_1] = true } # operators an object may define (and coerce, for `5 + obj`)
+          when :scat, :sappend then read_name[:to_str] = true # "s" + obj reads obj.to_str
           end
           (i.op == :phi ? i.args.map(&:last) : i.args).each do |a|
             next unless a.is_a?(Inst)
@@ -1830,6 +1841,23 @@ module Indus
     end
 
     # `1.5 + "s"`: a TypeError at run time, with Ruby's wording (a provisional nil join is left alone: only a literal nil)
+    # 5 + obj where obj's class defines coerce: a, b = obj.coerce(5); a op b (Ruby's numeric protocol)
+    def self.numeric_coerce(f, i)
+      l, r = i.args
+      lt, rt = of(f, l), of(f, r)
+      if %i[int int? float].include?(lt) && (cs = classes_of(rt)) && cs.all? { @classes[_1].find_method(:coerce) }
+        b = i.block; at = b.insts.index(i)
+        pair = Inst.new(:mcall, [:coerce, r, l]); pair.block = b; b.insts.insert(at, pair); bind(f, pair)
+        z = Inst.new(:const, [0]); z.ty = :int; z.block = b; b.insts.insert(at + 1, z)
+        o = Inst.new(:const, [1]); o.ty = :int; o.block = b; b.insts.insert(at + 2, o)
+        a0 = Inst.new(:idx, [pair, z]); a0.block = b; b.insts.insert(at + 3, a0)
+        a1 = Inst.new(:idx, [pair, o]); a1.block = b; b.insts.insert(at + 4, a1)
+        i.args = [a0, a1]; i.ty = nil
+        return true
+      end
+      false
+    end
+
     def self.coerce_error(f, i)
       l, r = i.args
       lt, rt = of(f, l), of(f, r)
