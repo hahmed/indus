@@ -11,6 +11,7 @@ module Indus
     attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home, :uses
     attr_accessor :strict # to_i from Kernel#Integer: junk raises
     attr_accessor :raw_shift # a shift the helper itself performs (count already checked)
+    attr_accessor :destructure # an idx that binds a block parameter from an element: a scalar element destructures to [el, nil, ...]
     attr_accessor :dyn_split # the builtin arm of a tag branch (Types.split_dyn_object): not split again
     attr_reader :id
     @@n = 0
@@ -45,6 +46,7 @@ module Indus
     attr_accessor :nullable_ivars # ivars written only by ||= / &&= somewhere: nil before the first write
     attr_accessor :dyn_ivars # ivars typed dyn by decree: the spare slots a run-time class_eval may name
     attr_accessor :ie_self # a closure whose self (field 0) is set by instance_eval at the call
+    attr_accessor :arity_info # a closure's parameter shape: { required:, optional: } (for Proc#arity)
     attr_accessor :method_of # a Method object: [owner class name or nil, method name, arity] -- a closure with introspection
     SPARES = 4
     # a run-time class_eval may add ivars: reserve dyn-typed spare slots (zero = nil) that the resident compiler names later

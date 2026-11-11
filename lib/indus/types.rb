@@ -1372,6 +1372,13 @@ module Indus
         return
       end
       if (k = @classes[t]) && k.closure && k.method_of && name == :bind && args.size == 1 then i.op = :nop; i.args = [recv]; i.ty = t; return end # unbind.bind(obj): the object is the captured receiver already
+      if (k = @classes[t]) && k.closure && args.empty? && %i[arity lambda? parameters curry].include?(name) && (cf = k.methods[:call])
+        case name
+        when :arity then i.op = :const; i.args = [cf.rest || (k.arity_info && k.arity_info[:optional] > 0) ? -(k.arity_info ? k.arity_info[:required] : cf.params.size - 1 - (cf.rest ? 1 : 0)) - 1 : cf.params.size - 1]; i.ty = :int; return
+        when :lambda? then i.op = :const; i.args = [cf.strict_arity ? 1 : 0]; i.ty = :bool; return
+        else return
+        end
+      end
       if t == :dyn && args.empty? && %i[to_s inspect].include?(name)
         # user classes defining to_s/inspect may be behind the tag: tag 8 (object) dispatches to them, anything else is the builtin
         return unless @settled # the set of such classes must be final
@@ -1527,12 +1534,20 @@ module Indus
         i.op = :const; i.args = [0]; i.ty = :nil; return # the value after a trap: never read
       end
       kind, payload = resolve(klass, name, args.size, allow_missing: true)
-      if kind == :call && klass.closure && name == :call && !payload.rest && args.size != payload.params.size - 1 # proc arity: missing args are nil, extras dropped
+      if kind == :call && klass.closure && name == :call && args.size != payload.params.size - 1 # proc arity: missing args are nil, extras dropped (or gathered by *rest)
         want = payload.params.size - 1
-        if payload.strict_arity then raise "#{f.name}: a lambda called with #{args.size} arguments, takes #{want} (ArgumentError in Ruby)" end
-        args = args[0, want]
-        while args.size < want
-          c = Inst.new(:const, [0]); c.ty = :nil; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); args << c
+        if payload.rest # the last parameter takes the extras as an array
+          fixed = want - 1
+          extras = args[fixed..] || []
+          raise "#{f.name}: a lambda called with #{args.size} arguments, takes at least #{fixed}" if payload.strict_arity && args.size < fixed
+          while extras.size < 0 do end
+          pack = pack_insts(i, extras); args = (args[0, fixed] + Array.new([fixed - args.size, 0].max) { c = Inst.new(:const, [0]); c.ty = :nil; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); c } + [pack])
+        else
+          if payload.strict_arity then raise "#{f.name}: a lambda called with #{args.size} arguments, takes #{want} (ArgumentError in Ruby)" end
+          args = args[0, want]
+          while args.size < want
+            c = Inst.new(:const, [0]); c.ty = :nil; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); args << c
+          end
         end
       end
       case kind
@@ -1564,6 +1579,21 @@ module Indus
         c = Inst.new(:const, [v || 0]); c.ty = v.nil? ? :nil : :int; c.block = at.block
         at.block.insts.insert(at.block.insts.index(at), c); c
       end
+    end
+
+    # the values as a fresh array, built before `at`
+    def self.pack_insts(at, vals)
+      b = at.block; ix = at.block.insts.index(at)
+      n = Inst.new(:const, [vals.size]); n.ty = :int; n.block = b
+      z = Inst.new(:const, [0]); z.ty = :nil; z.block = b
+      arr = Inst.new(:anew, [n, z]); arr.block = b
+      b.insts.insert(ix, n, z, arr); ix += 3
+      vals.each_with_index do |v, k|
+        kc = Inst.new(:const, [k]); kc.ty = :int; kc.block = b
+        arr = Inst.new(:aset, [arr, kc, v]).tap { _1.block = b }
+        b.insts.insert(ix, kc, arr); ix += 2
+      end
+      arr
     end
 
     def self.sym_const(at, name)
@@ -1638,6 +1668,10 @@ module Indus
       elsif t == :sym # :abc[0]: index the name
         nm = Inst.new(:call, [fn(:__sym_name), r]); nm.ty = :str; nm.block = i.block; i.block.insts.insert(i.block.insts.index(i), nm)
         i.args[0] = nm; i.ty = nil
+      elsif @settled && %i[int int? float bool].include?(t) && i.op == :idx && i.args.size == 2 && i.args[1].op == :const && i.destructure
+        # a block |x, y| over scalar elements: x takes the element, y is nil (Ruby's one-value destructuring)
+        if i.args[1].args[0] == 0 then i.op = :nop; i.args = [r]; i.ty = t
+        else i.op = :const; i.args = [0]; i.ty = :nil end
       elsif @settled then raise "[] on #{t.inspect}" end # a scalar before settling may be a provisional join: wait
     end
 

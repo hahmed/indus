@@ -749,6 +749,7 @@ module Indus
       if f.rest && d # the extra positionals become the *rest array
         ps = d.parameters
         fixed, extra = vals[0, nfixed], vals[nfixed..] || []
+        fixed += [nil] * (nfixed - fixed.size) # omitted optionals: the rest array still sits at its own position (fill_defaults fills the nils)
         vals = fixed + [pack_values(extra)]
       elsif f.rest
         return vals
@@ -1317,7 +1318,7 @@ module Indus
           next if t.is_a?(Prism::SplatNode) && t.expression.nil? # a, * = arr
           t = t.expression if t.is_a?(Prism::SplatNode)
           case t
-          when Prism::LocalVariableTargetNode then shared?(t.name) ? write_shared(t.name, v) : @locals[lname(t.name)] = v # a captured local: through its cell
+          when Prism::LocalVariableTargetNode, Prism::RequiredParameterNode then shared?(t.name) ? write_shared(t.name, v) : @locals[lname(t.name)] = v # a captured local: through its cell (a RequiredParameterNode: a destructured block parameter)
           when Prism::InstanceVariableTargetNode
             if (ow = ivar_owner) then emit(:gset, [:"#{ow}#{t.name}", v])
             else emit(:fld_set, [me_val, @klass.ivar(t.name), v]) end
@@ -2510,7 +2511,7 @@ module Indus
         params = case blk.parameters
                  when Prism::NumberedParametersNode then (1..blk.parameters.maximum).map { :"_#{_1}" }
                  when nil then []
-                 else blk.parameters.parameters.requireds.map { |r| r.respond_to?(:name) ? r.name : r.lefts.map(&:name) } # |(a, b)|: the nested names
+                 else block_param_shapes(blk.parameters.parameters) # |a, (b, c), *rest|: names, nested names, [:rest, name]
                  end
         body = blk.body&.body || []
       end
@@ -2544,7 +2545,9 @@ module Indus
         if recv.nil? || (n.name == :new && recv.is_a?(Prism::ConstantReadNode) && recv.name == :Proc)
           blk = n.block
           raise "a block inside a method cannot yet refer to self or @ivars" if @klass && refers_to_self?(blk.body)
-          return closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, body)
+          fparams, pre = flatten_params(blk.parameters&.parameters) # |a, (b, c)|
+          fparams = params if blk.parameters.is_a?(Prism::NumberedParametersNode) || blk.parameters.nil?
+          return closure_value(fparams, free_locals(blk.body, fparams).select { |nm| @locals.key?(lname(nm)) }, pre + (body.is_a?(Array) ? body : []))
         end
       when :open # File.open(path, mode) { |f| ... }: f is the descriptor, closed after the block
         raise "block passed to #{recv&.name}.open" unless recv.is_a?(Prism::ConstantReadNode) && recv.name == :File
@@ -2884,12 +2887,19 @@ module Indus
         return
       end
       return if ps.empty?
-      if ps.size >= 2 # |(a, b), x| : the k-th parameter takes el[k]; a nested list destructures that element
-        ps.each_with_index do |pn, k|
-          if pn.is_a?(Array) then sub = emit(:idx, [el, const(k)]); pn.each_with_index { |nm, j| @locals[:"#{pfx}#{nm}"] = emit(:idx, [sub, const(j)]) }
-          else @locals[:"#{pfx}#{pn}"] = emit(:idx, [el, const(k)]) end
+      if ps.size >= 2 # |(a, b), x| : the k-th parameter takes el[k]; a nested list destructures that element; |a, *r| takes the rest
+        if (et = kind_of_value(el)) != :array && !(el.ty.nil? && el.op == :aget) && el.ty && el.ty != :dyn # a scalar element with several parameters: the first takes it, the rest are nil
+          @locals[:"#{pfx}#{ps[0]}"] = el if ps[0].is_a?(Symbol)
+          ps[1..].each { |pn| @locals[:"#{pfx}#{pn.is_a?(Array) ? pn[1] : pn}"] = pn.is_a?(Array) && pn[0] == :rest ? pack_values([]) : nil_const }
+          return
         end
-      else @locals[:"#{pfx}#{ps[0]}"] = el end
+        ps.each_with_index do |pn, k|
+          if pn.is_a?(Array) && pn[0] == :rest then @locals[:"#{pfx}#{pn[1]}"] = emit(:mcall, [:drop, el, const(k)])
+          elsif pn.is_a?(Array) && pn[0] == :opt then @locals[:"#{pfx}#{pn[1]}"] = emit(:idx, [el, const(k)])
+          elsif pn.is_a?(Array) then sub = emit(:idx, [el, const(k)]); pn.each_with_index { |nm, j| @locals[:"#{pfx}#{nm}"] = emit(:idx, [sub, const(j)]) }
+          else @locals[:"#{pfx}#{pn}"] = (ix = emit(:idx, [el, const(k)]); ix.destructure = true; ix) end
+        end
+      else @locals[:"#{pfx}#{ps[0].is_a?(Array) ? ps[0][1] : ps[0]}"] = ps[0].is_a?(Array) && ps[0][0] == :rest ? pack_values([el]) : el end
     end
 
     def array_loop(arr, kind, params, body)
@@ -2955,13 +2965,79 @@ module Indus
     end
 
     # splice the block body at a yield: it runs in the caller's naming
+    # a closure's required parameters as flat names; a destructuring |(b, c)| becomes a hidden name plus a
+    # `b, c = hidden` statement to run first
+    def flatten_params(ps)
+      return [[], []] unless ps
+      names = []; pre = []
+      ps.requireds.each_with_index do |r, k|
+        if r.respond_to?(:name) then names << r.name
+        else
+          hidden = :"__d#{k}_#{@lambda_count || 0}"; names << hidden
+          src = r.send(:source); loc = r.location
+          pre << Prism::MultiWriteNode.new(src, 0, loc, 0, r.lefts, r.rest, r.rights, nil, nil, loc, Prism::LocalVariableReadNode.new(src, 0, loc, 0, hidden, 0))
+        end
+      end
+      # optionals: a parameter the caller may omit (nil then, by the proc arity rule) -> `b = default if b.nil?`
+      ps.optionals.each do |o|
+        names << o.name
+        src = o.send(:source); loc = o.location
+        rd = Prism::LocalVariableReadNode.new(src, 0, loc, 0, o.name, 0)
+        isnil = Prism::CallNode.new(src, 0, loc, 0, rd, nil, :nil?, loc, nil, nil, nil, nil, nil)
+        asg = Prism::LocalVariableWriteNode.new(src, 0, loc, 0, o.name, 0, loc, o.value, loc)
+        pre << Prism::IfNode.new(src, 0, loc, 0, loc, isnil, nil, Prism::StatementsNode.new(src, 0, loc, 0, [asg]), nil, loc)
+      end
+      # keywords with defaults: bound to the default (a closure value cannot receive keywords yet; its inlined calls can)
+      ps.keywords.each do |kp|
+        raise "a lambda value with a required keyword #{kp.name}: not supported" unless kp.respond_to?(:value) && kp.value
+        src = kp.send(:source); loc = kp.location
+        pre << Prism::LocalVariableWriteNode.new(src, 0, loc, 0, kp.name, 0, loc, kp.value, loc)
+      end
+      names << [:rest, ps.rest.name || :__rest] if ps.rest.is_a?(Prism::RestParameterNode) # extras gathered by the caller (proc arity)
+      [names, pre]
+    end
+
+    # a block's parameter shapes: a name, [names] for |(a, b)| destructuring, [:rest, name] for |*rest|, [:opt, name, default node]
+    def block_param_shapes(ps)
+      out = ps.requireds.map { |r| r.respond_to?(:name) ? r.name : r.lefts.map { |l| l.respond_to?(:name) ? l.name : l.lefts.map(&:name) } }
+      out += ps.optionals.map { |o| [:opt, o.name, o.value] }
+      out << [:rest, ps.rest.name || :__rest] if ps.rest.is_a?(Prism::RestParameterNode)
+      out += ps.posts.map(&:name) if ps.respond_to?(:posts) && ps.posts
+      out
+    end
+
+    # bind a block's parameters to the yielded values (proc semantics: missing -> nil, extras dropped, one array auto-splats)
+    def bind_block_params(params, vals, pfx)
+      plain = params.reject { _1.is_a?(Array) && _1[0] == :rest }
+      if vals.size == 1 && plain.size > 1 && (kind_of_value(vals[0]) == :array) # |a, b| given one array: destructured
+        a = vals[0]; vals = plain.each_index.map { |k| emit(:idx, [a, const(k)]) }
+      end
+      k = 0
+      params.each do |p|
+        case p
+        when Symbol then @locals[:"#{pfx}#{p}"] = vals[k] || nil_const; k += 1
+        when Array
+          case p[0]
+          when :rest
+            rest = vals[k..] || []
+            @locals[:"#{pfx}#{p[1]}"] = pack_values(rest); k += rest.size
+          when :opt then @locals[:"#{pfx}#{p[1]}"] = vals[k] || expr(p[2]); k += 1
+          else # nested destructuring: |(b, c)|
+            v = vals[k] || nil_const; k += 1
+            p.each_with_index { |nm, j| @locals[:"#{pfx}#{nm}"] = emit(:idx, [v, const(j)]) if nm.is_a?(Symbol) }
+          end
+        end
+      end
+    end
+    def kind_of_value(v) = (v.ty.is_a?(Array) && v.ty[0] == :arr) || v.op == :anew || v.op == :aset ? :array : nil
+
     def yield_block(arg_nodes)
       params, body = @block
       vals = arg_nodes.map { expr(_1) }           # still in callee naming
       bpfx = :"y#{@f.blocks.size}:"
       saved_pfx, @name_pfx = @name_pfx, nil
       saved_ret, @ret_exit = @ret_exit, nil        # a `return` in the block would return from the caller: unsupported
-      params.each_with_index { |p, k| @locals[:"#{bpfx}#{p}"] = vals[k] || const(0) }
+      bind_block_params(params, vals, bpfx)
       @blk_pfx = (@blk_pfx || []) << bpfx
       last = nil
       last = run_body(body, bpfx)
@@ -3183,14 +3259,18 @@ module Indus
     # the moment of capture), its body is `call`. Dispatch, GC and escape analysis then treat
     # it like any object. The body is lowered after the enclosing function (deferred_lambdas).
     def lambda_value(n)
-      params = n.parameters&.parameters&.requireds&.map(&:name) || []
+      ps = n.parameters&.parameters
+      @pending_arity = { required: ps&.requireds&.size || 0, optional: ps&.optionals&.size || 0 }
+      params, pre = flatten_params(n.parameters&.parameters)
       captured = free_locals(n.body, params).select { |nm| @locals.key?(lname(nm)) }
-      c = closure_value(params, captured, n.body&.body || [])
+      c = closure_value(params, captured, pre + (n.body&.body || []))
       @deferred_lambdas.last[1].strict_arity = true if @deferred_lambdas.last[0].equal?(c.args[0]) # ->(){} checks its argument count
       c
     end
 
     def closure_value(params, captured, stmts, ie_self: nil)
+      rest_name = params.last.is_a?(Array) && params.last[0] == :rest ? params.last[1] : nil
+      params = params[0...-1] + [rest_name] if rest_name
       @lambda_count = (@lambda_count || 0) + 1
       k = @classes[:"__lambda#{@lambda_count}"] = Klass.new(:"__lambda#{@lambda_count}")
       k.id = @classes.size; k.closure = true
@@ -3204,6 +3284,8 @@ module Indus
         k.outer = outer_self; k.ivar(:@__self)
       end
       f = Func.new(:"#{k.name}#call", 1 + params.size); f.cls = k; k.methods[:call] = f
+      f.rest = true if rest_name # the last parameter gathers the extra arguments (Types packs them at the call)
+      k.arity_info = @pending_arity if @pending_arity; @pending_arity = nil
       (@deferred_lambdas ||= []) << [k, f, params, captured, stmts, captured.select { shared?(_1) }]
       o = emit(:onew, [k])
       captured.each { |nm| emit(:fld_set, [o, k.ivar(:"@#{nm}"), @locals.fetch(lname(nm))]) } # a shared capture stores its cell
@@ -3490,8 +3572,8 @@ module Indus
     def collect_closures(nodes, out)
       Array(nodes).each do |n|
         next unless n.is_a?(Prism::Node)
-        if n.is_a?(Prism::LambdaNode) then out << [n.parameters&.parameters&.requireds&.map(&:name) || [], n.body]
-        elsif closure_block?(n) then out << [n.block.parameters&.parameters&.requireds&.map(&:name) || [], n.block.body]
+        if n.is_a?(Prism::LambdaNode) then out << [(n.parameters&.parameters&.requireds || []).flat_map { |r| r.respond_to?(:name) ? [r.name] : r.lefts.map { |l| l.respond_to?(:name) ? l.name : nil }.compact }, n.body]
+        elsif closure_block?(n) then out << [(n.block.parameters&.parameters&.requireds || []).flat_map { |r| r.respond_to?(:name) ? [r.name] : r.lefts.map { |l| l.respond_to?(:name) ? l.name : nil }.compact }, n.block.body]
         end
         collect_closures(n.compact_child_nodes, out)
       end
@@ -3614,10 +3696,21 @@ module Indus
     end
 
     def inline_lambda(lam, args)
-      params = lam.parameters&.parameters&.requireds&.map(&:name) || []
-      raise "a lambda taking #{params.size} argument#{"s" if params.size != 1} called with #{args.size} (ArgumentError in Ruby)" if params.size != args.size && !lam.parameters&.parameters&.optionals&.any? && !lam.parameters&.parameters&.rest
+      ps = lam.parameters&.parameters
+      params = ps&.requireds&.map(&:name) || []
+      raise "a lambda taking #{params.size} argument#{"s" if params.size != 1} called with #{args.size} (ArgumentError in Ruby)" if params.size != args.size && !ps&.optionals&.any? && !ps&.rest
       pfx = :"lam#{@f.blocks.size}:"
+      args = args.dup; kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
       params.each_with_index { |p, k| @locals[:"#{pfx}#{p}"] = expr(args[k]) }
+      (ps&.optionals || []).each_with_index { |o, k| @locals[:"#{pfx}#{o.name}"] = args[params.size + k] ? expr(args[params.size + k]) : expr(o.value) } # a default, evaluated here
+      if ps&.rest.is_a?(Prism::RestParameterNode) && ps.rest.name
+        extra = args[(params.size + (ps.optionals || []).size)..] || []
+        @locals[:"#{pfx}#{ps.rest.name}"] = pack_values(extra.map { expr(_1) })
+      end
+      if kw || (ps&.keywords&.any?)
+        given = (kw&.elements || []).to_h { |el| [el.key.unescaped.to_sym, el.value] }
+        (ps&.keywords || []).each { |kp| @locals[:"#{pfx}#{kp.name}"] = given.key?(kp.name) ? expr(given[kp.name]) : (kp.respond_to?(:value) && kp.value ? expr(kp.value) : raise("missing keyword #{kp.name}")) }
+      end
       @blk_pfx = (@blk_pfx || []) << pfx
       last = nil
       (lam.body&.body || []).each { last = expr(_1) }
