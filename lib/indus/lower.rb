@@ -967,7 +967,15 @@ module Indus
             new_name = st.new_name.unescaped.to_sym; old_name = st.old_name.unescaped.to_sym
           end
           if (y = @yielders[old_name]) then @yielders[new_name] = y
-          elsif (m = k.methods[old_name]) then k.methods[new_name] = m
+          elsif (m = k.methods[old_name])
+            # the alias names the body as it is now; a later `def old` makes old a patchable slot pointing at the new version,
+            # so the alias must not go through that slot: a non-patchable copy bound to the current (latest) version
+            cur = m.versions&.last || m
+            if cur.patchable || m.patchable || (@redefine_markers&.values&.any? { |(cn, names)| cn == k.name && names.include?(old_name) })
+              copy = Func.new(:"#{k.name}##{new_name}", cur.params.size); copy.cls = k; copy.rest = cur.rest
+              @defs_by_func[copy] = @defs_by_func[cur]; methods << [k, @defs_by_func[cur], copy]
+              k.methods[new_name] = copy
+            else k.methods[new_name] = m end
           elsif k.readers[old_name] then k.readers[new_name] = k.readers[old_name]
           else raise "alias #{new_name} #{old_name}: no such method in #{k.name}" end
         when Prism::ClassVariableWriteNode, Prism::InstanceVariableWriteNode, Prism::SingletonClassNode, Prism::ClassNode, Prism::ModuleNode then nil # hoisted above
@@ -1181,8 +1189,23 @@ module Indus
       when Prism::RescueModifierNode then rescue_modifier(n) # expr rescue fallback
       when Prism::SuperNode, Prism::ForwardingSuperNode # super(args) / super: the superclass's version of this method
         raise "super outside a method" unless @klass && @f.cls
-        mname = @f.name.to_s.split("#").last.delete("'").to_sym
-        sup = @f.shadowed || @klass.superclass&.find_method(mname) or raise "super: no #{mname} above #{@klass.name}"
+        mname = @f.name.to_s.split("#").last.delete("'").sub(/@v\d+\z/, "").to_sym
+        sup = @f.shadowed || @klass.superclass&.find_method(mname)
+        if sup.nil? # Object's own: method_missing raises NoMethodError, respond_to? is false (no method above answered)
+          case mname
+          when :method_missing
+            nm = (n.is_a?(Prism::SuperNode) ? n.arguments&.arguments&.first : nil) || Prism::LocalVariableReadNode.new(n.send(:source), 0, n.location, 0, @f.params[1] && @defs_by_func[@f]&.parameters&.requireds&.first&.name || :__none, 0)
+            src = n.send(:source); loc = n.location
+            msg = Prism::InterpolatedStringNode.new(src, 0, loc, 0, nil, [Prism::StringNode.new(src, 0, loc, 0, nil, loc, nil, "undefined method '"), Prism::EmbeddedStatementsNode.new(src, 0, loc, 0, loc, Prism::StatementsNode.new(src, 0, loc, 0, [nm]), loc), Prism::StringNode.new(src, 0, loc, 0, nil, loc, nil, "' for an instance of #{@klass.name}")], nil)
+            exc = new_exception(:NoMethodError, [msg])
+            emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc])
+            return nil_const
+          when :respond_to?, :respond_to_missing? then return (c = const(0); c.ty = :bool; c)
+          when :initialize then return nil_const # Object#initialize takes nothing and does nothing
+          when :to_s, :inspect then return emit(:sconst, ["#<#{@klass.name}>"])
+          end
+          raise "super: no #{mname} above #{@klass.name}"
+        end
         args = n.is_a?(Prism::SuperNode) ? (n.arguments&.arguments || []) : @f.params[1..].map { nil }
         vals = n.is_a?(Prism::SuperNode) ? method_args(sup, args) : @f.params[1..]
         emit(:call, [sup, me_val, *vals])
@@ -1635,7 +1658,7 @@ module Indus
         emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc])
         return nil_const
       end
-      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send respond_to? extend define_singleton_method methods public_methods instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
+      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send __send__ respond_to? extend define_singleton_method methods public_methods instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
         rv = expr(n.receiver)
         return emit(:mcall, [n.name, rv, *object_args(n, args, @classes[k], rv)])
       end
@@ -1729,7 +1752,7 @@ module Indus
         return inline_lambda(@lambdas[lname(n.receiver.name)], args)
       end
       return expr(@send_rewrites[n]) if @send_rewrites&.key?(n) # X.send(:define_method, ...): the call itself
-      if n.name == :send || n.name == :public_send
+      if n.name == :send || n.name == :public_send || n.name == :__send__
         name, *rest = args
         recv_v = n.receiver ? expr(n.receiver) : me_val
         if name.is_a?(Prism::SymbolNode) # send(:literal) is a plain call
@@ -1791,6 +1814,8 @@ module Indus
         elsif a.is_a?(Prism::RangeNode) || a.is_a?(Prism::ParenthesesNode) && a.body.body.last.is_a?(Prism::RangeNode) then range_array(a.is_a?(Prism::ParenthesesNode) ? a.body.body.last : a)
         elsif a.is_a?(Prism::ArrayNode) || kind_of(a).is_a?(Array) && kind_of(a)[0] == :array then expr(a)
         else expr(Prism::ArrayNode.new(a.send(:source), 0, a.location, 0, [a], nil, nil)) end
+      elsif n.name == :respond_to? && n.receiver && (kd = kind_of(n.receiver)).is_a?(Symbol) && (rk = @classes[kd]) && (um = rk.find_method(:respond_to?)) # the class's own respond_to?
+        rv = expr(n.receiver); emit(:call, [um, rv, *method_args(um, args, rv)])
       elsif n.name == :respond_to? && args.size == 1 && (args[0].is_a?(Prism::SymbolNode) || args[0].is_a?(Prism::StringNode) || args[0].is_a?(Prism::InterpolatedStringNode))
         # the class is known at compile time, so is the answer; an interpolated name must be a literal-with-constants
         nm = case args[0]
@@ -2158,6 +2183,8 @@ module Indus
         if n.receiver.is_a?(Prism::LocalVariableReadNode) then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
         else emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
         r
+      elsif n.name == :[] && n.receiver.is_a?(Prism::ConstantReadNode) && (sf = @funcs[:"#{n.receiver.name}.[]"]) # Klass[x]: the class method
+        emit(:call, [sf, *call_args(sf, args)])
       elsif n.name == :[] && args.size == 1 && args[0].is_a?(Prism::RangeNode) # s[a..b], a[2..], a[..-2]
         rg = args[0]
         lo = rg.left ? expr(rg.left) : const(0)

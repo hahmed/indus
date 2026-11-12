@@ -1336,6 +1336,10 @@ module Indus
       else
         if arr(t) then i.op = :call; i.args = [fn(:__arr_inspect), i.args[0]]
         elsif hsh(t) then i.op = :call; i.args = [fn(t[1] == :sym ? :__hash_inspect_sym : t[1] == :dyn ? :__hash_inspect_dyn : :__hash_inspect), i.args[0]]
+        elsif (cs = classes_of(t)) # a user object: its inspect (or to_s) if defined, else #<Klass>
+          want = cs.any? { @classes[_1].find_method(:inspect) } ? :inspect : (cs.any? { @classes[_1].find_method(:to_s) } ? :to_s : nil)
+          if want then i.op = :mcall; i.args = [want, i.args[0]]; i.ty = nil; bind(f, i); i.ty = :str
+          else i.op = :sconst; i.args = ["#<#{cs.first}>"]; i.ty = :str end
         else raise "inspect of #{t.inspect} not supported" end
       end
     end
