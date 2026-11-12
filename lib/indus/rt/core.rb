@@ -160,7 +160,7 @@ def __dyn_hash_inspect(h)
   while i < __hcount(h)
     out = out + ", " if i > 0
     k = __hkey_at(h, i)
-    out = out + (__dyn_sym_p(k) ? __dyn_to_s(k) + ": " : __dyn_inspect(k) + " => ") + __dyn_inspect(__hval_at(h, i))
+    out = out + (__dyn_sym_p(k) ? __sym_key(__unbox_sym(k)) + " " : __dyn_inspect(k) + " => ") + __dyn_inspect(__hval_at(h, i))
     i = i + 1
   end
   out + "}"
@@ -1139,6 +1139,21 @@ end
 # Symbols are small integers at run time; SYMBOL_NAMES (built at the top of main) has their names
 def __sym_name(id) = SYMBOL_NAMES[id]
 def __sym_inspect(id) = ":" + SYMBOL_NAMES[id]
+# a symbol as a hash key: `name:` when it is a plain identifier (optionally ending in ? or !), else `"name":`
+def __sym_key(id)
+  s = SYMBOL_NAMES[id]
+  return "\"" + s + "\":" if s.length == 0
+  i = 0
+  ok = true
+  while i < s.length
+    c = __ld8(s, i)
+    ident = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (c >= 48 && c <= 57 && i > 0) || c >= 128
+    last = i == s.length - 1 && (c == 63 || c == 33)
+    ok = false unless ident || last
+    i = i + 1
+  end
+  ok ? s + ":" : "\"" + s + "\":"
+end
 
 def __hash_values(h)
   out = []
@@ -1436,6 +1451,33 @@ end
 def __trap_shift
   __trap
   0
+end
+
+# a reflective class's ivar table: [sym_id, index, sym_id, index, ...]; the field index of a name, -1 when absent
+# layout: [n_static_pairs, spares_used, sym, idx, sym, idx, ...] with room for the spares behind the static pairs
+def __ivtab_end(tab) = 2 + 2 * (tab[0] + tab[1])
+def __ivtab_index(tab, sym)
+  i = 2
+  stop = __ivtab_end(tab)
+  while i < stop
+    return tab[i + 1] if tab[i] == __sym_id(sym)
+    i = i + 2
+  end
+  -1
+end
+# instance_variable_set of a name the class has not seen: the next spare slot (tab[1] counts the spares used; slots
+# spare_base.. are the spares), or a trap when they are gone
+def __ivtab_claim(tab, sym, spare_base, nspares)
+  used = tab[1]
+  __ivar_overflow(sym) if used >= nspares
+  at = __ivtab_end(tab)
+  tab[1] = used + 1
+  tab[at] = __sym_id(sym)
+  tab[at + 1] = spare_base + used
+  spare_base + used
+end
+def __ivar_overflow(sym)
+  raise NameError, "instance variable " + __sym_name(sym) + ": this class has no spare field left (4 per reflective class)"
 end
 
 # Kernel#Integer(str): strict -- optional sign, 0x/0b/0o prefixes, underscores between digits; anything else is ArgumentError

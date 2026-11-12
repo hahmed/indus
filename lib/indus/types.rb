@@ -989,6 +989,7 @@ module Indus
       when :hset
         t = of(f, i.args[0]); (yield i.args[1], t[1]; yield i.args[2], t[2]) if hsh(t)
       when :fld_set then (k = of(f, i.args[0])) && (yield i.args[2], ivar_type(k, i.args[1]))
+      when :fld_set_i then yield i.args[2], :dyn
       when :cell_set then (t = of(f, i.args[0])) && cell?(t) && (yield i.args[1], t[1])
       when :gset then yield i.args[1], @consts[i.args[0]]
       when :call # a generic prelude function takes an instance per container type: no widening of the argument towards another caller's shape
@@ -1772,6 +1773,8 @@ module Indus
       when :and, :or then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int # nil is the word 0, false: nil & x, nil | x are booleans
       when :xor then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int
       when :mod then i.args.any? { of(f, _1) == :float } ? :float : :int
+      when :fld_get_i then :dyn
+      when :fld_set_i then of(f, a[2])
       when :sascii then :bool
       when :sclen then :int
       when :shl, :shr, :to_i, :alen, :ipow, :rawld, :rawld32, :gbase, :adrlbl, :rawst, :rawmmap, :rawmunmap, :trap, :fbits, :lsr, :clz, :umulh, :wmul, :wadd, :wsub, :handle then :int
@@ -1871,6 +1874,7 @@ module Indus
       when :hget, :hkey # a lookup key takes the hash's key representation too
         t = of(f, i.args[0]); yield i.args[1], t[1], ->(w) { i.args[1] = w } if hsh(t)
       when :fld_set then yield i.args[2], ivar_type(of(f, i.args[0]), i.args[1]), ->(w) { i.args[2] = w }
+      when :fld_set_i then yield i.args[2], :dyn, ->(w) { i.args[2] = w } # a reflective class: every field is dyn
       when :cell_set then (t = of(f, i.args[0])) && cell?(t) && (yield i.args[1], t[1], ->(w) { i.args[1] = w })
       when :gset then yield i.args[1], @consts[i.args[0]], ->(w) { i.args[1] = w }
       when :call then i.args[1..].each_with_index { |v, k| yield v, i.args[0].ptypes[k], ->(w) { i.args[k + 1] = w } }

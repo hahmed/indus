@@ -79,7 +79,7 @@ module Indus
       mark = ->(v) { esc[v] = true if v.is_a?(Inst) && !esc[v] }
       f.all.each do |i|
         case i.op
-        when :fld_set then mark.(i.args[2])
+        when :fld_set, :fld_set_i then mark.(i.args[2])
         when :cell_new then mark.(i.args[0])
         when :cell_set then mark.(i.args[1])
         when :box, :mkbuf, :raise then mark.(i.args[0]) # a tagged value / a cell's content / an exception is tracked no further
@@ -177,7 +177,7 @@ module Indus
       into = ->(o) { origins(f, o).each { |r| r.op == :param ? sp[f.params.index(r)] = true : (so = true unless fresh_here?(r)) } }
       f.all.each do |i|
         case i.op
-        when :fld_set
+        when :fld_set, :fld_set_i
           o, _, v = i.args
           into.(o) if heap?(ty(f, v))
         when :bufappend then into.(i.args[0]) # the grown string is stored into the cell

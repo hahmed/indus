@@ -160,6 +160,7 @@ module Indus
         params = blk.parameters.is_a?(Prism::BlockParametersNode) ? blk.parameters.parameters.requireds.map { _1.respond_to?(:name) ? _1.name : nil } : [] # |(a, b)| destructures: no name for that slot
         benv = env # blocks share the enclosing locals
         case n.name
+        when :tap, :then, :yield_self, :instance_exec then benv[params[0]] = recv if params[0] && recv # the receiver itself
         when :times, :upto, :downto then benv[params[0]] = :int if params[0]
         when :each, :map, :select, :each_with_index
           if recv.is_a?(Array) && recv[0] == :array then benv[params[0]] = recv[1] if params[0]
@@ -187,6 +188,7 @@ module Indus
       when :to_f then :float
       when :new
         cname = n.receiver.is_a?(Prism::ConstantReadNode) || n.receiver.is_a?(Prism::ConstantPathNode) ? n.receiver.name : nil
+        cname = klass if n.receiver.nil? && klass && @classes[klass] # `new` inside `def self.create`: this class
         return [:array, akinds[1]] if cname == :Array
         return [:hash, nil, akinds[0]] if cname == :Hash # Hash.new / Hash.new(default) / Hash.new { }
         if cname && @classes[cname]

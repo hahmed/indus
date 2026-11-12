@@ -438,6 +438,16 @@ module Indus
           o, ix = i.args; kt = o.ty.is_a?(Array) && o.ty[0] == :poly ? o.ty[1][0] : o.ty # a poly set shares the field layout
           off = @classes.fetch(kt) { raise "fld_get on #{o} (#{o.op}) typed #{o.ty.inspect} in #{@f.name}" }.base + ix * 8
           i.float? ? @asm.fldr_off(d, reg(o), off) : @asm.ldr_off(d, reg(o), off)
+        when :fld_get_i # a field at a run-time index: [obj + base + idx*8]
+          o, ix = i.args; kt = o.ty.is_a?(Array) && o.ty[0] == :poly ? o.ty[1][0] : o.ty
+          base = @classes.fetch(kt).base
+          @asm.emit(0x8B000C00 | (reg(ix, 9) << 16) | (reg(o) << 5) | 16) # add x16, obj, idx, lsl #3
+          @asm.ldr_off(d, 16, base)
+        when :fld_set_i
+          o, ix, v = i.args; kt = o.ty.is_a?(Array) && o.ty[0] == :poly ? o.ty[1][0] : o.ty
+          base = @classes.fetch(kt).base
+          @asm.emit(0x8B000C00 | (reg(ix, 9) << 16) | (reg(o) << 5) | 16)
+          @asm.str_off(reg(v, 10), 16, base)
         when :fld_set
           o, ix, v = i.args; ro = reg(o); kt = o.ty.is_a?(Array) && o.ty[0] == :poly ? o.ty[1][0] : o.ty # a poly set shares the field layout
           off = @classes.fetch(kt) { raise "fld_set on #{o} typed #{o.ty.inspect} in #{@f.name}" }.base + ix * 8

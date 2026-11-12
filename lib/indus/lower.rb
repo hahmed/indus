@@ -413,6 +413,18 @@ module Indus
         end
         register_class_body(k, (c.body&.body || []) + readers, methods)
       end
+      # a class reflecting on its ivars with a name computed at run time (instance_variable_get(iv), instance_variable_set("@#{k}", v)):
+      # every field is dyn-typed and the class gets a run-time name table (symbol id -> field index). Its fields: the ones its
+      # bodies name, every keyword key in the program (the `**attrs` idiom), and four spare slots for anything else.
+      kw_keys = all_kwarg_keys(@ast)
+      cdefs.each do |c|
+        k = @classes[c.constant_path.name]
+        next unless reflects_ivars?(c)
+        k.reflective = true
+        kw_keys.each { |key| k.ivar(:"@#{key}") }
+        k.reserve_spares
+        k.dyn_ivars = k.ivars.dup
+      end
       # nested defs (inside methods, conditionals, blocks, class_eval blocks): versions behind the method's slot
       @nested_defs.each do |owner, d|
         raise "a `def` with yield nested in #{owner || 'the top level'}: not supported (yielders are inlined)" if yields?(d) && !d.parameters&.block
@@ -624,6 +636,26 @@ module Indus
 
     # the DefNode of `def self.name` on k or an ancestor, when it is the kind of body a class-level macro has:
     # define_method / attr_* / instance_variable_* / nested macro calls, and nothing that needs a run-time value
+    # does this class body use instance_variable_get/set/defined? with a name that is not a literal (or a macro parameter)?
+    def reflects_ivars?(c)
+      found = false
+      walk = lambda do |node|
+        return if found || !node.is_a?(Prism::Node)
+        if node.is_a?(Prism::CallNode) && %i[instance_variable_get instance_variable_set instance_variable_defined?].include?(node.name) && (a = node.arguments&.arguments&.first) && !a.is_a?(Prism::SymbolNode) && !a.is_a?(Prism::StringNode)
+          found = true; return
+        end
+        node.compact_child_nodes.each { walk.(_1) }
+      end
+      walk.(c.body)
+      found
+    end
+    def all_kwarg_keys(node, out = [])
+      return out unless node.is_a?(Prism::Node)
+      node.elements.each { |el| out << el.key.unescaped.to_sym if el.is_a?(Prism::AssocNode) && el.key.is_a?(Prism::SymbolNode) } if node.is_a?(Prism::KeywordHashNode)
+      node.compact_child_nodes.each { all_kwarg_keys(_1, out) }
+      out.uniq
+    end
+
     # a compile-time value as IR
     def ct_materialize(v)
       case v
@@ -1409,6 +1441,9 @@ module Indus
         yield_block(n.arguments&.arguments || [])
       when Prism::RangeNode then range_array(n) # a Range as a value: its elements (each/map/times fuse before reaching here)
       when Prism::SymbolNode then (c = const(sym_id(n.unescaped)); c.ty = :sym; c)
+      when Prism::InterpolatedSymbolNode # :"a#{x}": the string, interned at run time
+        str = expr(Prism::InterpolatedStringNode.new(n.send(:source), 0, n.location, 0, nil, n.parts, nil))
+        emit(:call, [demand(:__str_to_sym), str])
       when Prism::ParenthesesNode then n.body.body.map { expr(_1) }.last
       when Prism::StringNode then emit(:sconst, [n.unescaped])
       when Prism::InterpolatedStringNode # "a#{x}b" -> concat chain
@@ -2028,9 +2063,56 @@ module Indus
         expr(n.copy(arguments: n.arguments.copy(arguments: expanded)))
       elsif %i[instance_variable_get instance_variable_set instance_variable_defined? instance_variables].include?(n.name) && (n.receiver ? (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] : @klass && !@klass.closure)
         k = n.receiver ? @classes[kd] : @klass; rv = n.receiver ? expr(n.receiver) : me_val
+        if n.name == :instance_variables && k.reflective # the table's names whose field holds something (nil = unset), claimed spares included
+          k.ivars.each { sym_id(_1.to_s) }
+          @reflective_tabs = (@reflective_tabs || {}).merge(k.name => true)
+          tab = emit(:gget, [:"__IVTAB_#{k.name}"])
+          outv = :"ivs#{@f.blocks.size}:out" # a loop-carried local: the loop's phis carry the grown array
+          @locals[outv] = emit(:anew, [const(0), nil_const])
+          n_pairs = emit(:call, [demand(:__ivtab_end), tab])
+          counted_loop(const(2), n_pairs, :lt, [], [], step: 2) do |i, _ps, _pfx|
+            ix = emit(:idx, [tab, emit(:add, [i, const(1)])])
+            v = emit(:fld_get_i, [rv, ix]); v.ty = :dyn
+            tb, eb, mb = @f.new_block(:ivset), @f.new_block(:ivunset), @f.new_block(:ivmerge)
+            emit(:condbr, [emit(:cmp, [v, nil_const], :ne), tb, eb])
+            before = @locals.dup
+            @cur = tb; sc = emit(:idx, [tab, i]); sc = (c = emit(:nop, [sc]); c.ty = :sym; c); @locals[outv] = emit(:aset, [@locals[outv], emit(:alen, [@locals[outv]]), sc]); tl = @locals; emit(:br, [mb])
+            @cur = eb; @locals = before.dup; emit(:br, [mb])
+            @cur = mb; @locals = merge_locals(mb, [[tb, tl], [eb, before]])
+          end
+          return @locals.delete(outv)
+        end
         if n.name == :instance_variables then pack_values(k.ivars.reject { _1.to_s.start_with?("@__") }.map { |iv| c = const(sym_id(iv.to_s)); c.ty = :sym; c })
         else
-          iv = begin ct_symbol(args[0], @ct || {}) rescue raise("#{n.name}: the name must be known at compile time (a literal, or built from a class-level macro's parameter)") end
+          literal = begin ct_symbol(args[0], @ct || {}) rescue nil end
+          literal = nil if k.reflective && literal && !k.ivars.include?(:"@#{literal.to_s.delete_prefix("@")}") # a reflective class: an unknown literal name goes through the table (a spare slot), never a new field
+          if literal.nil? && k.reflective # a run-time name: the class's table gives the field index
+            nv = expr(args[0]); nv = emit(:call, [demand(:__str_to_sym), nv]) if kind_of(args[0]) == :str || args[0].is_a?(Prism::InterpolatedStringNode)
+            k.ivars.each { sym_id(_1.to_s) } # every field name is a symbol the table knows
+            @reflective_tabs = (@reflective_tabs || {}).merge(k.name => true)
+            tab = emit(:gget, [:"__IVTAB_#{k.name}"])
+            ix = emit(:call, [demand(:__ivtab_index), tab, nv])
+            bad, ok, mb = @f.new_block(:ivbad), @f.new_block(:ivok), @f.new_block(:ivmerge)
+            emit(:condbr, [emit(:cmp, [ix, const(0)], :lt), bad, ok])
+            @cur = bad # a name the class has not seen: get -> nil, defined? -> false, set -> the next spare slot
+            badv = case n.name
+                   when :instance_variable_set
+                     spare_base = k.ivars.index { _1.to_s.start_with?("@__spare") }
+                     six = emit(:call, [demand(:__ivtab_claim), tab, nv, const(spare_base), const(Klass::SPARES)])
+                     v0 = expr(args[1]); emit(:fld_set_i, [rv, six, v0]); v0
+                   when :instance_variable_get then nil_const
+                   else (c = const(0); c.ty = :bool; c) end
+            badend = @cur; emit(:br, [mb])
+            @cur = ok
+            r = case n.name
+                when :instance_variable_get then (g = emit(:fld_get_i, [rv, ix]); g.ty = :dyn; g)
+                when :instance_variable_set then (v = expr(args[1]); emit(:fld_set_i, [rv, ix, v]); v)
+                else emit(:cmp, [(g = emit(:fld_get_i, [rv, ix]); g.ty = :dyn; g), nil_const], :ne) end
+            okend = @cur; emit(:br, [mb])
+            @cur = mb; ph = mb.phi; ph.args = [[badend, badv], [okend, r]]
+            return ph
+          end
+          iv = literal or raise("#{n.name}: the name must be known at compile time (a literal, or built from a class-level macro's parameter)")
           iv = :"@#{iv}" unless iv.to_s.start_with?("@")
           # a name the class has not seen yet (a setter lowered later, a macro's field): registered now; the field reads nil until set.
           # instance_variable_defined? is "the field is not nil" (an ivar assigned nil counts as undefined: an approximation)
@@ -2373,6 +2455,9 @@ module Indus
       when :__unbox_float then emit(:unbox, [expr(args[0]), :float])
       when :__unbox_bool then emit(:unbox, [expr(args[0]), :bool])
       when :__sym_of_id then (c = emit(:nop, [expr(args[0])]); c.ty = :sym; c) # an integer id as a Symbol
+      when :__sym_id then (c = emit(:nop, [expr(args[0])]); c.ty = :int; c)    # a Symbol's integer id
+      when :__fld_get_i then (c = emit(:fld_get_i, [expr(args[0]), expr(args[1])]); c.ty = :dyn; c) # field at a run-time index (a reflective class: dyn fields)
+      when :__fld_set_i then (v = expr(args[2]); emit(:fld_set_i, [expr(args[0]), expr(args[1]), v]); v)
       when :__unbox_obj_addr then emit(:xor, [emit(:handle, [expr(args[0])]), const(8)]) # an object's tag is 8: the raw word with the tag cleared
       when :__unbox_sym then emit(:unbox, [expr(args[0]), :sym])
       when :__unbox_hash then emit(:unbox, [expr(args[0]), [:hash, :dyn, :dyn]])
@@ -2744,7 +2829,7 @@ module Indus
 
     # for i in [from, to): header phis over every local; block params are
     # prefixed so they shadow without clobbering
-    def counted_loop(from, to, cond, params, body, &each)
+    def counted_loop(from, to, cond, params, body, step: 1, &each)
       pfx = :"blk#{@f.blocks.size}:"
       hb, bb, lb, xb = @f.new_block(:head), @f.new_block(:body), @f.new_block(:latch), @f.new_block(:exit)
       xb.cold = true
@@ -2852,7 +2937,7 @@ module Indus
       arms = @loop[:nexts].select { |(b, _)| b.succs.include?(lb) }
       @locals = merge_locals(lb, arms) unless arms.size <= 1
       @locals = arms[0][1].dup if arms.size == 1
-      @locals[ivar] = emit(:add, [@locals[ivar], const(1)])
+      @locals[ivar] = emit(:add, [@locals[ivar], const(step)])
       emit(:br, [hb])
       phis.each { |nm, ph| ph.args << [lb, @locals.fetch(nm)] }
       breaks = @loop[:breaks]; bvals = @loop[:break_values] || []; @loop = outer
@@ -3401,6 +3486,14 @@ module Indus
       arr = emit(:anew, [const(@syms.size + 1), emit(:sconst, [""])])
       @syms.each { |name, id| arr = emit(:aset, [arr, const(id), emit(:sconst, [name.to_s])]) }
       emit(:gset, [:SYMBOL_NAMES, arr])
+      (@reflective_tabs || {}).each_key do |cn| # a reflective class's ivar table: [sym_id, index, ...]
+        k = @classes[cn]; statics = k.ivars.each_with_index.reject { |(iv, _)| iv.to_s.start_with?("@__spare") }
+        pairs = [statics.size, 0] + statics.flat_map { |iv, ix| [sym_id(iv.to_s), ix] } # header [static pairs, spares used], the pairs, room for the spares
+        pairs += [0] * (2 * Klass::SPARES)
+        t = emit(:anew, [const(pairs.size), const(0)])
+        pairs.each_with_index { |v, j| t = emit(:aset, [t, const(j), const(v)]) }
+        emit(:gset, [:"__IVTAB_#{cn}", t])
+      end
       # and every class name by class id: obj.class reads it (classes are ids in the header)
       ks = @classes.values.reject(&:closure)
       carr = emit(:anew, [const((ks.map(&:id).max || 0) + 1), emit(:sconst, [""])])

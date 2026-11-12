@@ -656,7 +656,7 @@ def __hash_inspect_sym(h)
   i = 0
   while i < __hcount(h)
     out = out + ", " if i > 0
-    out = out + __sym_name(__hkey_at(h, i)) + ": " + __hval_at(h, i).inspect
+    out = out + __sym_key(__hkey_at(h, i)) + " " + __hval_at(h, i).inspect
     i = i + 1
   end
   out + "}"
@@ -670,7 +670,7 @@ def __hash_inspect_dyn(h)
   while i < __hcount(h)
     out = out + ", " if i > 0
     k = __hkey_at(h, i)
-    out = out + (__dyn_sym_p(k) ? __dyn_to_s(k) + ": " : __dyn_inspect(k) + " => ") + __hval_at(h, i).inspect
+    out = out + (__dyn_sym_p(k) ? __sym_key(__unbox_sym(k)) + " " : __dyn_inspect(k) + " => ") + __hval_at(h, i).inspect
     i = i + 1
   end
   out + "}"
