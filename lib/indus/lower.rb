@@ -92,6 +92,12 @@ module Indus
       # mod = Module.new { } in a local likewise: an anonymous module named after the local (`__anon_mod`), and
       # every later read of that local as a module/class argument (include, extend, prepend, raise, <) is the constant
       anon_locals = {}
+      # k = Object.const_get(:Array) / const_get("Name") in a local: the local is that constant
+      body.each do |st|
+        next unless st.is_a?(Prism::LocalVariableWriteNode) && (v = st.value).is_a?(Prism::CallNode) && v.name == :const_get && v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Object && (a = v.arguments&.arguments&.first) && (a.is_a?(Prism::SymbolNode) || a.is_a?(Prism::StringNode))
+        anon_locals[st.name] = a.unescaped.to_sym
+      end
+      body = body.reject { |st| st.is_a?(Prism::LocalVariableWriteNode) && anon_locals.key?(st.name) && st.value.is_a?(Prism::CallNode) && st.value.name == :const_get }
       # s = Struct.new(:a) { } / Data.define(:a) in a local: the struct class under a hidden constant
       body = body.map do |st|
         next st unless st.is_a?(Prism::LocalVariableWriteNode) && struct_new?(st.value)
@@ -1235,6 +1241,9 @@ module Indus
           when :respond_to?, :respond_to_missing? then return (c = const(0); c.ty = :bool; c)
           when :initialize then return nil_const # Object#initialize takes nothing and does nothing
           when :to_s, :inspect then return emit(:sconst, ["#<#{@klass.name}>"])
+          when :freeze, :dup, :clone, :itself then return me_val # no frozen bit; the object itself
+          when :== then return emit(:cmp, [me_val, expr(n.arguments.arguments[0])], :eq) # Object#==: identity
+          when :hash then return emit(:handle, [me_val])
           end
           raise "super: no #{mname} above #{@klass.name}"
         end
@@ -1693,7 +1702,7 @@ module Indus
         emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc])
         return nil_const
       end
-      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send __send__ respond_to? extend define_singleton_method methods public_methods instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
+      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send __send__ respond_to? extend define_singleton_method methods public_methods singleton_methods singleton_class instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
         rv = expr(n.receiver)
         return emit(:mcall, [n.name, rv, *object_args(n, args, @classes[k], rv)])
       end
@@ -1886,6 +1895,24 @@ module Indus
         emit(:sconst, [n.receiver.name.to_s]) # Klass.name
       elsif n.name == :class && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name))
         emit(:sconst, [@modules.include?(n.receiver.name) ? "Module" : "Class"])
+      elsif n.name == :singleton_methods && n.receiver && (kd = kind_of(n.receiver)).is_a?(Symbol) && (kk = @classes[kd])
+        # the methods defined on this very object (def o.m / extend): those of the hidden subclass it was retagged into, by class id
+        expr(n.receiver)
+        subs = @classes.values.select { |c| c.superclass.equal?(kk) && c.name.to_s.include?("$") }
+        if subs.empty? then pack_values([])
+        else
+          raise "singleton_methods: several singleton sites on #{kk.name}; not supported" if subs.size > 1
+          names = subs[0].methods.keys.map { |nm| c = const(sym_id(nm.to_s)); c.ty = :sym; c }
+          # a retag happens at the def site: before it the object is a plain kk (no singleton methods)
+          tagged = emit(:isa_tag, [expr(n.receiver), subs[0].id]); tagged.ty = :bool
+          tb, eb, mb = @f.new_block(:sm_yes), @f.new_block(:sm_no), @f.new_block(:sm_merge)
+          emit(:condbr, [tagged, tb, eb])
+          @cur = tb; yes = pack_values(names); emit(:br, [mb])
+          @cur = eb; no = pack_values([]); emit(:br, [mb])
+          @cur = mb; ph = mb.phi; ph.args = [[tb, yes], [eb, no]]; ph
+        end
+      elsif n.name == :instance_methods && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :singleton_class && n.receiver.receiver && (kd = kind_of(n.receiver.receiver)).is_a?(Symbol) && @classes[kd]
+        expr(n.copy(name: :singleton_methods, receiver: n.receiver.receiver, arguments: nil)) # obj.singleton_class.instance_methods(false)
       elsif %i[methods public_methods].include?(n.name) && n.receiver && !n.receiver.is_a?(Prism::ConstantReadNode) && (kd = kind_of(n.receiver)).is_a?(Symbol) && (kk = @classes[kd])
         # obj.methods / obj.public_methods(false): the class's instance methods (its own only with false)
         expr(n.receiver)
@@ -2129,8 +2156,16 @@ module Indus
         rv = n.receiver ? expr(n.receiver) : me_val; bv = expr(n.block.expression)
         emit(:fld_set, [bv, 0, rv])
         emit(:mcall, [:call, bv, *args.map { expr(_1) }])
+      elsif n.name == :extend && args.size == 1 && n.receiver && args[0].is_a?(Prism::ConstantReadNode) && @modules.include?(args[0].name) && !@singletons&.key?(n) && !(kind_of(n.receiver).is_a?(Symbol) && @classes[kind_of(n.receiver)])
+        # expr.extend(M) on an Object with no class of ours (Object.new): only M.extended(obj) observes it
+        rv = expr(n.receiver)
+        (hook = @funcs[:"#{args[0].name}.extended"]) ? emit(:call, [hook, rv]) : rv
       elsif (sub = @singletons&.[](n)) # x.extend(M) / x.define_singleton_method: the object joins the hidden subclass
-        rv = expr(n.receiver); emit(:retag, [rv, sub]); rv
+        rv = expr(n.receiver); emit(:retag, [rv, sub])
+        if n.name == :extend # M.extended(obj) hooks
+          n.arguments.arguments.each { |m| (hook = @funcs[:"#{m.name}.extended"]) && emit(:call, [hook, rv]) }
+        end
+        rv
       elsif n.name == :define_method && (d = @define_method_defs&.[](n)) # a run-time define_method site: the slot write
         expr(d)
       elsif %i[instance_eval instance_exec].include?(n.name) && n.receiver && n.block.is_a?(Prism::BlockNode) && (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd]
