@@ -92,6 +92,12 @@ module Indus
       # mod = Module.new { } in a local likewise: an anonymous module named after the local (`__anon_mod`), and
       # every later read of that local as a module/class argument (include, extend, prepend, raise, <) is the constant
       anon_locals = {}
+      # s = Struct.new(:a) { } / Data.define(:a) in a local: the struct class under a hidden constant
+      body = body.map do |st|
+        next st unless st.is_a?(Prism::LocalVariableWriteNode) && struct_new?(st.value)
+        cname = anon_locals[st.name] = :"__anon_#{st.name}"
+        Prism::ConstantWriteNode.new(st.send(:source), 0, st.location, 0, cname, st.location, st.value, st.location)
+      end
       body = body.map do |st|
         is_anon = st.value.is_a?(Prism::CallNode) && st.value.name == :new && st.value.receiver.is_a?(Prism::ConstantReadNode) && %i[Class Module].include?(st.value.receiver.name) && st.value.block.is_a?(Prism::BlockNode) if st.is_a?(Prism::ConstantWriteNode) || st.is_a?(Prism::LocalVariableWriteNode)
         next st unless is_anon
@@ -142,7 +148,16 @@ module Indus
       cdefs += nested
       # `A.include(M)` / `A.prepend(M)` / `A.extend(M)` as a top-level statement: the same as inside A's body (a re-opening)
       body = body.flat_map do |st|
-        next [st] unless st.is_a?(Prism::CallNode) && %i[include prepend extend].include?(st.name) && st.receiver.is_a?(Prism::ConstantReadNode) && st.arguments&.arguments&.all? { _1.is_a?(Prism::ConstantReadNode) } && cdefs.any? { _1.constant_path.name == st.receiver.name }
+        # A.send(:remove_method, :m) is A.remove_method(:m)
+        st = st.copy(name: st.arguments.arguments[0].unescaped.to_sym, arguments: st.arguments.copy(arguments: st.arguments.arguments[1..])) if st.is_a?(Prism::CallNode) && %i[send public_send __send__].include?(st.name) && st.receiver.is_a?(Prism::ConstantReadNode) && st.arguments&.arguments&.first.is_a?(Prism::SymbolNode) && cdefs.any? { _1.constant_path.name == st.receiver.name }
+        # X.class_eval { undef_method :m; attr_accessor :z; include M } at the top level with only class-body statements (no defs: those are versions): a re-opening
+        if st.is_a?(Prism::CallNode) && %i[class_eval class_exec].include?(st.name) && st.receiver.is_a?(Prism::ConstantReadNode) && st.block.is_a?(Prism::BlockNode) && st.arguments.nil? && cdefs.any? { _1.constant_path.name == st.receiver.name } && (st.block.body&.body || []).all? { |b| b.is_a?(Prism::CallNode) && b.receiver.nil? && %i[undef_method remove_method alias_method attr_accessor attr_reader attr_writer include extend prepend private public protected].include?(b.name) }
+          src = st.send(:source); loc = st.location
+          next [Prism::ClassNode.new(src, 0, loc, 0, [], loc, st.receiver, nil, nil, st.block.body, loc, st.receiver.name)]
+        end
+        mixin = st.is_a?(Prism::CallNode) && %i[include prepend extend].include?(st.name) && st.arguments&.arguments&.all? { _1.is_a?(Prism::ConstantReadNode) }
+        classop = st.is_a?(Prism::CallNode) && %i[alias_method remove_method undef_method private public protected attr_accessor attr_reader attr_writer].include?(st.name) && st.arguments&.arguments&.all? { _1.is_a?(Prism::SymbolNode) || _1.is_a?(Prism::StringNode) }
+        next [st] unless st.is_a?(Prism::CallNode) && (mixin || classop) && st.receiver.is_a?(Prism::ConstantReadNode) && cdefs.any? { _1.constant_path.name == st.receiver.name }
         src = st.send(:source); loc = st.location
         inner = st.copy(receiver: nil)
         [Prism::ClassNode.new(src, 0, loc, 0, [], loc, st.receiver, nil, nil, Prism::StatementsNode.new(src, 0, loc, 0, [inner]), loc, st.receiver.name)]
@@ -942,6 +957,10 @@ module Indus
                 next
               end
               next if %i[private_constant module_function freeze].include?(st.name) && st.receiver.nil? # visibility is not enforced (every call is resolved at compile time)
+              if %i[remove_method undef_method].include?(st.name) && st.receiver.nil? # the method is gone from this class
+                st.arguments.arguments.each { |a| nm = a.unescaped.to_sym; k.methods.delete(nm); k.readers.delete(nm); k.writers.delete(nm); (k.removed ||= {})[nm] = true }
+                next
+              end
               class_body_call(k, st, {}, methods); next
             end
           else
@@ -3662,6 +3681,16 @@ module Indus
       if n.receiver.is_a?(Prism::ConstantReadNode) && (sf = @funcs[:"#{n.receiver.name}.#{n.name}"]) && (d = @defs_by_func[sf]) && d.parameters&.block # Owner.m(&b)
         return emit(:call, [sf, *call_args(sf, args), bv])
       end
+      # obj.m(&pr) where m yields (inlined only): inline it with a block whose body calls the proc value with the yielded arguments
+      if n.receiver && (y = @yielders[n.name]) && y[0] && (kd = kind_of(n.receiver)).is_a?(Symbol) && (kd == y[0].name || @classes[kd] && (c = @classes[kd]; c = c.superclass while c && !c.equal?(y[0]); c))
+        yargs = yield_arities(y[1]).max || 0
+        params = (0...yargs).map { :"__ya#{_1}" }
+        hidden = :"__blkv#{@f.blocks.size}"
+        @locals[lname(hidden)] = bv
+        src = n.send(:source); loc = n.location
+        call = Prism::CallNode.new(src, 0, loc, 0, Prism::LocalVariableReadNode.new(src, 0, loc, 0, hidden, 0), nil, :call, loc, nil, params.empty? ? nil : Prism::ArgumentsNode.new(src, 0, loc, 0, params.map { Prism::LocalVariableReadNode.new(src, 0, loc, 0, _1, 0) }), nil, nil, nil)
+        return inline_yielder(y, n.receiver, args, params, [call])
+      end
       # a method of the current class (bare) or of a known receiver class that takes &block: the block value is its last argument
       k = n.receiver.nil? ? @klass : ((kd = kind_of(n.receiver)).is_a?(Symbol) ? @classes[kd] : nil)
       if k && (mf = k.find_method(n.name)) && (d = @defs_by_func[mf]) && d.parameters&.block
@@ -3669,6 +3698,14 @@ module Indus
         return emit(:mcall, [n.name, rv, *method_args(mf, args, rv), bv])
       end
       raise "block argument to #{n.name}: not supported"
+    end
+
+    # the argument counts of the yields in a def body
+    def yield_arities(node, out = [])
+      return out unless node.is_a?(Prism::Node)
+      out << (node.arguments&.arguments&.size || 0) if node.is_a?(Prism::YieldNode)
+      node.compact_child_nodes.each { yield_arities(_1, out) } unless node.is_a?(Prism::DefNode) && !node.equal?(node)
+      out
     end
 
     # a yielder called with a block value: compiled once more with the block as a parameter

@@ -1,0 +1,64 @@
+class A; [:x, :y].each { |n| define_method("get_#{n}") { n } }; end; p A.new.get_x
+class A; def initialize = @h = {}; def method_missing(n, *a) = n.end_with?("=") ? @h[n.to_s.chomp("=").to_sym] = a[0] : @h[n]; def respond_to_missing?(n, p = false) = true; end; a = A.new; a.name = "x"; p a.name
+class A; attr_accessor :v; end; a = A.new; a.send("v=", 3); p a.send(:v)
+class A; def hi = 1; end; A.class_eval { def bye = 2 }; p A.new.bye
+class A; end; A.class_eval("def dyn = 42"); p A.new.dyn
+class A; end; name = "m#{1 + 1}"; A.class_eval("def #{name} = 7"); p A.new.m2
+class A; def a = 1; end; p A.new.a; A.class_eval("def a = 2"); p A.new.a
+class A; end; A.send(:define_method, :z) { 9 }; p A.new.z
+class A; def self.make(n) = define_method(n) { n.to_s * 2 }; end; A.make(:q); p A.new.q
+mod = Module.new { def helper = :h }; class A; end; A.include(mod); p A.new.helper
+class A; include Comparable; attr_reader :n; def initialize(n) = @n = n; def <=>(o) = n <=> o.n; end; p [A.new(2), A.new(1)].sort.map(&:n), A.new(1).between?(A.new(0), A.new(2))
+class Base; def self.attribute(n) = (define_method(n) { instance_variable_get("@#{n}") }; define_method("#{n}=") { |v| instance_variable_set("@#{n}", v) }); end; class U < Base; attribute :email; end; u = U.new; u.email = "e"; p u.email
+class A; def to_str = "a"; end; p "x" + A.new rescue p $!.class
+class A; def coerce(o) = [o, 10]; end; p 5 + A.new
+class A; def each; yield 1; yield 2; end; include Enumerable; end; p A.new.map { _1 * 2 }, A.new.select(&:even?), A.new.first, A.new.min, A.new.sum, A.new.each_slice(1).to_a
+h = Hash.new { |hh, k| hh[k] = [] }; h[:a] << 1; h[:b] << 2; p h
+class A; def ==(o) = true; def hash = 1; def eql?(o) = true; end; p({A.new => 1}[A.new])
+obj = Object.new; obj.instance_variable_set(:@x, 5); p obj.instance_variable_get(:@x), obj.instance_variables
+class A; def m = 1; end; a = A.new; p a.public_methods(false).sort, a.method(:m).arity, A.instance_method(:m).owner
+class A; def m = 1; end; p A.new.respond_to?(:m), A.method_defined?(:m), A.instance_methods(false)
+class A; protected def p1 = 1; public; def pub = 2; private; def pv = 3; end; a = A.new; p a.pub; p((a.pv rescue :nope)); p((a.p1 rescue :nope))
+class A; def m(*a, **k, &b) = [a, k, b&.call]; end; p A.new.m(1, 2, x: 3) { 4 }
+def dsl(&b) = Object.new.instance_eval(&b); p dsl { 1 + 1 }
+class A; def self.inherited(k) = puts("sub #{k}"); end; class B < A; end
+class A; def self.method_added(m) = puts("added #{m}"); def x = 1; end
+module Tr; def self.included(b) = b.extend(CM); module CM; def cm = :cm; end; end; class A; include Tr; end; p A.cm
+class A; def initialize = @items = []; def <<(x) = (@items << x; self); def to_a = @items; end; p (A.new << 1 << 2).to_a
+s = Struct.new(:a, :b) { def sum = a + b }; p s.new(1, 2).sum
+k = Class.new(StandardError) { def message = "custom" }; begin; raise k; rescue => e; p e.message; end
+class A; CONST = 1; def self.const_missing(n) = "missing #{n}"; end; p A::CONST, A::NOPE
+x = 5; b = binding; p b.local_variable_get(:x)
+p eval("1 + 2")
+code = "3 * 3"; p eval(code)
+class A; def m = 1; end; A.alias_method :n, :m; p A.new.n
+class A; def m = 1; end; A.send(:remove_method, :m); p A.new.respond_to?(:m)
+class A; def m = 1; end; A.class_eval { undef_method :m }; p A.new.respond_to?(:m)
+o = Object.new; def o.greet = "hi"; p o.singleton_methods, o.greet
+class A; end; a = A.new; a.extend(Module.new { def ext = :e }); p a.ext
+class A; def m = yield; end; pr = proc { 5 }; p A.new.m(&pr)
+m = 1.method(:+); p m.call(2), m.to_proc.call(3), [1, 2].map(&10.method(:+))
+class A; def self.create(**attrs) = new.tap { |o| attrs.each { |k, v| o.instance_variable_set("@#{k}", v) } }; attr_reader :a, :b; end; o = A.create(a: 1, b: 2); p o.a, o.b
+class A; def method_missing(name, *args) = name.to_s.start_with?("find_by_") ? "find by #{name.to_s.sub("find_by_", "")}=#{args[0]}" : super; end; p A.new.find_by_email("x")
+class A; def m = 1; end; p A.new.public_send(:m), A.new.__send__(:m), A.instance_method(:m).bind_call(A.new)
+class A; def m = 1; end; a = A.new; p a.singleton_class.instance_methods(false); def a.m = 2; p a.m, A.new.m
+module M; def self.extended(o) = puts("extended"); end; Object.new.extend(M)
+class A; def self.[](x) = new(x); def initialize(x) = @x = x; attr_reader :x; end; p A[5].x
+class A; def call(x) = x + 1; def to_proc = method(:call).to_proc; end; p [1, 2].map(&A.new)
+class A; def respond_to?(m, p = false) = m == :magic || super; end; p A.new.respond_to?(:magic), A.new.respond_to?(:nope)
+ObjectSpace.each_object(Class).first; p 1
+class A; def freeze = (puts "frz"; super); end; A.new.freeze
+klass = Object.const_get(:Array); p klass.new(2, 0)
+class A; def initialize(**o) = o.each { |k, v| instance_variable_set(:"@#{k}", v) }; def [](k) = instance_variable_get(:"@#{k}"); end; p A.new(a: 1)[:a]
+class A; def m = 1; end; A.prepend(Module.new { def m = super + 10 }); p A.new.m
+class A; def m = 1; end; class A; alias old_m m; def m = old_m + 1; end; p A.new.m
+class A; def ivars = instance_variables.map { |iv| [iv, instance_variable_get(iv)] }.to_h; def initialize = (@a = 1; @b = "x"); end; p A.new.ivars
+def m = yield(1, 2); m { |a, b| p [a, b] }; m { |a| p a }; m { |*a| p a }
+l = ->(a, b = 2, *r, k: 3) { [a, b, r, k] }; p l.(1), l.(1, 5, 6, k: 7), l.arity, l.lambda?
+pr = proc { |a, (b, c)| [a, b, c] }; p pr.call(1, [2, 3])
+class A; def m = 1; end; obj = A.new; meth = obj.method(:m); p meth.call, meth.owner, meth.receiver == obj, meth.name
+class A; attr_writer :x; def x = @x || 0; end; a = A.new; a.x += 5; p a.x
+class A; def ==(o) = o.is_a?(A); end; p A.new == A.new, [A.new].include?(A.new), A.new != A.new
+p defined?(Foo), defined?(String), defined?(puts), defined?(@x), defined?(yield), defined?(super)
+class A; def to_s = "A!"; def inspect = "#<A>"; end; puts A.new; p A.new; puts "#{A.new}"; p [A.new]; puts [A.new].inspect
+class A; def m(a, b = a * 2, *rest, c:, d: c + 1, **o) = [a, b, rest, c, d, o]; end; p A.new.m(1, c: 5), A.new.m(1, 2, 3, c: 5, d: 6, e: 7)
