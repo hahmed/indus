@@ -142,6 +142,11 @@ module Indus
       # a module's instance methods: `include M` in a class body compiles them as that class's own
       # (one copy per including class -- typed for that class, like everything else here)
       @module_defs = mods.to_h { |m| [m.constant_path.name, (m.body&.body || []).grep(Prism::DefNode).reject { _1.receiver.is_a?(Prism::SelfNode) }] }
+      # `include M` inside a module body: M's defs are part of this module (transitively; the include statement itself is then done)
+      mod_includes = mods.to_h { |m| [m.constant_path.name, (m.body&.body || []).select { |st| st.is_a?(Prism::CallNode) && st.name == :include && st.receiver.nil? && st.arguments }.flat_map { |st| st.arguments.arguments.filter_map { _1.is_a?(Prism::ConstantReadNode) ? _1.name : nil } }] }
+      resolve_mod = ->(name, seen) { seen[name] ? [] : (seen[name] = true; (mod_includes[name] || []).flat_map { |inc| resolve_mod.(inc, seen) } + (@module_defs[name] || [])) }
+      @module_defs = @module_defs.to_h { |name, _| [name, resolve_mod.(name, {}).uniq] }
+      @mod_include_done = true # the include statements in module bodies are consumed here (register_class_body / mod_ivars skip them)
       mod_classes = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ClassNode) }
       mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
       defs = body.grep(Prism::DefNode).reject { _1.receiver && !_1.receiver.is_a?(Prism::SelfNode) } # def x.m stays a statement (a singleton site)
