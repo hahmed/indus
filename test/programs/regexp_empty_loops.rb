@@ -1,0 +1,1 @@
+p(/(a*)*/.match("").to_a, /(a*)?/.match("").to_a, /(a*)*?/.match("").to_a, /(a*?)*/.match("").to_a, /(ab)*c/.match("ababc").to_a, /a*b/.match("xaab").to_a, /(\d+)-(\d+)/.match("12-34").to_a, "aaa".gsub(/a*/, "x"))

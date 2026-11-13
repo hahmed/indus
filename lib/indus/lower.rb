@@ -260,11 +260,6 @@ module Indus
           c.copy(body: Prism::StatementsNode.new(src, 0, loc, 0, (c.body&.body || []) + extends))
         end
       end
-      # a top-level `include M`: M's methods are methods of main (top-level defs), as Object's
-      body = body.flat_map do |st|
-        next [st] unless st.is_a?(Prism::CallNode) && st.name == :include && st.receiver.nil? && st.arguments&.arguments&.all? { _1.is_a?(Prism::ConstantReadNode) || _1.is_a?(Prism::ConstantPathNode) }
-        st.arguments.arguments.flat_map { |m| @module_defs[m.name] || raise("include #{m.name}: no such module") }
-      end
       # `extend M` in a class body: M's methods are class methods of that class
       (cdefs + mods).each do |c|
         (c.body&.body || []).each do |st|

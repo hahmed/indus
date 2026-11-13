@@ -8,6 +8,3 @@ class Outer
   end
 end
 p Outer::Inner.new.mc, Outer::Inner.mc
-module MC; def mc = :c; end
-include MC
-p mc

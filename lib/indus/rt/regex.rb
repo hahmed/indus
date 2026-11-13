@@ -21,6 +21,8 @@ REGEX_OP_WORDB = 11
 REGEX_OP_NWORDB = 12
 REGEX_OP_EOSNL = 13
 REGEX_OP_BACKREF = 14
+REGEX_OP_MARK = 15          # mark slot: remember pos at a loop's entry
+REGEX_OP_JMP_PROGRESS = 16  # jmp_progress off slot: back to the loop only if pos moved since the mark
 
 def __re_word_byte(b) = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
 
@@ -55,6 +57,7 @@ def __re_try(prog, s, start, caps, ncap)
   pc = 0
   pos = start
   hit = [false]
+  marks = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # loop entry positions (16 nested/sibling star loops)
   while true
     op = prog[pc]
     ok = true
@@ -96,6 +99,15 @@ def __re_try(prog, s, start, caps, ncap)
       pc = pc + prog[pc + 1]
     elsif op == REGEX_OP_JMP
       pc = pc + prog[pc + 1]
+    elsif op == REGEX_OP_MARK
+      marks[prog[pc + 1]] = pos
+      pc = pc + 2
+    elsif op == REGEX_OP_JMP_PROGRESS
+      if pos > marks[prog[pc + 2]]
+        pc = pc + prog[pc + 1]
+      else
+        pc = pc + 3 # an empty iteration: leave the loop
+      end
     elsif op == REGEX_OP_SAVE
       caps[prog[pc + 1]] = pos
       pc = pc + 2

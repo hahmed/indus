@@ -22,7 +22,7 @@
 module Indus
   module Regex
     OPS = { char: 0, any: 1, cls: 2, split: 3, jmp: 4, save: 5, match: 6, bol: 7, eol: 8, bos: 9, eos: 10,
-            wordb: 11, nwordb: 12, eosnl: 13, backref: 14 }.freeze
+            wordb: 11, nwordb: 12, eosnl: 13, backref: 14, mark: 15, jmp_progress: 16 }.freeze
 
     class Node
       attr_accessor :kind, :a, :b, :min, :max, :greedy, :neg, :ranges, :index
@@ -181,7 +181,8 @@ module Indus
 
     class Compiler
       attr_reader :code
-      def initialize(ngroups, icase) = (@code = []; @ngroups = ngroups; @icase = icase)
+      def initialize(ngroups, icase) = (@code = []; @ngroups = ngroups; @icase = icase; @nloops = 0)
+      attr_reader :nloops
 
       def emit_node(n)
         case n.kind
@@ -224,11 +225,14 @@ module Indus
           min, max, g = n.min, n.max, n.greedy
           min.times { emit_node(n.a) }
           if max == -1
-            # L: split body, exit ; body ; jmp L
+            # L: split body, exit ; mark slot ; body ; jmp_progress L slot -- the back edge is taken only if the body
+            # consumed input (an empty iteration of (a*)* would otherwise loop forever)
+            slot = (@nloops += 1) - 1
             l = @code.size; @code << OPS[:split] << 0 << 0
+            @code << OPS[:mark] << slot
             emit_node(n.a)
             jmp_at = @code.size
-            @code << OPS[:jmp] << (l - jmp_at)
+            @code << OPS[:jmp_progress] << (l - jmp_at) << slot
             set_split(l, 3, @code.size - l, g)
           else
             (max - min).times do
