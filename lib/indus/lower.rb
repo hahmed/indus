@@ -275,7 +275,14 @@ module Indus
                 src_def = (sc.body&.body || []).grep(Prism::DefNode).find { _1.name == on } || (c.body&.body || []).grep(Prism::DefNode).find { _1.name == on && _1.receiver.is_a?(Prism::SelfNode) } or raise "alias_method #{nn}: no class method #{on}"
                 sdefs << [c.constant_path.name, src_def.copy(name: nn)]; next
               end
-              next if %i[private public protected private_class_method].include?(st.name)
+              next if %i[private public protected private_class_method module_function].include?(st.name)
+              if st.name == :include && st.arguments # `class << self; include M`: M's methods are class methods (as `extend M`)
+                st.arguments.arguments.each do |m|
+                  raise "class << self: include #{m.class}: a module name" unless m.is_a?(Prism::ConstantReadNode)
+                  (@module_defs[m.name] || raise("include #{m.name}: no such module")).each { |d| sdefs << [c.constant_path.name, d]; (@inherited_cm ||= {})[[c.constant_path.name, d.name]] = true }
+                end
+                next
+              end
               raise "unsupported in class << self: #{st.name}" unless %i[attr_accessor attr_reader attr_writer].include?(st.name)
               (st.arguments&.arguments || []).each do |sym|
                 nm = sym.unescaped.to_sym; src = sym.send(:source); loc = sym.location
@@ -290,6 +297,8 @@ module Indus
                   sdefs << [c.constant_path.name, Prism::DefNode.new(src, 0, loc, 0, :"#{nm}=", loc, Prism::SelfNode.new(src, 0, loc, 0), ps, Prism::StatementsNode.new(src, 0, loc, 0, [w]), [:v], loc, nil, nil, nil, nil, nil)]
                 end
               end
+            when Prism::ConstantWriteNode then (@singleton_consts ||= []) << [c.constant_path.name, st] # a constant on the singleton class: reachable as Klass::X / X inside the class
+            when Prism::StringNode, Prism::SymbolNode, Prism::IntegerNode, Prism::NilNode then nil # a bare value: no effect
             else raise "unsupported in class << self: #{st.class}"
             end
           end
@@ -328,7 +337,8 @@ module Indus
       @top_consts = body.grep(Prism::ConstantWriteNode).map(&:name) # the program's top-level constants
       @class_const_owners = Hash.new { |h, k| h[k] = [] } # const name -> classes that define it
       cdefs.each { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).each { |w| @class_const_owners[w.name] << c.constant_path.name } }
-      class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).map { |w| w.copy(name: :"#{c.constant_path.name}::#{w.name}") } + (c.body&.body || []).grep(Prism::ClassVariableWriteNode) } # @@x = v in a class body: run first, like a constant
+      (@singleton_consts || []).each { |(cn, w)| @class_const_owners[w.name] << cn } # `class << self; X = v`: X is the class's for lookup purposes
+      class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).map { |w| w.copy(name: :"#{c.constant_path.name}::#{w.name}") } + (c.body&.body || []).grep(Prism::ClassVariableWriteNode) } + (@singleton_consts || []).map { |(cn, w)| w.copy(name: :"#{cn}::#{w.name}") } # @@x = v in a class body: run first, like a constant
       # Name = Struct.new(:a, :b) defines a class with accessors and an initialize
       structs = body.select { |st| st.is_a?(Prism::ConstantWriteNode) && struct_new?(st.value) }
       @lazy = {}; @defs_by_func = {} # prelude functions (__name): lowered on first demand, see `demand`
@@ -1380,6 +1390,7 @@ module Indus
       when Prism::ConstantReadNode
         if n.name == :ARGV then emit(:anew, [const(0), emit(:sconst, [""])]) # no arguments: an empty array of strings (ARGV[k] is nil, ARGV.size 0)
         elsif (o = const_owner(n.name)) then emit(:gget, [:"#{o}::#{n.name}"]) # a class's constant, found lexically
+        elsif (@classes[n.name] || @modules.include?(n.name)) && !has_const?(n.name) then emit(:sconst, [n.name.to_s]) # a class or module as a value: its name (classes are names at run time)
         else emit(:gget, [n.name]) end
       when Prism::ConstantWriteNode
         v = expr(n.value); emit(:gset, [n.name, v]); v
