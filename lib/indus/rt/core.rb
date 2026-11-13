@@ -262,6 +262,29 @@ def __dyn_eq(a, b)
   if __dyn_numeric(a) && __dyn_numeric(b)
     return __dyn_num(a) == __dyn_num(b)
   end
+  if __tag(a) == 4 && __tag(b) == 4 # arrays of tagged values: element-wise
+    x = __unbox_arr(a)
+    y = __unbox_arr(b)
+    return false if x.length != y.length
+    i = 0
+    while i < x.length
+      return false unless __dyn_eq(x[i], y[i])
+      i = i + 1
+    end
+    return true
+  end
+  if __tag(a) == 6 && __tag(b) == 6 # hashes of tagged values: same count, every key present with an equal value
+    x = __unbox_hash(a)
+    y = __unbox_hash(b)
+    return false if __hcount(x) != __hcount(y)
+    i = 0
+    while i < __hcount(x)
+      k = __hkey_at(x, i)
+      return false unless y.key?(k) && __dyn_eq(__hval_at(x, i), y[k])
+      i = i + 1
+    end
+    return true
+  end
   __same(a, b)
 end
 
@@ -1194,6 +1217,7 @@ def __opt_to_s(v)
 end
 
 def __class_name(id) = CLASS_NAMES[id]
+def __obj_default_inspect(id) = "#<" + CLASS_NAMES[id] + ">"
 
 def __raise_zero_div
   raise ZeroDivisionError, "divided by 0"

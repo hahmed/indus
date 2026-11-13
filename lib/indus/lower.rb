@@ -191,7 +191,28 @@ module Indus
       # reopening a builtin (class String; def shout = upcase + "!"; end): each def becomes a family
       # function __str_shout(self__, ...) with self and bare calls rewritten onto the receiver; the
       # call `"hi".shout` then routes like any String method
-      builtin_fams = { String: "str", Integer: "num", Float: "num", Numeric: "num", Array: "arr", Hash: "hash" }
+      builtin_fams = { String: "str", Integer: "num", Float: "num", Numeric: "num", Array: "arr", Hash: "hash", Symbol: "sym", NilClass: "nil", TrueClass: "bool", FalseClass: "bool" }
+      # `class Object; def should ... end`: a method on everything. For user classes it is a method of the root (every class
+      # without a superclass inherits it); for the builtins one family function per family, and __obj_<name> for the rest.
+      object_bodies = cdefs.select { %i[Object Kernel BasicObject].include?(_1.constant_path.name) }
+      # the Object class itself stays declared (Object.new); its defs leave the body and become the family functions below
+      cdefs = cdefs.map { |c| object_bodies.include?(c) ? c.copy(body: Prism::StatementsNode.new(c.send(:source), 0, c.location, 0, (c.body&.body || []).reject { _1.is_a?(Prism::DefNode) && _1.receiver.nil? })) : c }
+      object_bodies.each do |c|
+        (c.body&.body || []).each do |st|
+          next unless st.is_a?(Prism::DefNode) && st.receiver.nil?
+          (@object_defs ||= []) << st
+          %w[str num arr hash sym nil bool obj].each do |fam|
+            src = st.send(:source); loc = st.location
+            selfp = Prism::RequiredParameterNode.new(src, 0, loc, 0, :self__)
+            ps = st.parameters || Prism::ParametersNode.new(src, 0, loc, 0, [], [], nil, [], [], nil, nil)
+            ps = ps.copy(requireds: [selfp] + ps.requireds)
+            body_ = Lower.onto_receiver(st.body, st, :self__)
+            d2 = Prism::DefNode.new(src, 0, loc, 0, :"__#{fam}_#{st.name.to_s.sub('?', '_p').sub('!', '_bang')}", loc, nil, ps, body_, [:self__] + st.locals, loc, nil, nil, nil, nil, nil)
+            body << d2; defs << d2
+            (@user_family_defs ||= []) << d2.name
+          end
+        end
+      end
       cdefs, builtin_bodies = cdefs.partition { !builtin_fams.key?(_1.constant_path.name) }
       builtin_bodies.each do |c|
         fam = builtin_fams[c.constant_path.name]
@@ -405,6 +426,14 @@ module Indus
         text = @ast.send(:source).source
         used = ->(nm) { %i[to_s inspect].include?(nm) || text.include?(nm == :[] ? "[" : nm == :== ? "==" : nm.to_s) }
         register_class_body(k, synth_defs.reject { own.include?(_1.name) || !used.(_1.name) } + body_defs, methods) # Struct.new(...) do ... end
+      end
+      cdefs = cdefs.map do |c| # a root class (no superclass) takes the `class Object` defs as its own, below its body (a body def of the same name wins)
+        next c if c.superclass || @object_defs.nil? || @object_defs.empty? || c.constant_path.name.to_s.start_with?("__") || PRELUDE_CLASSES.include?(c.constant_path.name)
+        own = (c.body&.body || []).grep(Prism::DefNode).map(&:name)
+        extra = @object_defs.reject { own.include?(_1.name) }
+        next c if extra.empty?
+        src = c.send(:source); loc = c.location
+        c.copy(body: Prism::StatementsNode.new(src, 0, loc, 0, extra + (c.body&.body || [])))
       end
       cdefs.each do |c|
         sup = c.superclass && @classes.fetch(c.superclass.name) { raise "superclass #{c.superclass.name} must be defined first" }
@@ -1213,7 +1242,16 @@ module Indus
 
     def expr(n)
       case n
-      when Prism::IntegerNode then (n.value.bit_length <= 64 or raise "integer literal #{n.value} does not fit 64 bits (Bignum literals not supported yet)"); const(n.value)
+      when Prism::IntegerNode
+        if n.value >= -(1 << 63) && n.value < (1 << 64) then const(n.value) # (an unsigned 64-bit pattern such as 0x8000000000000000 stays a word: the prelude's float tables)
+        else # a Bignum literal: the limb array lib/indus/rt/big.rb uses ([sign, limb0, limb1, ...], base 2**31, little-endian), typed BIG
+          mag = n.value.abs; limbs = []
+          while mag > 0 do limbs << (mag & 0x7fffffff); mag >>= 31 end
+          words = [n.value < 0 ? 1 : 0] + limbs
+          arr = emit(:anew, [const(words.size), const(0)]); arr.ty = Types::BIG
+          words.each_with_index { |w, k| arr = emit(:aset, [arr, const(k), const(w)]); arr.ty = Types::BIG }
+          arr
+        end
       when Prism::FloatNode then fconst(n.value)
       when Prism::NilNode then (c = const(0); c.ty = :nil; c)
       when Prism::TrueNode then (c = const(1); c.ty = :bool; c)
@@ -1678,6 +1716,7 @@ module Indus
 
     def call(n)
       args = n.arguments&.arguments || []
+      return nil_const if %i[public private protected module_function].include?(n.name) && n.receiver.nil? && args.empty? && @klass.nil? # a bare `private` at the top level: no effect on a script
       if (ta = enumerable_receiver(n)) then return call(n.copy(receiver: ta)) end
       if n.safe_navigation? && !@in_safe_nav # x&.m: nil when x is nil
         r = expr(n.receiver)

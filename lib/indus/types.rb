@@ -216,10 +216,13 @@ module Indus
             end
             dsend(f, i) if i.op == :dsend
             float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
-            if %i[puts_v p_v print_v to_s].include?(i.op) && big?(of(f, i.args[0])) # Bignum prints through the prelude
+            if %i[puts_v p_v print_v to_s inspect_v].include?(i.op) && big?(of(f, i.args[0])) # Bignum prints through the prelude (p/inspect: the digits, unquoted)
               c = Inst.new(:call, [fn(:__big_to_s), i.args[0]]); c.ty = :str; c.block = i.block
               i.block.insts.insert(i.block.insts.index(i), c)
-              if i.op == :to_s then i.op = :nop; i.args = [c]; i.ty = :str else i.args = [c] end
+              case i.op
+              when :to_s, :inspect_v then i.op = :nop; i.args = [c]; i.ty = :str
+              when :p_v then i.op = :puts_str; i.args = [c]
+              else i.args = [c] end
               changed = true
             end
             if i.op == :eputs_v && (t = of(f, i.args[0])) # $stderr.puts: make it a string, then write to fd 2
@@ -234,7 +237,7 @@ module Indus
               i.op = :eputs_str; i.args = [c]
             end
             # printing/inspecting by type is irreversible, so it waits for the types to settle (below)
-            if i.op == :cmp && (t0 = of(f, i.args[0])) && (t0.is_a?(Symbol) && @classes[t0] || poly?(t0))
+            if i.op == :cmp && (t0 = of(f, i.args[0])) && (t0.is_a?(Symbol) && @classes[t0] || poly?(t0)) && (@settled || i.args[0].op != :fld_get) # a field read may still widen to dyn (`@v = self` from every class): wait for settle
               # comparing objects: an ordering is the class's own operator (Comparable from the prelude,
               # or user-defined); == / != too when the class defines ==, else identity
               has_eq = (classes_of(t0) || []).any? { @classes[_1].find_method(:==) }
@@ -699,7 +702,7 @@ module Indus
           next unless i.op == :pcall && i.ty
           i.args[0].each do |arm|
             at = arm_type(f, i, arm)
-            next if at.nil? || at == i.ty || same_representation?(at, i.ty) || arm[1] == :trap
+            next if at.nil? || at == :nil || at == i.ty || same_representation?(at, i.ty) || arm[1] == :trap # a nil-typed arm never produced a value (its method's result was unused)
             raise "#{f.name}: #{arm[0].name}##{arm[1] == :call ? arm[2].name.to_s.split("#").last : "attr"} answers #{at.inspect} where other classes answer #{i.ty.inspect}; a dispatch mixing representations is not supported"
           end
         end
@@ -902,7 +905,7 @@ module Indus
 
     # prelude generics: top-level functions named __arr_* / __merge_*; one instance per
     # distinct container type they are called with
-    def self.generic?(f) = f.name.to_s.start_with?("__arr_", "__merge_", "__hash_", "__fd_lines_of", "__num_") && !f.cls
+    def self.generic?(f) = f.name.to_s.start_with?("__arr_", "__merge_", "__hash_", "__fd_lines_of", "__num_") && !f.cls && !@lower.user_family_defs&.include?(f.name) # a user's reopened-builtin body is one function, typed by join
     def self.clashes?(f, ts)
       # containers: one instance per exact element type (a narrower array passed where a wider one
       # was seen would need its elements re-represented, not just a wider parameter)
@@ -1404,6 +1407,10 @@ module Indus
         i.op = :call; i.args = [fn(:__class_name), cid]; i.ty = :str; return
       end
       if poly?(t) # one arm per class: [klass, kind, payload]; a class without the method traps if reached
+        if %i[to_s inspect].include?(name) && args.empty? && t[1].none? { @classes[_1].find_method(name) } # Object's default: #<Klass>, by class id
+          cid = Inst.new(:class_id, [recv]); cid.ty = :int; cid.block = i.block; i.block.insts.insert(i.block.insts.index(i), cid)
+          i.op = :call; i.args = [fn(:__obj_default_inspect), cid]; i.ty = :str; return
+        end
         arms = t[1].map { |c| [@classes[c], *resolve(@classes[c], name, args.size, trap_missing: true)] }
         raise "no method #{name} on any of #{t[1].join(', ')}" if arms.all? { |(_, kind, _)| kind == :trap }
         if arms.all? { |(_, kind, payload)| kind == :call && payload.equal?(arms[0][2]) } # one function for the whole set: no dispatch needed
@@ -1467,6 +1474,19 @@ module Indus
         end
       end
       if t == :int && name == :to_s && args.empty? then i.op = :itos; i.args = [recv]; return end
+      if t == :dyn && %i[== != eql? equal? hash].include?(name) # equality on a tagged value: the tag decides (a user == only when the object arm is reached)
+        if name == :== && args.size == 1
+          users = boxed_user_classes.select { |k| k.find_method(:==) }
+          if users.any? && !i.dyn_split && @settled
+            split_dyn_object(f, i, recv, users) { |un, ob| m = Inst.new(:mcall, [:==, un, args[0]]); m.block = ob; ob.insts << m; m }
+            return
+          end
+          return unless @settled || users.empty?
+          i.op = :cmp; i.args = [recv, args[0]]; i.cond = :eq; i.ty = nil; return # Types' cmp on dyn: __dyn_eq
+        end
+        if name == :!= && args.size == 1 then i.op = :cmp; i.args = [recv, args[0]]; i.cond = :ne; i.ty = nil; return end
+        return
+      end
       if t == :dyn && (cands = @classes.values.select { |k| k.closure ? name == :call : (k.find_method(name) || k.find_reader(name) || k.find_writer(name)) }).any? && !%i[str arr hash num].any? { |fm| prelude_method(fm, name, args.size) }
         # a method of user classes on a tagged value: the object (tag 8, class id in word 0), dispatched over the classes defining it
         cs = cands.map(&:name).sort
@@ -1516,7 +1536,8 @@ module Indus
       if t == :float && args.size == 1 && name == :fdiv then i.op = :div; i.args = [recv, args[0]]; i.ty = :float; return end
       if t == :float && args.size == 1 && name == :divmod then i.op = :call; i.args = [fn(:__float_divmod), recv, args[0]]; return end
       if t == :int && args.size == 1 && name == :divmod && of(f, args[0]) == :float then i.op = :call; i.args = [fn(:__float_divmod), recv, args[0]]; return end
-      fam = hsh(t) ? "hash" : (t == :int || t == :float) ? "num" : t == :str ? "str" : arr(t) ? "arr" : nil
+      fam = hsh(t) ? "hash" : (t == :int || t == :float || t == :int?) ? "num" : t == :str ? "str" : arr(t) ? "arr" : t == :sym ? "sym" : t == :nil ? "nil" : t == :bool ? "bool" : nil
+      if fam && %w[sym nil bool].include?(fam) && !prelude_method(fam, name, args.size) && prelude_method("obj", name, args.size) then fam = "obj" end # a `class Object` def reached through a Symbol/nil/bool
       if fam && (fn = prelude_method(fam, name, args.size))
         if fam == "str" && args.any? { |a| a.op == :const && a.ty == :nil } # "s".index(nil): TypeError, not a null read
           w = Inst.new(:sconst, ["String"]); w.ty = :str; w.block = i.block; i.block.insts.insert(i.block.insts.index(i), w)

@@ -6,3 +6,4 @@ notes/
 !docs/*.md
 !docs/notes/*.md
 !docs/notes/*.tsv
+/build/
