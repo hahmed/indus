@@ -159,6 +159,7 @@ module Indus
       nested = []
       walk = ->(c) { (c.body&.body || []).grep(Prism::ClassNode).each { |inner| nested << inner; walk.(inner) } }
       cdefs.each { walk.(_1) }
+      @hoisted_classes = nested
       cdefs += nested
       # `A.include(M)` / `A.prepend(M)` / `A.extend(M)` as a top-level statement: the same as inside A's body (a re-opening)
       body = body.flat_map do |st|
@@ -176,7 +177,7 @@ module Indus
         inner = st.copy(receiver: nil)
         [Prism::ClassNode.new(src, 0, loc, 0, [], loc, st.receiver, nil, nil, Prism::StatementsNode.new(src, 0, loc, 0, [inner]), loc, st.receiver.name)]
       end
-      cdefs = body.grep(Prism::ClassNode) + mod_classes + nested
+      cdefs = (body.grep(Prism::ClassNode) + mod_classes + nested).uniq # (nested was added above; the re-opening synthesised here is new)
       # a class opened several times (class A; ...; end ... class A; ...; end) is one class: the bodies
       # concatenated in order, the superclass from whichever body names it. (Whole program: every body is known.)
       by_name = {}
@@ -258,6 +259,11 @@ module Indus
           extends = adds.map { |path| Prism::CallNode.new(src, 0, loc, 0, nil, nil, :extend, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, [path]), nil, nil, nil) }
           c.copy(body: Prism::StatementsNode.new(src, 0, loc, 0, (c.body&.body || []) + extends))
         end
+      end
+      # a top-level `include M`: M's methods are methods of main (top-level defs), as Object's
+      body = body.flat_map do |st|
+        next [st] unless st.is_a?(Prism::CallNode) && st.name == :include && st.receiver.nil? && st.arguments&.arguments&.all? { _1.is_a?(Prism::ConstantReadNode) || _1.is_a?(Prism::ConstantPathNode) }
+        st.arguments.arguments.flat_map { |m| @module_defs[m.name] || raise("include #{m.name}: no such module") }
       end
       # `extend M` in a class body: M's methods are class methods of that class
       (cdefs + mods).each do |c|
@@ -1596,6 +1602,7 @@ module Indus
       case node
       when Prism::ClassNode
         cname = node.constant_path.name
+        top_level = true if @hoisted_classes&.include?(node) # a class nested in a class body: hoisted, so its defs are first definitions
         (node.body&.body || []).each do |st|
           st = st.arguments.arguments[0] if st.is_a?(Prism::CallNode) && %i[private public protected module_function].include?(st.name) && st.receiver.nil? && st.arguments&.arguments&.size == 1 && st.arguments.arguments[0].is_a?(Prism::DefNode) # `private def x`
           if st.is_a?(Prism::DefNode)
@@ -1737,6 +1744,10 @@ module Indus
 
     def call(n)
       args = n.arguments&.arguments || []
+      # Outer::Inner.m / Mod::Klass.new: classes are hoisted and known by their own name -- the path is the leaf
+      if n.receiver.is_a?(Prism::ConstantPathNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name)) && !(n.receiver.parent.is_a?(Prism::ConstantReadNode) && @class_const_owners && @class_const_owners[n.receiver.name].any?)
+        return call(n.copy(receiver: Prism::ConstantReadNode.new(n.send(:source), 0, n.receiver.location, 0, n.receiver.name)))
+      end
       return nil_const if %i[public private protected module_function].include?(n.name) && n.receiver.nil? && args.empty? && @klass.nil? # a bare `private` at the top level: no effect on a script
       if (ta = enumerable_receiver(n)) then return call(n.copy(receiver: ta)) end
       if n.safe_navigation? && !@in_safe_nav # x&.m: nil when x is nil
