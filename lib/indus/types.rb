@@ -1604,6 +1604,11 @@ module Indus
       # a class without the method while the receiver's set may still widen (an element of a mixed array
       # seen one class at a time): wait; settled, it is Ruby's NoMethodError at run time (a trap)
       unless klass.find_reader(name) && args.empty? || klass.find_writer(name) && args.size == 1 || klass.find_method(name) || klass.find_method(:method_missing)
+        if @lower.object_def_names&.include?(name) && (of_ = prelude_method("obj", name, args.size)) # a `class Object` def on an object of a class that did not take it (a closure, a library class): the obj family, boxed
+          bx = Inst.new(:box, [recv, t]); bx.ty = :dyn; bx.block = i.block; i.block.insts.insert(i.block.insts.index(i), bx)
+          related(klass).each { _1.tagged = true; _1.boxed = true }
+          i.op = :call; i.args = [of_, bx, *args]; i.ty = nil; of_.ptypes[0] = :dyn; return
+        end
         return unless @settled
         tr = Inst.new(:trap, ["undefined method '#{name}' for an instance of #{klass.name} (NoMethodError)"]); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr) # NoMethodError at run time
         i.op = :const; i.args = [0]; i.ty = :nil; return # the value after a trap: never read
@@ -1611,6 +1616,15 @@ module Indus
       kind, payload = resolve(klass, name, args.size, allow_missing: true)
       if kind == :call && klass.closure && name == :call && args.size != payload.params.size - 1 # proc arity: missing args are nil, extras dropped (or gathered by *rest)
         want = payload.params.size - 1
+        if args.size == 1 && want > 1 && !payload.strict_arity && (at = of(f, args[0])) && arr(at) # one Array argument auto-splats across the parameters (proc semantics)
+          return unless at[1] # wait for the element type
+          a = args[0]
+          args = (0...want).map do |k|
+            kc = Inst.new(:const, [k]); kc.ty = :int; kc.block = i.block; i.block.insts.insert(i.block.insts.index(i), kc)
+            g = Inst.new(:idx, [a, kc]); g.block = i.block; g.destructure = true; i.block.insts.insert(i.block.insts.index(i), g); g
+          end
+          i.args = [name, recv, *args]; # fall through to the call with the pieces
+        end
         if payload.rest # the last parameter takes the extras as an array
           fixed = want - 1
           extras = args[fixed..] || []

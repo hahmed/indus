@@ -3204,6 +3204,8 @@ module Indus
       names = []; pre = []
       ps.requireds.each_with_index do |r, k|
         if r.respond_to?(:name) then names << r.name
+        elsif r.lefts.empty? && r.rights.empty? && (r.rest.nil? || r.rest.is_a?(Prism::ImplicitRestNode) || (r.rest.is_a?(Prism::SplatNode) && r.rest.expression.nil?)) # |(*)|: binds nothing
+          names << :"__d#{k}_#{@lambda_count || 0}"
         else
           hidden = :"__d#{k}_#{@lambda_count || 0}"; names << hidden
           src = r.send(:source); loc = r.location
