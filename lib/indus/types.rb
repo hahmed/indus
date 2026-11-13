@@ -97,6 +97,7 @@ module Indus
       rounds = 0
       loop do
         changed = false
+        @phi_users_cache = {} # per round: rewrites move users
         if ENV["PDBG"] && rounds > 395
           sig = funcs.flat_map { |g| g.all.map { |i| "#{g.name}:#{i}=#{i.op}:#{i.ty.inspect}" } }
           ($stderr.puts "round #{rounds} delta: " + (sig - (@last_sig || [])).first(8).join(" | ")) if @last_sig
@@ -245,13 +246,19 @@ module Indus
               i.op = :eputs_str; i.args = [c]
             end
             # printing/inspecting by type is irreversible, so it waits for the types to settle (below)
-            if i.op == :cmp && (t0 = of(f, i.args[0])) && (t0.is_a?(Symbol) && @classes[t0] || poly?(t0)) && (@settled || i.args[0].op != :fld_get) # a field read may still widen to dyn (`@v = self` from every class): wait for settle
+            if i.op == :cmp && !i.dyn_split && (t0 = of(f, i.args[0])) && (t0.is_a?(Symbol) && @classes[t0] || poly?(t0)) && (@settled || i.args[0].op != :fld_get) # a field read may still widen to dyn (`@v = self` from every class): wait for settle
               # comparing objects: an ordering is the class's own operator (Comparable from the prelude,
               # or user-defined); == / != too when the class defines ==, else identity
               has_eq = (classes_of(t0) || []).any? { @classes[_1].find_method(:==) }
               has_eq = false if i.args[1].op == :const && i.args[1].ty == :nil # x == nil / x.nil?: identity against nil, never the class's ==
               if %i[lt le gt ge].include?(i.cond) || has_eq && %i[eq ne].include?(i.cond)
                 neg = i.cond == :ne
+                if %i[eq ne].include?(i.cond) && i.args[0].op != :onew && !i.dyn_split # the object slot may hold nil: nil == x is identity, else the class's ==
+                  a0, a1 = i.args
+                  i.dyn_split = true
+                  ph = split_on_nil(f, i, a0, nil) { |ob| c = Inst.new(:cmp, [a0, a1], :eq); c.ty = :bool; c.block = ob; c.dyn_split = true; ob.insts << c; c } # identity in the nil arm (not rewritten again)
+                  ph.ty = :bool
+                end
                 i.op = :mcall; i.args = [{ lt: :<, le: :<=, gt: :>, ge: :>=, eq: :==, ne: :== }.fetch(i.cond), *i.args]; i.cond = nil; bind(f, i); changed = true
                 if neg # a != b is !(a == b)
                   c = Inst.new(i.op, i.args.dup); c.ty = :bool; c.block = i.block; c.cond = i.cond; i.block.insts.insert(i.block.insts.index(i), c)
@@ -1009,7 +1016,7 @@ module Indus
         gen = generic?(i.args[0])
         i.args[1..].each_with_index { |v, k| d = i.args[0].ptypes[k]; yield v, (gen && d.is_a?(Array) && (t = of(f, v)).is_a?(Array) && t != d ? nil : d) }
       when :ret then yield i.args[0], f.rtype unless f.result_unused
-      when :phi then i.args.each { |(_, v)| yield v, i.ty } unless f.result_unused && f.all.all? { |u| !(u.op == :phi ? u.args.map(&:last) : u.args).include?(i) || u.op == :ret }
+      when :phi then i.args.each { |(_, v)| yield v, i.ty } unless f.result_unused && phi_only_returned?(f, i)
       end
     end
 
@@ -1281,6 +1288,8 @@ module Indus
 
     # before `i`: branch on v being the nil word; the nil arm yields the String `nil_text`, the other arm what the
     # block builds in its block; the rest of i's block (from i on) continues at the join. Returns the join phi.
+    # (nil_text nil: the nil arm is the block's result evaluated in the nil block -- used for `nil == x`: identity there, so the
+    #  nil arm computes the same compare and i itself, the object arm, follows in the join block)
     def self.split_on_nil(f, i, v, nil_text)
       b = i.block; at = b.insts.index(i)
       rest = b.insts[at..]; b.insts = b.insts[0...at]
@@ -1290,10 +1299,19 @@ module Indus
       z = Inst.new(:const, [0]); z.ty = :nil; b << z
       c = Inst.new(:cmp, [v, z], :eq); c.ty = :bool; b << c
       b << Inst.new(:condbr, [c, nb, ob])
-      s = Inst.new(:sconst, [nil_text]); s.ty = :str; nb << s; nb << Inst.new(:br, [jb])
-      r = yield(ob); ob << Inst.new(:br, [jb])
-      ph = jb.phi; ph.args = [[nb, s], [ob, r]]; ph.ty = :str
-      ph
+      if nil_text
+        s = Inst.new(:sconst, [nil_text]); s.ty = :str; nb << s; nb << Inst.new(:br, [jb])
+        r = yield(ob); ob << Inst.new(:br, [jb])
+        ph = jb.phi; ph.args = [[nb, s], [ob, r]]; ph.ty = :str
+        ph
+      else
+        # nil arm: the block's compare; object arm: i (moved to its own block, its users see the phi)
+        r = yield(nb); nb << Inst.new(:br, [jb])
+        jb.insts.delete(i); i.block = ob; ob.insts << i; ob << Inst.new(:br, [jb])
+        ph = jb.phi; ph.args = [[nb, r], [ob, i]]
+        f.replace_uses(i, ph); ph.args = [[nb, r], [ob, i]]
+        ph
+      end
     end
 
     # `i` (an mcall on the tagged value `recv`) becomes a branch on the tag: an object (tag 8) is unboxed to the
@@ -1422,8 +1440,13 @@ module Indus
       if poly?(t) # one arm per class: [klass, kind, payload]; a class without the method traps if reached
         if %i[to_s inspect].include?(name) && args.empty? && t[1].none? { @classes[_1].find_method(name) } # Object's default: #<Klass>, by class id
           return unless @settled || recv.op != :fld_get # the field may still widen to dyn
-          cid = Inst.new(:class_id, [recv]); cid.ty = :int; cid.block = i.block; i.block.insts.insert(i.block.insts.index(i), cid)
-          i.op = :call; i.args = [fn(:__obj_default_inspect), cid]; i.ty = :str; return
+          # the slot may hold nil (the 0 word): "nil"/"" then, else #<Klass> by class id
+          split_on_nil(f, i, recv, name == :inspect ? "nil" : "") do |ob|
+            cid = Inst.new(:class_id, [recv]); cid.ty = :int; cid.block = ob; ob.insts << cid
+            c = Inst.new(:call, [fn(:__obj_default_inspect), cid]); c.ty = :str; c.block = ob; ob.insts << c; c
+          end
+          i.op = :nop; i.args = [i.block.phis.last || recv]; i.ty = :str
+          return
         end
         arms = t[1].map { |c| [@classes[c], *resolve(@classes[c], name, args.size, trap_missing: true)] }
         if arms.all? { |(_, kind, _)| kind == :trap }
@@ -1905,6 +1928,19 @@ module Indus
           p.args.map! { |(pred, v)| [pred, coerce(f, pred, pred.term, v, p.ty)] }
         end
       end
+    end
+
+    # is this phi read by nothing but a ret? (cached per function per round: the scan is O(insts))
+    def self.phi_only_returned?(f, ph)
+      @phi_users_cache ||= {}
+      key = f.object_id
+      entry = @phi_users_cache[key]
+      unless entry
+        users = Hash.new { |h, k| h[k] = [] }
+        f.all.each { |u| (u.op == :phi ? u.args.map(&:last) : u.args).each { |a| users[a] << u if a.is_a?(Inst) && a.op == :phi } }
+        entry = @phi_users_cache[key] = users
+      end
+      entry[ph].all? { |u| u.op == :ret }
     end
 
     # like each_flow, with a setter for the operand position
