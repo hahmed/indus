@@ -11,6 +11,7 @@ module Indus
     attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home, :uses
     attr_accessor :strict # to_i from Kernel#Integer: junk raises
     attr_accessor :raw_shift # a shift the helper itself performs (count already checked)
+    attr_accessor :key_copied # an hset whose String key was copied (Ruby's dup-freeze of string keys)
     attr_accessor :destructure # an idx that binds a block parameter from an element: a scalar element destructures to [el, nil, ...]
     attr_accessor :dyn_split # the builtin arm of a tag branch (Types.split_dyn_object): not split again
     attr_reader :id

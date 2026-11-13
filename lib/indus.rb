@@ -75,8 +75,10 @@ module Indus
 
   def self.compile(src, standalone: nil, file: nil)
     src = expand_requires(src, file ? File.dirname(File.expand_path(file)) : Dir.pwd)
+    user_src = src
     src = PRELUDE_CORE + "\n" + src          # Float#to_s and friends, in Ruby
     src = PRELUDE_GC + "\n" + src if GC.enabled? # the collector rides along as Ruby
+    Lower.prelude_lines = src.count("\n") - user_src.count("\n") # __LINE__ counts from the user's first line
     Types.reset!
     lower = Lower.new(src)
     funcs = lower.run

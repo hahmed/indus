@@ -434,6 +434,10 @@ module Indus
               if i.op == :unbox && @settled && (ut = of(f, i.args[0])) && ut != :dyn && !poly?(ut) # a guard narrowed a value that was never tagged (an int? to Integer): the value itself
                 i.op = :nop; i.args = [i.args[0]]; i.ty = ut == :int? && i.ty == :int ? :int : ut; changed = true
               end
+              if @settled && i.op == :hset && of(f, i.args[1]) == :str && !i.key_copied && !%i[sconst_ro scat sjoin itos sdup].include?(i.args[1].op) && !(i.args[1].op == :call && i.args[1].args[0].returns_fresh) # a String key: Ruby stores a frozen copy, so a later mutation of the variable does not reach the key
+                d = Inst.new(:sdup, [i.args[1]]); d.ty = :str; d.block = i.block; i.block.insts.insert(i.block.insts.index(i), d)
+                i.args[1] = d; i.key_copied = true; changed = true
+              end
               if i.op == :to_i && i.strict && of(f, i.args[0]) == :str # Kernel#Integer(str): strict parse, ArgumentError on junk
                 i.op = :call; i.args = [fn(:__kernel_integer), i.args[0]]; i.ty = :int; changed = true
               end

@@ -28,6 +28,8 @@ module Indus
     # every def site expects, so one shape reaches the lowering
     # a method body lifted out of a builtin's class: `self` is the parameter, a bare call is a call on it
     # reads of the given locals become constant reads (an anonymous module/class held in a local)
+    class << self; attr_accessor :prelude_lines; end
+
     def self.rename_locals(node, names)
       return node.map { rename_locals(_1, names) } if node.is_a?(Array)
       return node unless node.is_a?(Prism::Node)
@@ -1499,6 +1501,8 @@ module Indus
         raise "yield outside an inlined block method" unless @block
         yield_block(n.arguments&.arguments || [])
       when Prism::RangeNode then range_array(n) # a Range as a value: its elements (each/map/times fuse before reaching here)
+      when Prism::SourceLineNode then const(n.location.start_line - (Lower.prelude_lines || 0)) # __LINE__, in the user's file
+      when Prism::SourceFileNode then emit(:sconst, [@source_file || "main.rb"]) # __FILE__
       when Prism::SymbolNode then (c = const(sym_id(n.unescaped)); c.ty = :sym; c)
       when Prism::InterpolatedSymbolNode # :"a#{x}": the string, interned at run time
         str = expr(Prism::InterpolatedStringNode.new(n.send(:source), 0, n.location, 0, nil, n.parts, nil))
