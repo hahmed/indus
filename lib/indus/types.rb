@@ -97,7 +97,15 @@ module Indus
       rounds = 0
       loop do
         changed = false
-        raise "type inference does not converge (#{rounds} rounds): a rewrite keeps undoing another's work; refusing rather than looping" if (rounds += 1) > 400
+        if ENV["PDBG"] && rounds > 395
+          sig = funcs.flat_map { |g| g.all.map { |i| "#{g.name}:#{i}=#{i.op}:#{i.ty.inspect}" } }
+          ($stderr.puts "round #{rounds} delta: " + (sig - (@last_sig || [])).first(8).join(" | ")) if @last_sig
+          @last_sig = sig
+        end
+        if (rounds += 1) > 400
+          $stderr.puts funcs.select { |g| g.all.any? { |i| i.op == :mcall } }.map { |g| "#{g.name}: " + g.all.select { |i| i.op == :mcall }.map { |i| "#{i.args[0]} on #{of(g, i.args[1]).inspect}" }.join(", ") }.first(6) if ENV["PDBG"]
+          raise "type inference does not converge (#{rounds} rounds): a rewrite keeps undoing another's work; refusing rather than looping"
+        end
         mark_unused_results(funcs) if funcs.any? { _1.name == :main } # a whole-program fact; the resident compiler sees one function
         funcs.each do |pr| # method versions behind one slot: one signature for all
           next unless pr.versions
@@ -201,7 +209,7 @@ module Indus
                 end
               end
             end
-            if %i[add sub mul div mod].include?(i.op) && (cs0 = classes_of(of(f, i.args[0]))) && (@settled || i.args[0].op != :fld_get) # obj + v: the class's own operator (the lowering guessed arithmetic); a set with no such operator may still widen to dyn (a field every class stores self into): wait
+            if %i[add sub mul div mod].include?(i.op) && (cs0 = classes_of(of(f, i.args[0]))) && cs0.any? { @classes[_1].find_method({ add: :+, sub: :-, mul: :*, div: :/, mod: :% }[i.op]) } && (@settled || i.args[0].op != :fld_get) # obj + v: the class's own operator (the lowering guessed arithmetic); a set with no such operator may still widen to dyn (a field every class stores self into): wait
               nm = { add: :+, sub: :-, mul: :*, div: :/, mod: :% }.fetch(i.op)
               i.op = :mcall; i.args = [nm, *i.args]; i.ty = nil; bind(f, i); changed = true
             end
@@ -1420,7 +1428,9 @@ module Indus
         arms = t[1].map { |c| [@classes[c], *resolve(@classes[c], name, args.size, trap_missing: true)] }
         if arms.all? { |(_, kind, _)| kind == :trap }
           return unless @settled # a field read whose set is provisional (a tagged scalar may still arrive and make it dyn): wait
-          raise "no method #{name} on any of #{t[1].join(', ')}"
+          # none of the classes has it: Ruby's NoMethodError if this ever runs (a shim's unused matcher, dead code typed anyway)
+          tr = Inst.new(:trap, ["undefined method '#{name}' for an instance of #{t[1].join('/')} (NoMethodError)"]); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr)
+          i.op = :const; i.args = [0]; i.ty = :nil; return
         end
         if arms.all? { |(_, kind, payload)| kind == :call && payload.equal?(arms[0][2]) } # one function for the whole set: no dispatch needed
           i.op = :call; i.args = [arms[0][2], recv, *args]; return
@@ -1483,6 +1493,9 @@ module Indus
         end
       end
       if t == :int && name == :to_s && args.empty? then i.op = :itos; i.args = [recv]; return end
+      if t == :dyn && @lower.object_def_names&.include?(name) && (of_ = prelude_method("obj", name, args.size)) # a `class Object` def on a tagged value: the obj family takes the tagged value itself
+        i.op = :call; i.args = [of_, recv, *args]; i.ty = nil; of_.ptypes[0] = :dyn; return
+      end
       if t == :dyn && %i[== != eql? equal? hash].include?(name) # equality on a tagged value: the tag decides (a user == only when the object arm is reached)
         if name == :== && args.size == 1
           users = boxed_user_classes.select { |k| k.find_method(:==) }

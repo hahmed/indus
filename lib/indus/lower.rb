@@ -11,6 +11,7 @@ module Indus
 
     attr_reader :classes, :syms, :funcs
     attr_reader :user_family_defs # `class String; def dup ... end` bodies, as __str_dup etc.
+    def object_def_names = @object_defs&.map(&:name)
     # a prelude function's trailing optional parameters: their literal default values (Integer / nil),
     # so a routed call with fewer arguments can be completed at the type level
     def optional_defaults(f)
