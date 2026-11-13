@@ -201,7 +201,7 @@ module Indus
                 end
               end
             end
-            if %i[add sub mul div mod].include?(i.op) && classes_of(of(f, i.args[0])) # obj + v: the class's own operator (the lowering guessed arithmetic)
+            if %i[add sub mul div mod].include?(i.op) && (cs0 = classes_of(of(f, i.args[0]))) && (@settled || i.args[0].op != :fld_get) # obj + v: the class's own operator (the lowering guessed arithmetic); a set with no such operator may still widen to dyn (a field every class stores self into): wait
               nm = { add: :+, sub: :-, mul: :*, div: :/, mod: :% }.fetch(i.op)
               i.op = :mcall; i.args = [nm, *i.args]; i.ty = nil; bind(f, i); changed = true
             end
@@ -403,7 +403,9 @@ module Indus
                 end
                 i.op = :call; i.args = [fn(:__format), i.args[0], a]; i.ty = :str; changed = true; next
               end
-              dyn_op(f, i) if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
+              if %i[add sub mul div cmp].include?(i.op) && (of(f, i.args[0]) == :dyn || of(f, i.args[1]) == :dyn)
+                dyn_op(f, i)
+              end
               # a shift whose count is not known to be in range (negative counts shift the other way; a left shift past 63 bits
               # is a Bignum in Ruby): the helper decides at run time. The library (`__*`) shifts are written in range.
               if %i[shl shr].include?(i.op) && !i.raw_shift && !f.name.to_s.start_with?("__") && of(f, i.args[0]) == :int && of(f, i.args[1]) == :int
@@ -1354,8 +1356,11 @@ module Indus
       t = of(f, recv)
       if name == :class && args.empty? && t == :dyn then i.op = :call; i.args = [fn(:__dyn_class_name), recv]; i.ty = :str; return end
       # an operator guessed to be an object's method (the pre-typing misjudged the receiver): the builtin operation
-      if args.size == 1 && (ar = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :% => :mod }[name]) && %i[int int? float].include?(t)
-        i.op = ar; i.args = [recv, args[0]]; i.ty = nil; return
+      if args.size == 1 && (ar = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :% => :mod, :< => :lt, :<= => :le, :> => :gt, :>= => :ge }[name]) && (%i[int int? float dyn].include?(t) || (classes_of(t) && classes_of(t).none? { @classes[_1].find_method(name) }))
+        # a dyn, or a class set with no such operator: a field read whose type is still provisional (the int has not arrived yet) -- wait; settled, the builtin operation
+        return if classes_of(t) && !@settled
+        if %i[lt le gt ge].include?(ar) then i.op = :cmp; i.cond = ar else i.op = ar end
+        i.args = [recv, args[0]]; i.ty = nil; return
       end
       if name == :+ && args.size == 1 && t == :str then i.op = :scat; i.args = [recv, args[0]]; i.ty = :str; return end
       if name == :class && args.empty? && (cn = { int: "Integer", float: "Float", str: "String", sym: "Symbol", bool: "TrueClass", nil: "NilClass" }[t] || (arr(t) && "Array") || (hsh(t) && "Hash"))
@@ -1408,11 +1413,15 @@ module Indus
       end
       if poly?(t) # one arm per class: [klass, kind, payload]; a class without the method traps if reached
         if %i[to_s inspect].include?(name) && args.empty? && t[1].none? { @classes[_1].find_method(name) } # Object's default: #<Klass>, by class id
+          return unless @settled || recv.op != :fld_get # the field may still widen to dyn
           cid = Inst.new(:class_id, [recv]); cid.ty = :int; cid.block = i.block; i.block.insts.insert(i.block.insts.index(i), cid)
           i.op = :call; i.args = [fn(:__obj_default_inspect), cid]; i.ty = :str; return
         end
         arms = t[1].map { |c| [@classes[c], *resolve(@classes[c], name, args.size, trap_missing: true)] }
-        raise "no method #{name} on any of #{t[1].join(', ')}" if arms.all? { |(_, kind, _)| kind == :trap }
+        if arms.all? { |(_, kind, _)| kind == :trap }
+          return unless @settled # a field read whose set is provisional (a tagged scalar may still arrive and make it dyn): wait
+          raise "no method #{name} on any of #{t[1].join(', ')}"
+        end
         if arms.all? { |(_, kind, payload)| kind == :call && payload.equal?(arms[0][2]) } # one function for the whole set: no dispatch needed
           i.op = :call; i.args = [arms[0][2], recv, *args]; return
         end
@@ -1790,6 +1799,7 @@ module Indus
       when :puts_v then of(f, a[0]) && :int
       when :add, :sub, :mul, :div
         l, r = of(f, a[0]), of(f, a[1])
+        return nil if classes_of(l) # an object's operator: the method call the rewrite makes decides (joining would say dyn)
         l && r ? join(narrow(l), narrow(r)) : nil # both sides known, or no guess: a str * n is not an int
       when :and, :or then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int # nil is the word 0, false: nil & x, nil | x are booleans
       when :xor then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int
