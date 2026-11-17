@@ -1543,10 +1543,21 @@ module Indus
       when Prism::WhileNode then while_stmt(n)
       when Prism::ForNode # for x in coll: each over the collection; the variable is an ordinary local
         src = n.send(:source); loc = n.location
-        names = n.index.is_a?(Prism::MultiTargetNode) ? n.index.lefts.map(&:name) : [n.index.name]
+        body = n.statements
+        if !n.index.is_a?(Prism::MultiTargetNode) && !n.index.is_a?(Prism::LocalVariableTargetNode) # for @x / $g / a.b / a[i] in ...: assign the target from a hidden local each turn
+          hidden = :"__for#{@f.blocks.size}"
+          asg = case n.index
+                when Prism::InstanceVariableTargetNode then Prism::InstanceVariableWriteNode.new(src, 0, loc, 0, n.index.name, loc, Prism::LocalVariableReadNode.new(src, 0, loc, 0, hidden, 0), loc)
+                when Prism::GlobalVariableTargetNode then Prism::GlobalVariableWriteNode.new(src, 0, loc, 0, n.index.name, loc, Prism::LocalVariableReadNode.new(src, 0, loc, 0, hidden, 0), loc)
+                else raise "for: unsupported target #{n.index.class}" end
+          body = Prism::StatementsNode.new(src, 0, loc, 0, [asg, *(n.statements&.body || [])])
+          names = [hidden]
+        else
+          names = n.index.is_a?(Prism::MultiTargetNode) ? n.index.lefts.map(&:name) : [n.index.name]
+        end
         reqs = names.map { Prism::RequiredParameterNode.new(src, 0, loc, 0, _1) }
         params = Prism::BlockParametersNode.new(src, 0, loc, 0, Prism::ParametersNode.new(src, 0, loc, 0, reqs, [], nil, [], [], nil, nil), [], nil, nil)
-        blk = Prism::BlockNode.new(src, 0, loc, 0, [], params, n.statements, loc, loc)
+        blk = Prism::BlockNode.new(src, 0, loc, 0, [], params, body, loc, loc)
         names.each { |nm| @locals[lname(nm)] ||= nil_const } # visible after the loop
         each = Prism::CallNode.new(src, 0, loc, 0, n.collection, nil, :each, loc, nil, nil, nil, nil, blk)
         expr(each)
