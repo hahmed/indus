@@ -269,7 +269,7 @@ module Indus
           v, t = i.args; r = v.float? ? nil : reg(v)
           case t
           when :int, :int? then @asm.emit(0xD37FF800 | (r << 5) | d) ; @asm.emit(0xB2400000 | (d << 5) | d) # lsl d, r, #1 ; orr d, d, #1
-          when :str then @asm.emit(0xB27F0000 | (r << 5) | d)                            # orr d, r, #2
+          when :str then @asm.emit(0xB27F0000 | (r << 5) | 16); @asm.cmpi(r, 0); @asm.emit(0x9A8003E0 | (16 << 16) | d) # orr x16, r, #2 ; a nil String slot (0) stays nil
           when :bool then @asm.emit(0xD37CEC00 | (r << 5) | d); @asm.emit(0xB27D0000 | (d << 5) | d); @asm.emit(0xB27F0000 | (d << 5) | d) # (<<4) |8 |2 = 10
           when :sym then @asm.emit(0xD37CEC00 | (r << 5) | d); @asm.emit(0xB27E0400 | (d << 5) | d) # (<<4) |12
           when :nil then @asm.mov_imm(d, 0)
@@ -279,9 +279,12 @@ module Indus
             @asm.emit(0x910043FF)                                              # add sp, sp, #16
             @asm.emit(0xB27F0800 | (0 << 5) | d)                               # orr d, x0, #14
           else
-            if t.is_a?(Array) && t[0] == :arr then @asm.emit(0xB27E0000 | (r << 5) | d)      # orr d, r, #4
-            elsif t.is_a?(Array) && t[0] == :hash then @asm.emit(0xB27F0400 | (r << 5) | d)   # orr d, r, #6
-            else @asm.emit(0xB27D0000 | (r << 5) | d) end                                   # object: orr d, r, #8
+            if t.is_a?(Array) && t[0] == :arr then @asm.emit(0xB27E0000 | (r << 5) | 16); @asm.cmpi(r, 0); @asm.emit(0x9A8003E0 | (16 << 16) | d)      # orr x16, r, #4 ; nil (0) stays 0
+            elsif t.is_a?(Array) && t[0] == :hash then @asm.emit(0xB27F0400 | (r << 5) | 16); @asm.cmpi(r, 0); @asm.emit(0x9A8003E0 | (16 << 16) | d)   # orr x16, r, #6
+            else # object: orr d, r, #8 -- unless the slot holds nil (the 0 word), which stays the dyn nil (0)
+              @asm.emit(0xB27D0000 | (r << 5) | 16)                                            # orr x16, r, #8
+              @asm.cmpi(r, 0); @asm.emit(0x9A8003E0 | (16 << 16) | d)             # csel d, xzr, x16, eq
+            end
           end
         when :unbox
           v, t = i.args; r = reg(v)
