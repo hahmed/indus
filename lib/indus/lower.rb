@@ -3194,7 +3194,14 @@ module Indus
       pfx = :"inl#{@f.blocks.size}:"
       me = recv ? expr(recv) : @locals[:self]
       callee_locals = me ? { :"#{pfx}self" => me } : {} # top-level yielders have no self
-      (d.parameters&.requireds || []).each_with_index { |p, k| callee_locals[:"#{pfx}#{p.name}"] = expr(args[k]) }
+      ps = d.parameters
+      nreq = ps&.requireds&.size || 0
+      (ps&.requireds || []).each_with_index { |p, k| callee_locals[:"#{pfx}#{p.name}"] = expr(args[k]) }
+      (ps&.optionals || []).each_with_index { |o, k| callee_locals[:"#{pfx}#{o.name}"] = args[nreq + k] ? expr(args[nreq + k]) : nil } # a missing optional: its default, lowered in the callee's scope below
+      if ps&.rest.is_a?(Prism::RestParameterNode) # *rest: the extra arguments as an array
+        extra = args[(nreq + (ps.optionals || []).size)..] || []
+        callee_locals[:"#{pfx}#{ps.rest.name || :__rest}"] = pack_values(extra.map { expr(_1) })
+      end
       saved = [@block, @klass, @inl, @ret_exit]
       @block = body == :none ? :none : [params, body]
       @inl = pfx; @klass = klass || @klass
@@ -3298,7 +3305,30 @@ module Indus
 
     def yield_block(arg_nodes)
       params, body = @block
-      vals = arg_nodes.map { expr(_1) }           # still in callee naming
+      # yield(*a) / yield(x, *a): the splatted array's elements are the yielded values. With a single splat and a plain
+      # parameter list the parameters take the elements by index (missing -> nil); a block *rest takes the array itself
+      vals = []
+      arg_nodes.each do |a|
+        if a.is_a?(Prism::SplatNode)
+          sp = a.expression ? expr(a.expression) : @locals.fetch(lname(:__rest)) { raise "anonymous * outside a method taking *" }
+          plain = params.reject { _1.is_a?(Array) && _1[0] == :rest }
+          if arg_nodes.size == 1 && params.size == 1 && params[0].is_a?(Array) && params[0][0] == :rest then vals << [:rest_array, sp]
+          else # the elements, as many as parameters remain to fill (missing ones nil)
+            need = [plain.size - vals.size, 0].max
+            need.times { |k| vals << (ix = emit(:idx, [sp, const(k)]); ix.destructure = true; ix) }
+          end
+        else vals << expr(a) end
+      end
+      if vals.size == 1 && vals[0].is_a?(Array) && vals[0][0] == :rest_array # |*a| given *arr: a is the array
+        bpfx = :"y#{@f.blocks.size}:"
+        @locals[:"#{bpfx}#{params[0][1]}"] = vals[0][1]
+        saved_pfx, @name_pfx = @name_pfx, nil; saved_ret, @ret_exit = @ret_exit, nil
+        @blk_pfx = (@blk_pfx || []) << bpfx
+        last = run_body(body, bpfx)
+        @blk_pfx.pop; @locals.delete_if { |k, _| k.to_s.start_with?(bpfx.to_s) }
+        @name_pfx, @ret_exit = saved_pfx, saved_ret
+        return last || const(0)
+      end
       bpfx = :"y#{@f.blocks.size}:"
       saved_pfx, @name_pfx = @name_pfx, nil
       saved_ret, @ret_exit = @ret_exit, nil        # a `return` in the block would return from the caller: unsupported
