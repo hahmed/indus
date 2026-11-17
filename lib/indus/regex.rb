@@ -76,10 +76,14 @@ module Indus
           if eat("*") then min, max = 0, -1
           elsif eat("+") then min, max = 1, -1
           elsif eat("?") then min, max = 0, 1
-          elsif peek == "{".ord && (m = @s[@i..].pack("C*").match(/\A\{(\d+)(,(\d*))?\}/))
+          elsif peek == "{".ord && (m = @s[@i..].pack("C*").match(/\A\{(\d*)(,(\d*))?\}/)) && !(m[1].empty? && m[2].nil?)
             @i += m[0].bytesize
-            min = m[1].to_i; max = m[2].nil? ? min : (m[3].empty? ? -1 : m[3].to_i)
+            min = m[1].to_i; max = m[2].nil? ? min : (m[3].empty? ? -1 : m[3].to_i) # {,n} is {0,n}
           else break end
+          if min == max && min && m && eat("?") # Onigmo: an exact count followed by ? is (a{n})?, not a lazy repetition
+            atom = Node.new(:rep, a: Node.new(:rep, a: atom, min: min, max: max, greedy: true), min: 0, max: 1, greedy: true)
+            next
+          end
           greedy = !eat("?")
           atom = Node.new(:rep, a: atom, min: min, max: max, greedy: greedy)
         end
