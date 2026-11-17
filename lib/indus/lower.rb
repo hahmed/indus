@@ -3404,6 +3404,8 @@ module Indus
     # defined?(x): decided at compile time wherever the answer is static
     def defined_expr(v)
       str = ->(s) { s ? emit(:sconst, [s]) : nil_const }
+      v = v.body.body[0] if v.is_a?(Prism::ParenthesesNode) && v.body.is_a?(Prism::StatementsNode) && v.body.body.size == 1 # defined?((a, b = 1, 2))
+      return str.("assignment") if v.class.name.end_with?("WriteNode") || v.is_a?(Prism::MultiWriteNode) # every assignment form
       case v
       when Prism::LocalVariableReadNode then str.(@locals.key?(lname(v.name)) ? "local-variable" : nil)
       when Prism::InstanceVariableReadNode # set iff assigned (a never-written field reads as its zero: nil / 0 / false all count as unset)
@@ -3411,6 +3413,7 @@ module Indus
               elsif @klass&.ivars&.include?(v.name) then emit(:fld_get, [me_val, @klass.ivar(v.name)])
               else return str.(nil) end
         or_value(and_value(emit(:cmp, [cur, const(0)], :ne)) { emit(:sconst, ["instance-variable"]) }) { nil_const }
+      when Prism::BackReferenceReadNode, Prism::NumberedReferenceReadNode then str.(nil) # $& $` $' $1: set only after a match; no match is in flight at compile time -- nil (as Ruby answers with no last match)
       when Prism::GlobalVariableReadNode then str.(global_assigned?(@ast, v.name) || %i[$stdout $stderr $stdin $0 $PROGRAM_NAME $~ $! $; $, $/ $\\ $_ $DEBUG $VERBOSE $LOAD_PATH $LOADED_FEATURES].include?(v.name) ? "global-variable" : nil) # assigned somewhere, or predefined
       when Prism::ArrayNode then (v.elements.all? { |e| !e.is_a?(Prism::ConstantReadNode) && !e.is_a?(Prism::ConstantPathNode) && !e.is_a?(Prism::CallNode) || defined_known?(e) } ? str.("expression") : str.(nil)) # [A, B]: every element must be defined
       when Prism::ConstantReadNode then str.(@classes[v.name] || @modules.include?(v.name) || @class_const_owners&.key?(v.name) || %i[Integer Float String Array Hash Symbol NilClass Comparable Kernel Object Math].include?(v.name) ? "constant" : nil)
@@ -3424,7 +3427,11 @@ module Indus
           str.(has ? "constant" : nil)
         end
       when Prism::CallNode
-        if v.receiver && (pk = v.receiver.is_a?(Prism::SelfNode) ? @klass : ((kd = kind_of(v.receiver)).is_a?(Symbol) ? @classes[kd] : nil)) && pk.hidden&.[](v.name) then str.(nil) # a private method with an explicit receiver (self. too, as defined? reports it): not callable, so not defined
+        if v.receiver && (pk = v.receiver.is_a?(Prism::SelfNode) ? @klass : ((kd = kind_of(v.receiver)).is_a?(Symbol) ? @classes[kd] : nil)) && pk.hidden&.[](v.name) then str.(nil) # private / protected with an explicit receiver (self. too, as defined? reports it)
+        elsif v.receiver && v.receiver.is_a?(Prism::CallNode) && v.receiver.receiver.nil? && v.receiver.arguments.nil? && !v.receiver.block && defined_expr(v.receiver).op != :sconst then str.(nil) # the receiver itself is undefined
+        elsif v.receiver.is_a?(Prism::ConstantReadNode) && !defined_known?(v.receiver) then str.(nil) # Nope.foo
+        elsif v.receiver.is_a?(Prism::ConstantReadNode) && v.receiver.name == :Kernel && !%i[puts p print format sprintf rand srand sleep exit abort raise loop lambda proc Integer Float String Array catch throw].include?(v.name) then str.(nil)
+        elsif v.receiver && (pk = (kd = kind_of(v.receiver)).is_a?(Symbol) ? @classes[kd] : nil) && !v.receiver.is_a?(Prism::ConstantReadNode) && !(pk.find_method(v.name) || pk.find_reader(v.name) || pk.find_writer(v.name) || pk.find_method(:method_missing) || %i[class to_s inspect == != nil? is_a? kind_of? respond_to? send object_id hash freeze frozen? dup clone tap then instance_of? equal? eql? instance_variable_get instance_variable_set instance_variables methods extend singleton_class display itself].include?(v.name)) then str.(nil) # a private method with an explicit receiver (self. too, as defined? reports it): not callable, so not defined
         elsif v.receiver && !v.receiver.is_a?(Prism::SelfNode) && %i[print puts p pp require require_relative raise fail loop lambda proc sleep exit abort gets format sprintf printf rand srand catch throw binding block_given? Integer Float String Array Hash].include?(v.name) then str.(nil) # Kernel's private methods: not callable with a receiver
         elsif v.receiver.nil? && v.arguments.nil?
           known = @funcs.key?(v.name) || @yielders.key?(v.name) || (@klass && (@klass.find_method(v.name) || @klass.find_reader(v.name))) || %i[puts p print require require_relative raise loop lambda proc format sprintf rand gets].include?(v.name)
