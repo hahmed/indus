@@ -186,6 +186,7 @@ module Indus
       when :to_s, :upcase, :downcase, :capitalize, :swapcase, :strip, :lstrip, :rstrip, :chomp, :chop, :succ, :next, :tr,
            :delete, :squeeze, :center, :ljust, :rjust, :inspect, :join, :chr, :sub, :gsub, :slice, :insert, :prepend then :str
       when :to_f then :float
+      when :match then (recv == :str || n.receiver.is_a?(Prism::RegularExpressionNode) || recv == :Regexp) && !n.block ? :MatchData : nil
       when :new
         cname = n.receiver.is_a?(Prism::ConstantReadNode) || n.receiver.is_a?(Prism::ConstantPathNode) ? n.receiver.name : nil
         cname = klass if n.receiver.nil? && klass && @classes[klass] # `new` inside `def self.create`: this class

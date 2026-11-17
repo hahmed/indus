@@ -1297,6 +1297,19 @@ module Indus
 
     # before `i`: branch on v being the nil word; the nil arm yields the String `nil_text`, the other arm what the
     # block builds in its block; the rest of i's block (from i on) continues at the join. Returns the join phi.
+    PRELUDE_NILABLE = %i[MatchData].freeze # library classes whose methods commonly return nil instead of an instance (match misses)
+    # what nil answers to a method the class lacks (NilClass's own), as a builder of the instruction in the nil arm
+    def self.nil_answer(name, argc)
+      case [name, argc]
+      in [:to_a, 0] then ->(b) { n = Inst.new(:const, [0]).tap { _1.ty = :int; _1.block = b }; z = Inst.new(:const, [0]).tap { _1.ty = :nil; _1.block = b }; b.insts.push(n, z); a = Inst.new(:anew, [n, z]).tap { _1.ty = [:arr, :dyn]; _1.block = b }; b.insts << a; a }
+      in [:to_s, 0] then ->(b) { Inst.new(:sconst, [""]).tap { _1.ty = :str; _1.block = b; b.insts << _1 } }
+      in [:inspect, 0] then ->(b) { Inst.new(:sconst, ["nil"]).tap { _1.ty = :str; _1.block = b; b.insts << _1 } }
+      in [:to_i, 0] then ->(b) { Inst.new(:const, [0]).tap { _1.ty = :int; _1.block = b; b.insts << _1 } }
+      in [:nil?, 0] then ->(b) { Inst.new(:const, [1]).tap { _1.ty = :bool; _1.block = b; b.insts << _1 } }
+      else nil
+      end
+    end
+
     # (nil_text nil: the nil arm is the block's result evaluated in the nil block -- used for `nil == x`: identity there, so the
     #  nil arm computes the same compare and i itself, the object arm, follows in the join block)
     def self.split_on_nil(f, i, v, nil_text)
@@ -1620,6 +1633,8 @@ module Indus
       # prelude methods take no optional parameters: an arity-suffixed name (__str_rjust1) serves the shorter call
       if arr(t) && name == :to_a && args.empty? then i.op = :nop; i.args = [recv]; i.ty = t; return end
       return unless t.is_a?(Symbol) && (klass = @classes[t])
+      # a class without the method but one NilClass has (to_a, to_s, inspect, nil?, to_i ...): the slot can be nil (a
+      # method returning the object or nil) -- nil's answer when the word is 0, else the class's method (or NoMethodError)
       # a class without the method while the receiver's set may still widen (an element of a mixed array
       # seen one class at a time): wait; settled, it is Ruby's NoMethodError at run time (a trap)
       unless klass.find_reader(name) && args.empty? || klass.find_writer(name) && args.size == 1 || klass.find_method(name) || klass.find_method(:method_missing)

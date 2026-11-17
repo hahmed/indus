@@ -1782,6 +1782,30 @@ module Indus
         emit(:raise, [exc]); emit(:call, [demand(:__uncaught), exc])
         return nil_const
       end
+      if n.name == :values_at && n.receiver && args.any? { _1.is_a?(Prism::RangeNode) && _1.left.is_a?(Prism::IntegerNode) && _1.right.is_a?(Prism::IntegerNode) }
+        expanded = args.flat_map do |a| # m.values_at(1..2): the integers
+          next [a] unless a.is_a?(Prism::RangeNode) && a.left.is_a?(Prism::IntegerNode) && a.right.is_a?(Prism::IntegerNode)
+          (a.left.value..(a.exclude_end? ? a.right.value - 1 : a.right.value)).map { |k| a.left.copy(value: k) }
+        end
+        return expr(n.copy(arguments: n.arguments.copy(arguments: expanded)))
+      end
+      # a MatchData-valued expression (a match that may have missed) asked something nil answers: nil's answer when the word is 0
+      if n.receiver && !n.block && (kd0 = kind_of(n.receiver)) == :MatchData && %i[to_a to_s inspect to_i nil? captures].include?(n.name) && args.empty?
+        rv = expr(n.receiver)
+        nb, ob, mb = @f.new_block(:mnil), @f.new_block(:mobj), @f.new_block(:mjoin)
+        emit(:condbr, [emit(:cmp, [rv, nil_const], :eq), nb, ob])
+        @cur = nb
+        nv = case n.name
+             when :to_a, :captures then emit(:anew, [const(0), nil_const])
+             when :to_s then emit(:sconst, [""])
+             when :inspect then emit(:sconst, ["nil"])
+             when :to_i then const(0)
+             else (c = const(1); c.ty = :bool; c) end
+        emit(:br, [mb])
+        @cur = ob; ov = emit(:mcall, [n.name, rv]); emit(:br, [mb])
+        @cur = mb; ph = mb.phi; ph.args = [[nb, nv], [ob, ov]]
+        return ph
+      end
       if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send __send__ respond_to? extend define_singleton_method methods public_methods singleton_methods singleton_class instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
         rv = expr(n.receiver)
         return emit(:mcall, [n.name, rv, *object_args(n, args, @classes[k], rv)])
@@ -2169,12 +2193,6 @@ module Indus
       elsif %i[class_eval module_eval].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && @classes[n.receiver.name] && @eval_parsed&.key?(n)
         @eval_parsed[n].each { |st| st.is_a?(Prism::DefNode) ? expr(st) : nil } # a literal string: its defs' slot writes here (other statements in it: ignored)
         nil_const
-      elsif n.name == :values_at && n.receiver && args.any? { _1.is_a?(Prism::RangeNode) && _1.left.is_a?(Prism::IntegerNode) && _1.right.is_a?(Prism::IntegerNode) }
-        expanded = args.flat_map do |a| # m.values_at(1..2): the integers
-          next [a] unless a.is_a?(Prism::RangeNode) && a.left.is_a?(Prism::IntegerNode) && a.right.is_a?(Prism::IntegerNode)
-          (a.left.value..(a.exclude_end? ? a.right.value - 1 : a.right.value)).map { |k| a.left.copy(value: k) }
-        end
-        expr(n.copy(arguments: n.arguments.copy(arguments: expanded)))
       elsif %i[instance_variable_get instance_variable_set instance_variable_defined? instance_variables].include?(n.name) && (n.receiver ? (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] : @klass && !@klass.closure)
         k = n.receiver ? @classes[kd] : @klass; rv = n.receiver ? expr(n.receiver) : me_val
         if n.name == :instance_variables && k.reflective # the table's names whose field holds something (nil = unset), claimed spares included

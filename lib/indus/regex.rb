@@ -146,6 +146,23 @@ module Indus
       WORD = [[48, 57], [65, 90], [95, 95], [97, 122]].freeze
       SPACE = [[9, 13], [32, 32]].freeze
 
+      # a single-byte escape inside a class (after the backslash): its byte
+      def class_escape_byte(e)
+        case e.chr
+        when "n" then 10 when "t" then 9 when "r" then 13 when "f" then 12 when "v" then 11 when "a" then 7 when "e" then 27 when "b" then 8 when "0" then 0
+        when "x" then (h = +""; h << take.chr while peek && h.size < 2 && peek.chr =~ /\h/; h.to_i(16))
+        else e
+        end
+      end
+
+      # the byte ranges not covered by `ranges` (for \D \W \S inside a class)
+      def complement(ranges)
+        out = []; lo = 0
+        ranges.sort_by(&:first).each { |a, b| out << [lo, a - 1] if a > lo; lo = [lo, b + 1].max }
+        out << [lo, 255] if lo <= 255
+        out
+      end
+
       def klass
         neg = eat("^")
         ranges = []
@@ -162,14 +179,25 @@ module Indus
             when "s" then ranges.concat(SPACE); next
             when "n" then c = 10
             when "t" then c = 9
-            when "D", "W", "S" then raise "regexp: \\#{e.chr} inside [...] is not supported"
+            when "r" then c = 13
+            when "f" then c = 12
+            when "v" then c = 11
+            when "a" then c = 7
+            when "e" then c = 27
+            when "b" then c = 8 # backspace inside a class
+            when "0" then c = 0
+            when "x" then (h = +""; h << take.chr while peek && h.size < 2 && peek.chr =~ /\h/; c = h.to_i(16))
+            when "D" then ranges.concat(complement([[48, 57]])); next
+            when "W" then ranges.concat(complement(WORD)); next
+            when "S" then ranges.concat(complement(SPACE)); next
+            when "h" then ranges.concat([[48, 57], [65, 70], [97, 102]]); next
             else c = e
             end
           end
           if peek == "-".ord && @s[@i + 1] && @s[@i + 1] != "]".ord
             take
             hi = take
-            hi = take if hi == "\\".ord
+            hi = class_escape_byte(take) if hi == "\\".ord # \xHH, \n ... as the range's upper bound
             ranges << [c, hi]
           else
             ranges << [c, c]
