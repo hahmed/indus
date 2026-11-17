@@ -3363,9 +3363,18 @@ module Indus
               elsif @klass&.ivars&.include?(v.name) then emit(:fld_get, [me_val, @klass.ivar(v.name)])
               else return str.(nil) end
         or_value(and_value(emit(:cmp, [cur, const(0)], :ne)) { emit(:sconst, ["instance-variable"]) }) { nil_const }
-      when Prism::GlobalVariableReadNode then str.("global-variable")
+      when Prism::GlobalVariableReadNode then str.(global_assigned?(@ast, v.name) || %i[$stdout $stderr $stdin $0 $PROGRAM_NAME $~ $! $; $, $/ $\\ $_ $DEBUG $VERBOSE $LOAD_PATH $LOADED_FEATURES].include?(v.name) ? "global-variable" : nil) # assigned somewhere, or predefined
+      when Prism::ArrayNode then (v.elements.all? { |e| !e.is_a?(Prism::ConstantReadNode) && !e.is_a?(Prism::ConstantPathNode) && !e.is_a?(Prism::CallNode) || defined_known?(e) } ? str.("expression") : str.(nil)) # [A, B]: every element must be defined
       when Prism::ConstantReadNode then str.(@classes[v.name] || @modules.include?(v.name) || @class_const_owners&.key?(v.name) || %i[Integer Float String Array Hash Symbol NilClass Comparable Kernel Object Math].include?(v.name) ? "constant" : nil)
-      when Prism::ConstantPathNode then str.("constant")
+      when Prism::ConstantPathNode # Mod::X / ::X: the parent must be a known class/module and hold X
+        if v.parent.nil? then str.(defined_known?(Prism::ConstantReadNode.new(v.send(:source), 0, v.location, 0, v.name)) ? "constant" : nil)
+        else
+          pn = v.parent.respond_to?(:name) ? v.parent.name : nil
+          pk = pn && (@classes[pn] || @modules.include?(pn) || %i[Object Float Math Integer String Array Hash].include?(pn))
+          nested_in = @lexical_parent && @lexical_parent[v.name] == pn # Mod::Inner: Inner declared inside Mod
+          has = pk && (nested_in || (@class_const_owners && (c = @classes[pn]; (c ? (begin; own = false; while c; (own = true; break) if @class_const_owners[v.name].include?(c.name); c = c.superclass; end; own end) : @class_const_owners[v.name].include?(pn)))) || (pn == :Float && (FLOAT_CONSTS.key?(v.name) || FLOAT_INT_CONSTS.key?(v.name))) || (pn == :Math && MATH_CONSTS.key?(v.name)))
+          str.(has ? "constant" : nil)
+        end
       when Prism::CallNode
         if v.receiver.nil? && v.arguments.nil?
           known = @funcs.key?(v.name) || @yielders.key?(v.name) || (@klass && (@klass.find_method(v.name) || @klass.find_reader(v.name))) || %i[puts p print require require_relative raise loop lambda proc format sprintf rand gets].include?(v.name)
@@ -3374,13 +3383,25 @@ module Indus
           k = @classes[kd]; str.(k.find_method(v.name) || k.find_reader(v.name) || k.find_writer(v.name) ? "method" : nil)
         else str.("method") end # a builtin receiver: assume it responds (the compile would otherwise have refused)
       when Prism::YieldNode then @block == :none ? str.(nil) : (@block ? str.("yield") : (@block_param && @locals[@block_param] ? or_value(and_value(emit(:cmp, [@locals[@block_param], nil_const], :ne)) { emit(:sconst, ["yield"]) }) { nil_const } : str.(nil)))
-      when Prism::SuperNode, Prism::ForwardingSuperNode then str.("super")
+      when Prism::SuperNode, Prism::ForwardingSuperNode # super: only inside a method whose class has an ancestor defining it
+        has = @klass && @f.cls && (mn = @f.name.to_s.split("#").last.delete("'").sub(/@v\d+\z/, "").to_sym) && (@f.shadowed || @klass.superclass&.find_method(mn))
+        str.(has ? "super" : nil)
       when Prism::SelfNode then str.("self")
-      when Prism::NilNode then str.("expression")
-      when Prism::TrueNode, Prism::FalseNode then str.("expression")
+      when Prism::NilNode then str.("nil")
+      when Prism::TrueNode then str.("true")
+      when Prism::FalseNode then str.("false")
       when Prism::LocalVariableWriteNode, Prism::LocalVariableOperatorWriteNode, Prism::InstanceVariableWriteNode, Prism::CallOperatorWriteNode, Prism::CallOrWriteNode, Prism::IndexOperatorWriteNode, Prism::GlobalVariableWriteNode, Prism::MultiWriteNode then str.("assignment")
       else str.("expression")
       end
+    end
+
+    # is this constant / call node certainly defined (for defined?([A, B]) and Mod::X)?
+    def defined_known?(e)
+      case e
+      when Prism::ConstantReadNode then !!(@classes[e.name] || @modules.include?(e.name) || @class_const_owners&.[](e.name)&.any? || has_const?(e.name) || %i[Integer Float String Array Hash Symbol NilClass Comparable Kernel Object Math Struct Enumerable Proc Range Regexp Exception StandardError TrueClass FalseClass].include?(e.name))
+      when Prism::ConstantPathNode then defined_expr(e).op == :sconst
+      when Prism::CallNode then true
+      else true end
     end
 
     def class_const?(c) = c.is_a?(Prism::ConstantReadNode) && (@classes[c.name] || %i[Integer Float String Array Hash Symbol].include?(c.name))
@@ -3898,6 +3919,12 @@ module Indus
       return false unless node.is_a?(Prism::Node)
       return true if node.is_a?(Prism::GlobalVariableReadNode) && node.name == name
       node.compact_child_nodes.any? { has_global?(_1, name) }
+    end
+    # is the global assigned anywhere in the program? (a read alone, as in defined?($x), does not define it)
+    def global_assigned?(node, name)
+      return false unless node.is_a?(Prism::Node)
+      return true if (node.is_a?(Prism::GlobalVariableWriteNode) || node.is_a?(Prism::GlobalVariableOrWriteNode) || node.is_a?(Prism::GlobalVariableOperatorWriteNode) || node.is_a?(Prism::GlobalVariableAndWriteNode) || node.is_a?(Prism::GlobalVariableTargetNode)) && node.name == name
+      node.compact_child_nodes.any? { global_assigned?(_1, name) }
     end
 
     # locals that are grown in place (<<, push, insert, concat, []= with a new key): their handle may change
