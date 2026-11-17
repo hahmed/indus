@@ -1390,6 +1390,17 @@ module Indus
       name, recv, *args = i.args
       t = of(f, recv)
       if name == :class && args.empty? && t == :dyn then i.op = :call; i.args = [fn(:__dyn_class_name), recv]; i.ty = :str; return end
+      if name == :__ancestors_of && args.empty? && t # obj.class.ancestors: the table row for the object's class id
+        return unless @settled
+        cid = if classes_of(t) && classes_of(t).size == 1 && !@classes[classes_of(t)[0]].tagged then Inst.new(:const, [@classes[classes_of(t)[0]].id]).tap { _1.ty = :int }
+              elsif classes_of(t) then Inst.new(:class_id, [recv]).tap { _1.ty = :int }
+              else nil end
+        return unless cid
+        cid.block = i.block; i.block.insts.insert(i.block.insts.index(i), cid)
+        tab = Inst.new(:gget, [:CLASS_ANCESTORS]); tab.ty = [:arr, [:arr, :str]]; tab.block = i.block; i.block.insts.insert(i.block.insts.index(i), tab)
+        @consts[:CLASS_ANCESTORS] ||= [:arr, [:arr, :str]]
+        i.op = :aget; i.args = [tab, cid]; i.ty = [:arr, :str]; return
+      end
       # an operator guessed to be an object's method (the pre-typing misjudged the receiver): the builtin operation
       if args.size == 1 && (ar = { :+ => :add, :- => :sub, :* => :mul, :/ => :div, :% => :mod, :< => :lt, :<= => :le, :> => :gt, :>= => :ge }[name]) && (%i[int int? float dyn].include?(t) || (classes_of(t) && classes_of(t).none? { @classes[_1].find_method(name) }))
         # a dyn, or a class set with no such operator: a field read whose type is still provisional (the int has not arrived yet) -- wait; settled, the builtin operation

@@ -2048,7 +2048,14 @@ module Indus
         emit(:const, [k.is_a?(Prism::SymbolNode) || k.is_a?(Prism::IntegerNode) || k.is_a?(Prism::FloatNode) || k.is_a?(Prism::NilNode) || k.is_a?(Prism::TrueNode) || k.is_a?(Prism::FalseNode) ? 1 : 0]).tap { _1.ty = :bool }
       elsif n.name == :name && args.empty? && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :class && n.receiver.arguments.nil? && n.receiver.receiver
         expr(n.receiver) # obj.class.name: the class is already its name (no class objects)
-      elsif n.name == :ancestors && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) then raise "ancestors: no class objects at run time"
+      elsif n.name == :ancestors && args.empty? && n.receiver.is_a?(Prism::ConstantReadNode) && (ak = @classes[n.receiver.name]) # Klass.ancestors: names, known here
+        names = []; c = ak
+        while c; names << c.name.to_s; names.concat((c.mixins || []).map(&:to_s)); c = c.superclass; end
+        names << "Object" unless names.include?("Object"); names.concat(%w[Kernel BasicObject])
+        pack_values(names.map { emit(:sconst, [_1]) })
+      elsif n.name == :ancestors && args.empty? && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :class && n.receiver.arguments.nil? && n.receiver.receiver
+        @needs_ancestors = true # obj.class.ancestors: by the object's class id at run time
+        emit(:mcall, [:__ancestors_of, expr(n.receiver.receiver)])
       elsif n.name == :extend && args.size == 1 && n.receiver && !@singletons&.key?(n) then raise "extend on #{n.receiver.class}: the object's class must be known at compile time"
       elsif %i[is_a? kind_of? instance_of?].include?(n.name) && args.size == 1 && n.receiver && args[0].is_a?(Prism::ConstantReadNode)
         emit(:isa, [expr(n.receiver), args[0].name])
@@ -3628,6 +3635,20 @@ module Indus
       carr = emit(:anew, [const((ks.map(&:id).max || 0) + 1), emit(:sconst, [""])])
       ks.each { |k| carr = emit(:aset, [carr, const(k.id), emit(:sconst, [k.name.to_s])]) }
       emit(:gset, [:CLASS_NAMES, carr])
+      if @needs_ancestors # obj.class.ancestors: each class's ancestor names (itself, mixins, superclasses, Object), by class id
+        aarr = emit(:anew, [const((ks.map(&:id).max || 0) + 1), emit(:anew, [const(0), emit(:sconst, [""])])])
+        ks.each do |k|
+          names = []; c = k
+          while c
+            names << c.name.to_s; names.concat((c.mixins || []).map(&:to_s)); c = c.superclass
+          end
+          names << "Object" unless names.include?("Object"); names.concat(%w[Kernel BasicObject])
+          inner = emit(:anew, [const(names.size), emit(:sconst, [""])])
+          names.each_with_index { |nm, j| inner = emit(:aset, [inner, const(j), emit(:sconst, [nm])]) }
+          aarr = emit(:aset, [aarr, const(k.id), inner])
+        end
+        emit(:gset, [:CLASS_ANCESTORS, aarr])
+      end
       main.entry.insts.concat(head)
       @f, @locals, @cur, @klass, @ct, @owner, @shared = saved
     end
