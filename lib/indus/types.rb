@@ -438,6 +438,11 @@ module Indus
                 d = Inst.new(:sdup, [i.args[1]]); d.ty = :str; d.block = i.block; i.block.insts.insert(i.block.insts.index(i), d)
                 i.args[1] = d; i.key_copied = true; changed = true
               end
+              if @settled && i.op == :gget && !@consts.key?(i.args[0]) && i.args[0].to_s !~ /[$@]/ && !(f.name == :main && !i.block.name.to_s.start_with?("handler", "rescue", "then", "else", "merge", "body"))
+                # an undefined constant read inside a method or a branch: Ruby's NameError when (if) it runs (a spec probes exactly this); straight-line main stays a refusal
+                nm = Inst.new(:sconst, ["uninitialized constant #{i.args[0].to_s.split('::').last}"]); nm.ty = :str; nm.block = i.block; i.block.insts.insert(i.block.insts.index(i), nm)
+                i.op = :call; i.args = [fn(:__raise_name_error), nm]; i.ty = :nil; changed = true
+              end
               if i.op == :to_i && i.strict && of(f, i.args[0]) == :str # Kernel#Integer(str): strict parse, ArgumentError on junk
                 i.op = :call; i.args = [fn(:__kernel_integer), i.args[0]]; i.ty = :int; changed = true
               end
@@ -669,7 +674,7 @@ module Indus
           next unless i.op == :gget && !@consts.key?(i.args[0])
           # a $global or an object's @ivar never assigned reads as nil; a bare constant is an error
           if i.args[0].to_s =~ /[$@]/ then i.op = :const; i.args = [0]; i.ty = :nil
-          else raise "uninitialized constant #{i.args[0]}" end
+          else raise "uninitialized constant #{i.args[0]}" end # (a read inside a method or branch was made a NameError at run time during the fixpoint)
         end
       end
       # classes that appear in any poly type carry a tag word

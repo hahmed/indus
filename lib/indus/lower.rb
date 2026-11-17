@@ -136,7 +136,8 @@ module Indus
       mods = body.grep(Prism::ModuleNode)
       # modules nested in modules (module Tr; module CM; end; end) are hoisted: the inner name resolves on its own
       nested_mods = []
-      walk_mods = ->(m) { (m.body&.body || []).each { |inner| next unless inner.is_a?(Prism::ModuleNode) || inner.is_a?(Prism::ClassNode); nested_mods << inner if inner.is_a?(Prism::ModuleNode); walk_mods.(inner) } }
+      @lexical_parent = {} # class/module name -> the class/module whose body encloses it (Ruby's cref for constant lookup)
+      walk_mods = ->(m) { (m.body&.body || []).each { |inner| next unless inner.is_a?(Prism::ModuleNode) || inner.is_a?(Prism::ClassNode); @lexical_parent[inner.constant_path.name] ||= m.constant_path.name unless inner.constant_path.is_a?(Prism::ConstantPathNode) && inner.constant_path.parent.nil?; nested_mods << inner if inner.is_a?(Prism::ModuleNode); walk_mods.(inner) } }
       (mods + body.grep(Prism::ClassNode)).each { walk_mods.(_1) } # modules nested in modules or classes (class ::Object; module X ...)
       mods += nested_mods
       # a module's instance methods: `include M` in a class body compiles them as that class's own
@@ -145,10 +146,14 @@ module Indus
       # `include M` inside a module body: M's defs are part of this module (transitively; the include statement itself is then done)
       mod_includes = mods.to_h { |m| [m.constant_path.name, (m.body&.body || []).select { |st| st.is_a?(Prism::CallNode) && st.name == :include && st.receiver.nil? && st.arguments }.flat_map { |st| st.arguments.arguments.filter_map { _1.is_a?(Prism::ConstantReadNode) ? _1.name : nil } }] }
       resolve_mod = ->(name, seen) { seen[name] ? [] : (seen[name] = true; (mod_includes[name] || []).flat_map { |inc| resolve_mod.(inc, seen) } + (@module_defs[name] || [])) }
+      @def_module = {} # DefNode -> the module whose body holds it (its cref for constant lookup, wherever it is mixed in)
+      @module_defs.each { |name, ds| ds.each { |d| @def_module[d] ||= name } }
       @module_defs = @module_defs.to_h { |name, _| [name, resolve_mod.(name, {}).uniq] }
       @mod_include_done = true # the include statements in module bodies are consumed here (register_class_body / mod_ivars skip them)
       mod_classes = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ClassNode) } # (mods now holds every module at any depth)
-      mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
+      mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode).map { |w| w.copy(name: :"#{m.constant_path.name}::#{w.name}") } } # scoped: Mod::X (two modules may each have an X)
+      @mod_const_owners = Hash.new { |h, k| h[k] = [] }
+      mods.each { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode).each { |w| @mod_const_owners[w.name] << m.constant_path.name } }
       # a top-level `include M`: M's methods become top-level defs (main's methods), as Ruby makes them Object's
       body = body.flat_map do |st|
         next [st] unless st.is_a?(Prism::CallNode) && st.name == :include && st.receiver.nil? && st.arguments&.arguments&.all? { _1.is_a?(Prism::ConstantReadNode) || _1.is_a?(Prism::ConstantPathNode) }
@@ -348,7 +353,8 @@ module Indus
       # a class's constants are its own (Base::PREFIX and Child::PREFIX are two globals, "Base::PREFIX" and
       # "Child::PREFIX"); bare X inside a class resolves lexically through the ancestors (see const_owner)
       @top_consts = body.grep(Prism::ConstantWriteNode).map(&:name) # the program's top-level constants
-      @class_const_owners = Hash.new { |h, k| h[k] = [] } # const name -> classes that define it
+      @class_const_owners = Hash.new { |h, k| h[k] = [] } # const name -> classes (and modules) that define it
+      @mod_const_owners.each { |x, owners| @class_const_owners[x].concat(owners) }
       cdefs.each { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).each { |w| @class_const_owners[w.name] << c.constant_path.name } }
       (@singleton_consts || []).each { |(cn, w)| @class_const_owners[w.name] << cn } # `class << self; X = v`: X is the class's for lookup purposes
       class_consts = cdefs.flat_map { |c| (c.body&.body || []).grep(Prism::ConstantWriteNode).map { |w| w.copy(name: :"#{c.constant_path.name}::#{w.name}") } + (c.body&.body || []).grep(Prism::ClassVariableWriteNode) } + (@singleton_consts || []).map { |(cn, w)| w.copy(name: :"#{cn}::#{w.name}") } # @@x = v in a class body: run first, like a constant
@@ -468,7 +474,7 @@ module Indus
         k.id = @classes.size
         # every @ivar this class body writes, registered now: a subclass declared below copies
         # the parent's layout at declaration, before the parent's methods are lowered
-        has = ->(cn) { kk = k; (return true if @class_const_owners[cn].include?(kk.name); kk = kk.superclass && @classes[kk.superclass]) while kk; false }
+        has = ->(cn) { kk = k; (return true if @class_const_owners[cn].include?(kk.name); kk = kk.superclass) while kk; false }
         readers = @class_const_owners.keys.select { has.(_1) }.map do |cn| # def __const_X = X, so self.class::X can dispatch
           src = c.send(:source); loc = c.location
           Prism::DefNode.new(src, 0, loc, 0, :"__const_#{cn}", loc, nil, nil, Prism::StatementsNode.new(src, 0, loc, 0, [Prism::ConstantReadNode.new(src, 0, loc, 0, cn)]), [], loc, nil, nil, nil, nil, nil)
@@ -1998,11 +2004,11 @@ module Indus
       elsif %i[instance_methods public_instance_methods singleton_methods methods public_methods].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && ((kk = @classes[n.receiver.name]) || @modules.include?(n.receiver.name))
         own_only = args[0].is_a?(Prism::FalseNode)
         names = if n.name == :singleton_methods || n.name == :methods # the class object's methods (inherited class methods too, unless (false))
-                  chain = []; c = kk; while c; chain << c.name; c = c.superclass && @classes[c.superclass]; end
+                  chain = []; c = kk; while c; chain << c.name; c = c.superclass; end
                   chain = [n.receiver.name] if own_only || chain.empty?
                   chain.flat_map { |cn| @funcs.keys.map(&:to_s).select { _1.start_with?("#{cn}.") }.map { _1.split(".", 2)[1].to_sym }.reject { own_only && @inherited_cm&.[]([cn, _1]) } }.uniq
                 else
-                  chain = []; c = kk; while c; chain << c; c = c.superclass && @classes[c.superclass]; end
+                  chain = []; c = kk; while c; chain << c; c = c.superclass; end
                   chain = [kk] if own_only
                   chain.flat_map { |c| c.methods.keys.reject { _1 == :initialize || _1.to_s.start_with?("__") } + c.readers.keys + c.writers.keys }.uniq
                 end
@@ -4025,20 +4031,30 @@ module Indus
       return nil unless @class_const_owners && !@class_const_owners[name].empty?
       k = @owner ? @classes[@owner] : @klass
       k = k.outer if k&.closure && k.outer
+      start = k&.name || @owner
+      start = @def_module[@defs_by_func[@f]] if @f && @defs_by_func && @def_module&.key?(@defs_by_func[@f]) # a mixed-in method: its module's scope
+      # Ruby: the lexical scopes enclosing the code first (innermost out), then the class's ancestors
+      scope = start
+      while scope
+        return scope if @class_const_owners[name].include?(scope)
+        scope = @lexical_parent&.[](scope)
+      end
       while k
         return k.name if @class_const_owners[name].include?(k.name)
-        k = k.superclass && @classes[k.superclass]
+        k = k.superclass
       end
       nil
     end
 
     def expr_const_path(n)
       # Mod::NAME -> the constant; Mod::Klass handled by callers (Klass.new)
-      if n.parent.is_a?(Prism::ConstantReadNode) && @classes[n.parent.name] && @class_const_owners && !@class_const_owners[n.name].empty? # Base::PREFIX: through the ancestors
-        k = @classes[n.parent.name]
+      pname = n.parent.is_a?(Prism::ConstantReadNode) || n.parent.is_a?(Prism::ConstantPathNode) ? n.parent.name : nil
+      if pname && @class_const_owners && !@class_const_owners[n.name].empty? # Base::PREFIX: the owner, then its ancestors (a module: itself)
+        return emit(:gget, [:"#{pname}::#{n.name}"]) if @class_const_owners[n.name].include?(pname)
+        k = @classes[pname]
         while k
           return emit(:gget, [:"#{k.name}::#{n.name}"]) if @class_const_owners[n.name].include?(k.name)
-          k = k.superclass && @classes[k.superclass]
+          k = k.superclass
         end
       end
       if n.parent.is_a?(Prism::CallNode) && n.parent.name == :class && n.parent.arguments.nil? && n.parent.receiver && @class_const_owners && !@class_const_owners[n.name].empty?

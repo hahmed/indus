@@ -1553,6 +1553,9 @@ end
 def __raise_coerce(what, into)
   raise TypeError, what + " can't be coerced into " + into
 end
+def __raise_name_error(msg)
+  raise NameError, msg
+end
 def __raise_no_implicit(what)
   raise TypeError, "no implicit conversion of " + what + " into String"
 end
