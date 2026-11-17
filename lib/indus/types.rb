@@ -1390,6 +1390,9 @@ module Indus
       name, recv, *args = i.args
       t = of(f, recv)
       if name == :class && args.empty? && t == :dyn then i.op = :call; i.args = [fn(:__dyn_class_name), recv]; i.ty = :str; return end
+      if %i[=~ match match? !~].include?(name) && args.size == 1 && of(f, args[0]) == :nil && @settled # `s =~ nil` in a branch the guard rules out: nil (never a match)
+        i.op = :const; i.args = [0]; i.ty = name == :!~ ? :bool : :nil; return
+      end
       if name == :__ancestors_of && args.empty? && t # obj.class.ancestors: the table row for the object's class id
         return unless @settled
         cid = if classes_of(t) && classes_of(t).size == 1 && !@classes[classes_of(t)[0]].tagged then Inst.new(:const, [@classes[classes_of(t)[0]].id]).tap { _1.ty = :int }
