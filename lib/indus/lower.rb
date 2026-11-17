@@ -1000,7 +1000,7 @@ module Indus
       # later definition overrides an earlier one), the body, then prepended modules on top.
       # An overridden definition stays reachable as the overrider's `shadowed`: super's target
       mods_named = ->(kind) { stmts.select { |st| st.is_a?(Prism::CallNode) && st.name == kind && st.receiver.nil? }
-                                .flat_map { |st| st.arguments.arguments.map { |a| a.is_a?(Prism::ConstantReadNode) ? a.name : raise("#{kind} needs a module name") } } }
+                                .flat_map { |st| st.arguments.arguments.map { |a| a.is_a?(Prism::ConstantReadNode) || a.is_a?(Prism::ConstantPathNode) ? a.name : raise("#{kind} needs a module name") } } } # Outer::M: the leaf names the hoisted module
       mod_defs = ->(m) { @module_defs.fetch(m) { m == :Comparable || m == :Enumerable ? [] : raise("include #{m}: unknown module") } }
       included, prepended = mods_named.(:include), mods_named.(:prepend)
       if included.include?(:Enumerable) # every Enumerable method is the array method on what each yields

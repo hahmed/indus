@@ -5,5 +5,5 @@ module Top
     end
   end
 end
-class C; include D; end
+class C; include Wrap::D; end
 p C.new.dd
