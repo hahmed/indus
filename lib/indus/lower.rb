@@ -402,6 +402,9 @@ module Indus
       sdefs.reject! { |(_, d)| @structural_hooks&.any? { _1.equal?(d) } } # a hook applied at compile time is not a function
       @sdef_nodes = Hash.new { |h, kk| h[kk] = [] }
       sdefs.each { |_, d| @sdef_nodes[d.name] << d }
+      # a class method that yields (no &blk): inlined at `Owner.m { }` sites like an instance yielder, keyed Owner.m
+      sdefs, yielding_sdefs = sdefs.partition { |(_, d)| !(yields?(d) && !d.parameters&.block) }
+      yielding_sdefs.each { |owner, d| @yielders[:"#{owner}.#{d.name}"] = [nil, d, owner] }
       sdefs.each do |owner, d|
         ps = d.parameters
         f = @funcs[:"#{owner}.#{d.name}"] = Func.new(:"#{owner}.#{d.name}", def_param_names(d).size)
@@ -2928,8 +2931,18 @@ module Indus
         return inline_yielder(y, recv, args, params, body) if y && k.nil? && recv.nil?
         array_loop(expr(recv), n.name, params, body)
       else
-        y = @yielders[n.name] or raise "block passed to #{n.name}, which has no yield"
-        inline_yielder(y, recv, args, params, body)
+        y = @yielders[n.name]
+        y ||= @yielders[:"#{recv.name}.#{n.name}"] if recv.is_a?(Prism::ConstantReadNode) # Owner.m { }: a yielding class method
+        y ||= @yielders[:"#{@owner}.#{n.name}"] if recv.nil? && @owner
+        y or raise "block passed to #{n.name}, which has no yield"
+        if y[2] # a class method: self is the class (no instance); the callee's constants resolve in its owner, the block's in the caller's
+          saved_owner, @owner = @owner, y[2]
+          @block_owner_stack = (@block_owner_stack || []) << saved_owner
+          r = inline_yielder([nil, y[1]], nil, args, params, body)
+          @block_owner_stack.pop
+          @owner = saved_owner
+          r
+        else inline_yielder(y, recv, args, params, body) end
       end
     end
 
@@ -3276,6 +3289,7 @@ module Indus
       bpfx = :"y#{@f.blocks.size}:"
       saved_pfx, @name_pfx = @name_pfx, nil
       saved_ret, @ret_exit = @ret_exit, nil        # a `return` in the block would return from the caller: unsupported
+      saved_owner = @owner; @owner = @block_owner_stack.last if @block_owner_stack&.any? # the block's constants: the caller's scope
       bind_block_params(params, vals, bpfx)
       @blk_pfx = (@blk_pfx || []) << bpfx
       last = nil
@@ -3283,6 +3297,7 @@ module Indus
       @blk_pfx.pop
       @locals.delete_if { |k, _| k.to_s.start_with?(bpfx.to_s) }
       @name_pfx, @ret_exit = saved_pfx, saved_ret
+      @owner = saved_owner
       last || const(0)
     end
 
