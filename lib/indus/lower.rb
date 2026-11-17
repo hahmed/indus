@@ -136,8 +136,8 @@ module Indus
       mods = body.grep(Prism::ModuleNode)
       # modules nested in modules (module Tr; module CM; end; end) are hoisted: the inner name resolves on its own
       nested_mods = []
-      walk_mods = ->(m) { (m.body&.body || []).grep(Prism::ModuleNode).each { |inner| nested_mods << inner; walk_mods.(inner) } }
-      mods.each { walk_mods.(_1) }
+      walk_mods = ->(m) { (m.body&.body || []).each { |inner| next unless inner.is_a?(Prism::ModuleNode) || inner.is_a?(Prism::ClassNode); nested_mods << inner if inner.is_a?(Prism::ModuleNode); walk_mods.(inner) } }
+      (mods + body.grep(Prism::ClassNode)).each { walk_mods.(_1) } # modules nested in modules or classes (class ::Object; module X ...)
       mods += nested_mods
       # a module's instance methods: `include M` in a class body compiles them as that class's own
       # (one copy per including class -- typed for that class, like everything else here)
@@ -147,8 +147,13 @@ module Indus
       resolve_mod = ->(name, seen) { seen[name] ? [] : (seen[name] = true; (mod_includes[name] || []).flat_map { |inc| resolve_mod.(inc, seen) } + (@module_defs[name] || [])) }
       @module_defs = @module_defs.to_h { |name, _| [name, resolve_mod.(name, {}).uniq] }
       @mod_include_done = true # the include statements in module bodies are consumed here (register_class_body / mod_ivars skip them)
-      mod_classes = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ClassNode) }
+      mod_classes = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ClassNode) } # (mods now holds every module at any depth)
       mod_consts = mods.flat_map { |m| (m.body&.body || []).grep(Prism::ConstantWriteNode) }
+      # a top-level `include M`: M's methods become top-level defs (main's methods), as Ruby makes them Object's
+      body = body.flat_map do |st|
+        next [st] unless st.is_a?(Prism::CallNode) && st.name == :include && st.receiver.nil? && st.arguments&.arguments&.all? { _1.is_a?(Prism::ConstantReadNode) || _1.is_a?(Prism::ConstantPathNode) }
+        st.arguments.arguments.flat_map { |m| @module_defs[m.name] || raise("include #{m.name}: no such module") }
+      end
       defs = body.grep(Prism::DefNode).reject { _1.receiver && !_1.receiver.is_a?(Prism::SelfNode) } # def x.m stays a statement (a singleton site)
       # top-level define_method(:name) { |params| body } with a literal symbol and block: a def
       dm = body.select { |st| st.is_a?(Prism::CallNode) && st.name == :define_method && st.receiver.nil? && st.block.is_a?(Prism::BlockNode) && st.arguments&.arguments&.first.is_a?(Prism::SymbolNode) }
@@ -157,10 +162,10 @@ module Indus
       # classes nested in class bodies (class Outer; class Inner; end; end) are hoisted like module-nested ones;
       # Outer::Inner resolves by the inner name. Declared after their outer class so a superclass reference works.
       nested = []
-      walk = ->(c) { (c.body&.body || []).grep(Prism::ClassNode).each { |inner| nested << inner; walk.(inner) } }
-      cdefs.each { walk.(_1) }
+      walk = ->(c) { (c.body&.body || []).each { |inner| next unless inner.is_a?(Prism::ClassNode) || inner.is_a?(Prism::ModuleNode); (nested << inner) if inner.is_a?(Prism::ClassNode) && !cdefs.include?(inner); walk.(inner) } }
+      cdefs.each { walk.(_1) } # classes nested in class bodies (through modules too), at any depth
       @hoisted_classes = nested
-      cdefs += nested
+      cdefs = (cdefs + nested).uniq
       # `A.include(M)` / `A.prepend(M)` / `A.extend(M)` as a top-level statement: the same as inside A's body (a re-opening)
       body = body.flat_map do |st|
         # A.send(:remove_method, :m) is A.remove_method(:m)
@@ -2425,7 +2430,7 @@ module Indus
       elsif n.receiver.nil? && (y = @yielders[n.name]) && (y[0].nil? || @klass && (y[0].name == @klass.name)) # a yielding method called without a block: inlined, block_given? false
         inline_yielder(y, nil, args, nil, :none)
       else
-        f = @funcs.fetch(n.name) { raise "unknown method #{n.name}" }
+        f = @funcs.fetch(n.name) { raise "unknown method #{n.name} (line #{n.location.start_line - (Lower.prelude_lines || 0)})" }
         f = demand(n.name) if n.name.to_s.start_with?("__")
         emit(:call, [f, *call_args(f, args)])
       end
