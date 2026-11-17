@@ -2140,7 +2140,7 @@ module Indus
         @cur = mb2; inner = mb2.phi; inner.args = [[tb2, hi], [eb2, x]]; emit(:br, [mb])
         @cur = mb; p = mb.phi; p.args = [[tb, lo], [mb2, inner]]; p
       elsif n.name == :~ && args.empty? && n.receiver then emit(:xor, [expr(n.receiver), const(-1)]) # bitwise not
-      elsif %i[match match? scan sub gsub split =~ !~].include?(n.name) && args.size >= 1 && args[0].is_a?(Prism::RegularExpressionNode) && n.receiver && !((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd])
+      elsif %i[match match? scan sub gsub split =~ !~].include?(n.name) && args.size >= 1 && (args[0].is_a?(Prism::RegularExpressionNode) || (kind_of(args[0]) == :Regexp && !%i[scan].include?(n.name))) && n.receiver && !((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd])
         re = expr(args[0]); sv = expr(n.receiver)
         case n.name
         when :match then (r = emit(:call, [demand(:__str_match_re), sv, re]); r.routed = :match; r) # Types reroutes when the receiver turns out not to be a String
@@ -2152,8 +2152,15 @@ module Indus
         when :=~ then emit(:call, [demand(:__str_index_re), sv, re])
         when :!~ then emit(:cmp, [emit(:call, [demand(:__str_match_p_re), sv, re]), (c = const(0); c.ty = :bool; c)], :eq)
         end
-      elsif n.name == :=~ && args.size == 1 && n.receiver.is_a?(Prism::RegularExpressionNode) # /re/ =~ s
+      elsif n.name == :=~ && args.size == 1 && (n.receiver.is_a?(Prism::RegularExpressionNode) || kind_of(n.receiver) == :Regexp) # /re/ =~ s
         emit(:call, [demand(:__str_index_re), expr(args[0]), expr(n.receiver)])
+      elsif %i[match match? !~].include?(n.name) && args.size == 1 && kind_of(n.receiver) == :Regexp && !n.receiver.is_a?(Prism::RegularExpressionNode) # re.match(s) with re a value
+        re = expr(n.receiver); sv = expr(args[0])
+        case n.name
+        when :match then (r = emit(:call, [demand(:__str_match_re), sv, re]); r.routed = :match; r)
+        when :match? then emit(:call, [demand(:__str_match_p_re), sv, re])
+        when :!~ then emit(:cmp, [emit(:call, [demand(:__str_match_p_re), sv, re]), (c = const(0); c.ty = :bool; c)], :eq)
+        end
       elsif n.name == :first && args.size == 1 && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :cycle && n.receiver.arguments.nil? && n.receiver.receiver
         emit(:call, [demand(:__arr_cycle_first), expr(n.receiver.receiver), expr(args[0])]) # xs.cycle.first(n): the only finite view of a cycle
       elsif n.name == :step && args.size == 1 && n.receiver.is_a?(Prism::ParenthesesNode) && n.receiver.body.body.last.is_a?(Prism::RangeNode) # (a..b).step(n)

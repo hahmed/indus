@@ -89,6 +89,7 @@ module Indus
       k = case n
           when Prism::IntegerNode then :int
           when Prism::FloatNode then :float
+          when Prism::RegularExpressionNode then :Regexp
           when Prism::StringNode, Prism::InterpolatedStringNode then (n.is_a?(Prism::InterpolatedStringNode) && n.parts.each { |p| expr(p.statements.body.last, env, klass, fkey) if p.is_a?(Prism::EmbeddedStatementsNode) }; :str)
           when Prism::SymbolNode then :sym
           when Prism::TrueNode, Prism::FalseNode then :bool

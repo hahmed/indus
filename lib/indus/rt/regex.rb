@@ -336,6 +336,11 @@ def __re_split(prog, ncap, s)
       out.push(s[from, at - from])
       from = me
     end
+    g = 2 # captured groups join the pieces (Ruby: "a1b".split(/(\d)/) => ["a", "1", "b"])
+    while g < ncap
+      out.push(s[caps[g], caps[g + 1] - caps[g]]) if caps[g] >= 0
+      g = g + 2
+    end
   end
   out.push(s[from, s.length - from]) if from < s.length
   # Ruby drops trailing empty strings
