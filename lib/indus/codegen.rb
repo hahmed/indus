@@ -268,7 +268,12 @@ module Indus
         when :box # tag a typed value: see notes/29_tagged_scalars_design.md
           v, t = i.args; r = v.float? ? nil : reg(v)
           case t
-          when :int, :int? then @asm.emit(0xD37FF800 | (r << 5) | d) ; @asm.emit(0xB2400000 | (d << 5) | d) # lsl d, r, #1 ; orr d, d, #1
+          when :int then @asm.emit(0xD37FF800 | (r << 5) | d) ; @asm.emit(0xB2400000 | (d << 5) | d) # lsl d, r, #1 ; orr d, d, #1
+          when :int? # a nullable int: the sentinel is nil (0), anything else a fixnum
+            @asm.emit(0xD37FF800 | (r << 5) | 16); @asm.emit(0xB2400000 | (16 << 5) | 16)      # x16 = r << 1 | 1
+            @asm.emit(0xD2F00000 | 17)                                                        # x17 = INT_NIL (movz #0x8000, lsl 48)
+            @asm.emit(0xEB11001F | (r << 5))                                                  # cmp r, x17
+            @asm.emit(0x9A8003E0 | (16 << 16) | d)                                            # csel d, xzr, x16, eq
           when :str then @asm.emit(0xB27F0000 | (r << 5) | 16); @asm.cmpi(r, 0); @asm.emit(0x9A8003E0 | (16 << 16) | d) # orr x16, r, #2 ; a nil String slot (0) stays nil
           when :bool then @asm.emit(0xD37CEC00 | (r << 5) | d); @asm.emit(0xB27D0000 | (d << 5) | d); @asm.emit(0xB27F0000 | (d << 5) | d) # (<<4) |8 |2 = 10
           when :sym then @asm.emit(0xD37CEC00 | (r << 5) | d); @asm.emit(0xB27E0400 | (d << 5) | d) # (<<4) |12

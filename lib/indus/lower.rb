@@ -3376,7 +3376,9 @@ module Indus
           str.(has ? "constant" : nil)
         end
       when Prism::CallNode
-        if v.receiver.nil? && v.arguments.nil?
+        if v.receiver && (pk = v.receiver.is_a?(Prism::SelfNode) ? @klass : ((kd = kind_of(v.receiver)).is_a?(Symbol) ? @classes[kd] : nil)) && pk.hidden&.[](v.name) then str.(nil) # a private method with an explicit receiver (self. too, as defined? reports it): not callable, so not defined
+        elsif v.receiver && !v.receiver.is_a?(Prism::SelfNode) && %i[print puts p pp require require_relative raise fail loop lambda proc sleep exit abort gets format sprintf printf rand srand catch throw binding block_given? Integer Float String Array Hash].include?(v.name) then str.(nil) # Kernel's private methods: not callable with a receiver
+        elsif v.receiver.nil? && v.arguments.nil?
           known = @funcs.key?(v.name) || @yielders.key?(v.name) || (@klass && (@klass.find_method(v.name) || @klass.find_reader(v.name))) || %i[puts p print require require_relative raise loop lambda proc format sprintf rand gets].include?(v.name)
           str.(known ? "method" : nil)
         elsif v.receiver && (kd = kind_of(v.receiver)).is_a?(Symbol) && @classes[kd]
@@ -3390,6 +3392,7 @@ module Indus
       when Prism::NilNode then str.("nil")
       when Prism::TrueNode then str.("true")
       when Prism::FalseNode then str.("false")
+      when Prism::ClassVariableWriteNode, Prism::ConstantWriteNode, Prism::ConstantPathWriteNode, Prism::GlobalVariableWriteNode, Prism::MultiWriteNode, Prism::ClassVariableOperatorWriteNode, Prism::ConstantOperatorWriteNode, Prism::LocalVariableOrWriteNode, Prism::LocalVariableAndWriteNode, Prism::InstanceVariableOrWriteNode, Prism::InstanceVariableOperatorWriteNode, Prism::GlobalVariableOrWriteNode, Prism::GlobalVariableOperatorWriteNode, Prism::CallAndWriteNode, Prism::IndexOrWriteNode, Prism::IndexAndWriteNode then str.("assignment")
       when Prism::LocalVariableWriteNode, Prism::LocalVariableOperatorWriteNode, Prism::InstanceVariableWriteNode, Prism::CallOperatorWriteNode, Prism::CallOrWriteNode, Prism::IndexOperatorWriteNode, Prism::GlobalVariableWriteNode, Prism::MultiWriteNode then str.("assignment")
       else str.("expression")
       end
