@@ -223,7 +223,7 @@ end
 
 # Ruby's floor division
 def __big_div(a, b)
-  __trap if __big_zero_p(b)
+  raise(ZeroDivisionError, "divided by 0") if __big_zero_p(b)
   return [0] if __big_zero_p(a)
   if b.length == 2 && a[0] == 0 && b[0] == 0
     return __big_divmod_small(a, b[1], [0])
@@ -285,3 +285,167 @@ def __big_to_int(a)
   end
   a[0] == 1 ? 0 - v : v
 end
+
+# ---- more operations: power, bitwise (two's complement semantics on sign-magnitude), predicates
+
+def __big_pow(a, e)
+  raise(ArgumentError, "negative exponent") if e < 0
+  result = [0, 1]
+  base = __big_dup(a)
+  while e > 0
+    result = __big_mul(result, base) if e & 1 == 1
+    e = e >> 1
+    base = __big_mul(base, base) if e > 0
+  end
+  result
+end
+
+def __big_even_p(a) = a.length == 1 || a[1] & 1 == 0
+def __big_odd_p(a) = a.length > 1 && a[1] & 1 == 1
+def __big_negative_p(a) = a[0] == 1 && a.length > 1
+def __big_sign(a) = a.length == 1 ? 0 : (a[0] == 1 ? -1 : 1)
+
+# the magnitude's bits as little-endian 31-bit limbs in two's complement form over `n` limbs (negative: ~(m - 1))
+def __big_twos(a, n)
+  out = []
+  i = 0
+  while i < n
+    out.push(i + 1 < a.length ? a[i + 1] : 0)
+    i = i + 1
+  end
+  if a[0] == 1 && a.length > 1
+    # subtract one, then complement each limb
+    j = 0
+    borrow = 1
+    while j < n
+      v = out[j] - borrow
+      if v < 0 then v = v + BIG_BASE; borrow = 1 else borrow = 0 end
+      out[j] = (BIG_BASE - 1) - v
+      j = j + 1
+    end
+  end
+  out
+end
+
+# back from two's complement limbs (negative when the top bit of the last limb is set)
+def __big_from_twos(limbs, negative)
+  out = [negative ? 1 : 0]
+  if negative
+    # complement each limb and add one
+    i = 0
+    carry = 1
+    while i < limbs.length
+      v = ((BIG_BASE - 1) - limbs[i]) + carry
+      if v >= BIG_BASE then v = v - BIG_BASE; carry = 1 else carry = 0 end
+      out.push(v)
+      i = i + 1
+    end
+  else
+    i = 0
+    while i < limbs.length
+      out.push(limbs[i])
+      i = i + 1
+    end
+  end
+  __big_trim(out)
+end
+
+def __big_bitop(a, b, op)
+  n = (a.length > b.length ? a.length : b.length) # limbs + one for sign extension
+  ta = __big_twos(a, n)
+  tb = __big_twos(b, n)
+  na = a[0] == 1 && a.length > 1
+  nb = b[0] == 1 && b.length > 1
+  out = []
+  i = 0
+  while i < n
+    x = ta[i]; y = tb[i]
+    out.push(op == 0 ? (x & y) : (op == 1 ? (x | y) : (x ^ y)))
+    i = i + 1
+  end
+  neg = op == 0 ? (na && nb) : (op == 1 ? (na || nb) : (na != nb))
+  __big_from_twos(out, neg)
+end
+def __big_and(a, b) = __big_bitop(a, b, 0)
+def __big_or(a, b) = __big_bitop(a, b, 1)
+def __big_xor(a, b) = __big_bitop(a, b, 2)
+def __big_not(a) = __big_sub(__big_neg(a), [0, 1]) # ~a == -a - 1
+
+def __big_shl(a, n)
+  return __big_shr(a, 0 - n) if n < 0
+  out = __big_dup(a)
+  i = 0
+  while i < n
+    out = __big_shl1(out)
+    i = i + 1
+  end
+  out
+end
+# arithmetic shift right (floor toward -infinity, as Ruby)
+def __big_shr(a, n)
+  return __big_shl(a, 0 - n) if n < 0
+  return a if n == 0
+  p = __big_pow([0, 2], n)
+  q = __big_div(a, p) # __big_div floors already (Ruby semantics)
+  q
+end
+
+def __big_hash(a)
+  h = a[0]
+  i = 1
+  while i < a.length
+    h = (h * 1000003 + a[i]) & 0x3fffffffffffffff
+    i = i + 1
+  end
+  h
+end
+
+def __big_bit_length(a)
+  return 0 if a.length == 1
+  bits = __big_bits(a)
+  # negatives: bit length of ~a == bit length of (|a| - 1)
+  a[0] == 1 ? __big_bits(__big_sub_mag(a, [0, 1], 0)) : bits
+end
+
+def __big_gcd(a, b)
+  x = __big_abs(a)
+  y = __big_abs(b)
+  while !__big_zero_p(y)
+    t = __big_mod(x, y)
+    x = y
+    y = t
+  end
+  x
+end
+def __big_lcm(a, b) = (__big_zero_p(a) || __big_zero_p(b)) ? [0] : __big_abs(__big_div(__big_mul(a, b), __big_gcd(a, b)))
+
+def __big_to_f(a)
+  f = 0.0
+  i = a.length - 1
+  while i >= 1
+    f = f * 2147483648.0 + a[i].to_f
+    i = i - 1
+  end
+  a[0] == 1 ? 0.0 - f : f
+end
+def __big_fdiv(a, b) = __big_to_f(a) / __big_to_f(b)
+def __big_divmod(a, b) = [__big_div(a, b), __big_mod(a, b)]
+def __big_remainder(a, b)
+  m = __big_mod(a, b)
+  return m if __big_zero_p(m) || (a[0] == b[0])
+  __big_sub(m, b)
+end
+def __big_pred(a) = __big_sub(a, [0, 1])
+def __big_succ(a) = __big_add(a, [0, 1])
+def __big_size(a) = ((__big_bits(a) + 63) / 64) * 8
+def __big_digits(a, base)
+  out = []
+  x = __big_abs(a)
+  bb = __big_from_int(base)
+  while !__big_zero_p(x)
+    out.push(__big_to_int(__big_mod(x, bb)))
+    x = __big_div(x, bb)
+  end
+  out
+end
+def __big_coerce(a, b) = [b, a]

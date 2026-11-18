@@ -217,6 +217,7 @@ module Indus
             if i.op == :lshift_or_append && classes_of(of(f, i.args[0])) # obj << v: the class's own <<
               i.op = :mcall; i.args = [:<<, *i.args]; i.ty = nil; bind(f, i); changed = true
             end
+            if i.op == :lshift_or_append && big?(of(f, i.args[0])) then i.op = :shl; changed = true; next end # a Bignum shift
             if i.op == :lshift_or_append && arr(of(f, i.args[0])) # a << v on an array is push: aset at the length
               raise "#{f.name}: `<<` on parameter #{i.args[0]} would not be seen by the caller after growth; not supported yet" if i.args[0].op == :param
               len = Inst.new(:alen, [i.args[0]]); len.ty = :int; len.block = i.block
@@ -278,7 +279,11 @@ module Indus
               z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
               i.args = [c, z]; i.cond = i.cond == :eq ? :ne : :eq; changed = true # (a == b) is (eq_result != 0)
             end
-            if %i[add sub mul div mod cmp].include?(i.op) && (big?(of(f, i.args[0])) || big?(of(f, i.args[1]))) && !@no_big_rewrite
+            if %i[add sub mul div mod cmp and or xor shl shr pow].include?(i.op) && (big?(of(f, i.args[0])) || big?(of(f, i.args[1]))) && !@no_big_rewrite
+              big_op(f, i); changed = true
+            end
+            # 2**64 / 10**20: an integer power whose value cannot be 64-bit (both operands literal) is a Bignum
+            if i.op == :pow && i.args.all? { _1.op == :const && _1.args[0].is_a?(Integer) } && i.args[1].args[0] >= 0 && (i.args[0].args[0] ** i.args[1].args[0]).then { |v| v > 2**62 || v < -2**62 } && !@no_big_rewrite
               big_op(f, i); changed = true
             end
             if %i[add sub and or mul].include?(i.op) && arr(of(f, i.args[0])) # a + b, a - b, a & b, a | b, a * n on arrays
@@ -300,6 +305,7 @@ module Indus
             end
             if false then i.op = :const; i.args = [t == :dyn ? 1 : 0]; i.ty = :bool; changed = true end
             if i.op == :to_f && of(f, i.args[0]) == :str then i.op = :call; i.args = [fn(:__str_to_f), i.args[0]]; i.ty = :float; changed = true end # "3.5".to_f
+            if i.op == :to_f && big?(of(f, i.args[0])) then i.op = :call; i.args = [fn(:__big_to_f), i.args[0]]; i.ty = :float; changed = true end # a Bignum's float
             if i.op == :mul && of(f, i.args[0]) == :str # "ab" * n
               fn = fn(:__str_times); i.op = :call; i.args = [fn, *i.args]; i.ty = :str; changed = true
             end
@@ -833,6 +839,7 @@ module Indus
         when :lshift_or_append
           t = of(f, i.args[0])
           if t == :int then i.op = :shl
+          elsif big?(t) then i.op = :shl # a Bignum shift, not an append
           elsif t
             if i.args[0].op == :param || (i.args[0].op == :phi && i.args[0].args.any? { |(_, v)| v.op == :param })
               # the callee's home is rebound, the caller's is not: once the buffer grows they diverge.
@@ -1196,8 +1203,16 @@ module Indus
 
     # an operator with a Bignum operand: the other operand is lifted (coerce, int -> big) and
     # the op becomes a prelude call. Compares go through __big_cmp and test its sign.
-    BIG_OPS = { add: :__big_add, sub: :__big_sub, mul: :__big_mul, div: :__big_div, mod: :__big_mod }.freeze
+    BIG_OPS = { add: :__big_add, sub: :__big_sub, mul: :__big_mul, div: :__big_div, mod: :__big_mod, and: :__big_and, or: :__big_or, xor: :__big_xor }.freeze
     def self.big_op(f, i)
+      if %i[shl shr pow].include?(i.op) # the right operand stays a machine integer (a shift count / an exponent)
+        l = big?(of(f, i.args[0])) ? i.args[0] : coerce(f, i.block, i, i.args[0], BIG)
+        r = i.args[1]
+        r = Inst.new(:call, [fn(:__big_to_int), r]).tap { _1.ty = :int; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) } if big?(of(f, r))
+        callee = fn({ shl: :__big_shl, shr: :__big_shr, pow: :__big_pow }.fetch(i.op))
+        i.op = :call; i.args = [callee, l, r]; i.ty = BIG
+        return
+      end
       l, r = i.args.map { |v| big?(of(f, v)) ? v : coerce(f, i.block, i, v, BIG) } # lift the int operand now, so the callee is typed BIG from the start
       if i.op == :cmp
         c = Inst.new(:call, [fn(:__big_cmp), l, r]); c.ty = :int; c.block = i.block
@@ -1413,9 +1428,40 @@ module Indus
     end
 
     # :mcall name, recv, args -> :call Func / :fld_get / :fld_set
+    BIG_METHODS = { even?: [:__big_even_p, :bool], odd?: [:__big_odd_p, :bool], zero?: [:__big_zero_p, :bool], negative?: [:__big_negative_p, :bool],
+                    abs: [:__big_abs, :big], magnitude: [:__big_abs, :big], :-@ => [:__big_neg, :big], :~ => [:__big_not, :big], to_s: [:__big_to_s, :str], inspect: [:__big_to_s, :str],
+                    to_i: [nil, :big], to_int: [nil, :big], to_f: [:__big_to_f, :float], hash: [:__big_hash, :int], bit_length: [:__big_bit_length, :int], size: [:__big_size, :int],
+                    pred: [:__big_pred, :big], succ: [:__big_succ, :big], next: [:__big_succ, :big], integer?: [nil, :true], finite?: [nil, :true], infinite?: [nil, :nil], nan?: [nil, :false],
+                    gcd: [:__big_gcd, :big], lcm: [:__big_lcm, :big], fdiv: [:__big_fdiv, :float], divmod: [:__big_divmod, :bigarr], remainder: [:__big_remainder, :big], pow: [:__big_pow, :big],
+                    div: [:__big_div, :big], modulo: [:__big_mod, :big], "<=>": [:__big_cmp, :int], digits: [:__big_digits, :intarr], coerce: [:__big_coerce, :bigarr], eql?: [:__big_eq, :bool] }.freeze
     def self.bind(f, i)
       name, recv, *args = i.args
       t = of(f, recv)
+      if %i[int int?].include?(t) && args.size == 1 && big?(of(f, args[0])) && %i[gcd lcm fdiv divmod remainder div modulo pow eql? coerce].include?(name) # 6.lcm(bignum): the receiver lifted
+        recv = coerce(f, i.block, i, recv, BIG); i.args[1] = recv; t = BIG
+      end
+      if big?(t) && (bm = BIG_METHODS[name]) && (bm[0].nil? || args.size <= 1) # a method on a Bignum: the prelude's
+        callee, rt = bm
+        if callee.nil?
+          case rt
+          when :big then i.op = :nop; i.args = [recv]; i.ty = BIG
+          when :true then i.op = :const; i.args = [1]; i.ty = :bool
+          when :false then i.op = :const; i.args = [0]; i.ty = :bool
+          when :nil then i.op = :const; i.args = [0]; i.ty = :nil
+          end
+          return
+        end
+        if name == :digits && args.empty? then args = [Inst.new(:const, [10]).tap { _1.ty = :int; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) }] end
+        if %i[gcd lcm divmod remainder div modulo <=> eql? coerce].include?(name) # a binary op: the argument lifted to BIG; <=> with a non-integer is nil
+          at = of(f, args[0]); return unless at
+          if name == :<=> && !(%i[int int? float].include?(at) || big?(at)) then i.op = :const; i.args = [0]; i.ty = :nil; return end
+          if name == :eql? && !big?(at) then i.op = :const; i.args = [0]; i.ty = :bool; return end
+          args[0] = coerce(f, i.block, i, args[0], BIG) unless big?(at)
+        end
+        i.op = :call; i.args = [fn(callee), recv, *args]
+        i.ty = case rt when :big then BIG when :bigarr then [:arr, BIG] when :intarr then [:arr, :int] else rt end
+        return
+      end
       if name == :class && args.empty? && t == :dyn then i.op = :call; i.args = [fn(:__dyn_class_name), recv]; i.ty = :str; return end
       if %i[=~ match match? !~].include?(name) && args.size == 1 && of(f, args[0]) == :nil && @settled # `s =~ nil` in a branch the guard rules out: nil (never a match)
         i.op = :const; i.args = [0]; i.ty = name == :!~ ? :bool : :nil; return
@@ -1534,6 +1580,9 @@ module Indus
       if name == :<=> && (t == :int || t == :str || t == :float)
         at = of(f, args[0])
         return unless at # the argument's type decides the callee
+        if t != :str && big?(at) # 1 <=> bignum: through the Bignum compare
+          l = coerce(f, i.block, i, recv, BIG); i.op = :call; i.args = [fn(:__big_cmp), l, args[0]]; i.ty = :int; return
+        end
         if at != :dyn && !(t == :str ? at == :str : %i[int float int?].include?(at)) # 1 <=> "a": nil (not comparable)
           i.op = :const; i.args = [0]; i.ty = :nil; return
         end

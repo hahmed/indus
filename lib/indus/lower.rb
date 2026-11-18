@@ -1348,7 +1348,7 @@ module Indus
     def expr(n)
       case n
       when Prism::IntegerNode
-        if n.value >= -(1 << 63) && n.value < (1 << 64) then const(n.value) # (an unsigned 64-bit pattern such as 0x8000000000000000 stays a word: the prelude's float tables)
+        if n.value >= -(1 << 63) && (n.value < (1 << 63) || n.value < (1 << 64) && n.location.start_line <= (Lower.prelude_lines || 0)) then const(n.value) # (an unsigned 64-bit pattern such as 0x8000000000000000 stays a word in the prelude: its float tables)
         else # a Bignum literal: the limb array lib/indus/rt/big.rb uses ([sign, limb0, limb1, ...], base 2**31, little-endian), typed BIG
           mag = n.value.abs; limbs = []
           while mag > 0 do limbs << (mag & 0x7fffffff); mag >>= 31 end
