@@ -72,6 +72,7 @@ module Indus
       @ivars = superclass ? superclass.ivars.dup : [] # parent's fields first, same offsets
     end
     def ivar(n) = (@ivars << n unless @ivars.include?(n); @ivars.index(n))
+    def share_ivars(other) = (@ivars = other.ivars) # the same array: a field named on either shows on both
     # a class that ever meets another in a poly slot carries its id in word 0
     def base = tagged ? 8 : 0
     def size = @ivars.size * 8 + base

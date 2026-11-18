@@ -532,7 +532,9 @@ module Indus
         @single_subs ||= {}
         sub = @single_subs[key] ||= begin
           @single_count = (@single_count || 0) + 1
-          s = @classes[:"#{base.name}$#{@single_count}"] = Klass.new(:"#{base.name}$#{@single_count}", base); s.id = @classes.size; s
+          s = @classes[:"#{base.name}$#{@single_count}"] = Klass.new(:"#{base.name}$#{@single_count}", base); s.id = @classes.size
+          s.share_ivars(base) # a singleton's ivars are slots of the object as allocated by the base: one layout for both
+          s
         end
         defs.each do |d|
           f = Func.new(:"#{sub.name}##{d.name}#{sub.methods[d.name] ? "@v#{(sub.methods[d.name].versions || []).size + 1}" : ""}", 1 + def_param_names(d).size)
@@ -882,6 +884,7 @@ module Indus
     end
 
     attr_reader :modules
+    public :modules
 
     # `x << a << b`: the local or ivar at the root of the chain, nil when it is an integer local
     # x[k] = v for a receiver that is a hash or an array (Types decides which store)
@@ -969,6 +972,8 @@ module Indus
           if classes.size == 1 && (rk = @classes[classes[0]])
             descendants = @classes.values.select { |c| !c.equal?(rk) && !c.closure && (a = c.superclass; a = a.superclass while a && !a.equal?(rk); a) }
             overriding = descendants.select { |c| c.methods.keys.any? { |m| rk.find_method(m) } }
+            # e.class / e.inspect / e.is_a? read the real class: the set then too
+            overriding = descendants if overriding.empty? && !descendants.empty? && body.any? { |st| reads_class_of?(st, ref.name) }
             @locals[lname(ref.name)] = overriding.empty? ? emit(:unbox, [exc, classes[0]]) : (u = emit(:unbox, [exc, [:poly, [rk.name, *descendants.map(&:name)].sort]]); u)
           else
             @locals[lname(ref.name)] = exc
@@ -1517,7 +1522,7 @@ module Indus
         if (bv = @locals[@block_param || :__none]) && !@block # yield in a method holding its block as a value
           return emit(:mcall, [:call, bv, *(n.arguments&.arguments || []).map { expr(_1) }])
         end
-        if @block == :none then emit(:trap, []); return nil_const end # a yielder called without a block: yield raises LocalJumpError in Ruby
+        if @block == :none then emit(:call, [demand(:__raise_local_jump), emit(:sconst, ["no block given (yield)"])]); return nil_const end # a yielder called without a block
         raise "yield outside an inlined block method" unless @block
         yield_block(n.arguments&.arguments || [])
       when Prism::RangeNode then range_array(n) # a Range as a value: its elements (each/map/times fuse before reaching here)
@@ -1570,6 +1575,9 @@ module Indus
         l = expr(n.left)
         l.ty == :nil ? l : and_value(l) { expr(n.right) }
       when Prism::IndexTargetNode then raise "unsupported index target"
+      when Prism::SingletonClassNode # class << obj as a statement: obj joins its hidden subclass (defs were collected by scan_singletons)
+        if (sub = @singletons&.[](n)) then emit(:retag, [expr(n.expression), sub]); return nil_const end
+        raise "unsupported: class << #{n.expression.class} here"
       when Prism::DefNode # a def reached as a statement: a later definition writes the method's slot; the first is already compiled
         if (sub = @singletons&.[](n)) then emit(:retag, [expr(n.receiver), sub]); return (c = const(sym_id(n.name.to_s)); c.ty = :sym; c) end # def x.m: x joins the hidden subclass
         if (pv = @def_versions[n]) then emit(:setslot, pv) end
@@ -1586,7 +1594,29 @@ module Indus
       return node.each { scan_singletons(_1, &blk) } if node.is_a?(Array)
       return unless node.is_a?(Prism::Node)
       case node
-      when Prism::ClassNode, Prism::ModuleNode, Prism::SingletonClassNode then return
+      when Prism::SingletonClassNode # class << obj ... end (obj not self): its defs and attr_* are singleton methods of obj
+        return if node.expression.is_a?(Prism::SelfNode) || node.expression.is_a?(Prism::ConstantReadNode)
+        src = node.send(:source); loc = node.location
+        defs = (node.body&.body || []).flat_map do |st|
+          case st
+          when Prism::DefNode then st.receiver ? raise("class << x: def self.m inside is not supported") : [st]
+          when Prism::CallNode
+            raise "class << x: #{st.name} inside is not supported" unless %i[attr_accessor attr_reader attr_writer].include?(st.name) && st.receiver.nil?
+            st.arguments.arguments.flat_map do |a|
+              nm = a.unescaped.to_sym; iv = :"@#{nm}"; out = []
+              if st.name != :attr_writer
+                out << Prism::DefNode.new(src, 0, loc, 0, nm, loc, nil, nil, Prism::StatementsNode.new(src, 0, loc, 0, [Prism::InstanceVariableReadNode.new(src, 0, loc, 0, iv)]), [], loc, nil, nil, nil, nil, nil)
+              end
+              if st.name != :attr_reader
+                ps = Prism::ParametersNode.new(src, 0, loc, 0, [Prism::RequiredParameterNode.new(src, 0, loc, 0, :v)], [], nil, [], [], nil, nil)
+                out << Prism::DefNode.new(src, 0, loc, 0, :"#{nm}=", loc, nil, ps, Prism::StatementsNode.new(src, 0, loc, 0, [Prism::InstanceVariableWriteNode.new(src, 0, loc, 0, iv, loc, Prism::LocalVariableReadNode.new(src, 0, loc, 0, :v, 0), loc)]), [:v], loc, nil, nil, nil, nil, nil)
+              end
+              out
+            end
+          else raise "class << x: #{st.class} inside is not supported" end
+        end
+        blk.call(node, node.expression, defs); return
+      when Prism::ClassNode, Prism::ModuleNode then return
       when Prism::DefNode
         if node.receiver && !node.receiver.is_a?(Prism::SelfNode) then blk.call(node, node.receiver, [node.copy(receiver: nil)]); return end
       when Prism::CallNode
@@ -1816,6 +1846,11 @@ module Indus
         @cur = ob; ov = emit(:mcall, [n.name, rv]); emit(:br, [mb])
         @cur = mb; ph = mb.phi; ph.args = [[nb, nv], [ob, ov]]
         return ph
+      end
+      # obj[k] / obj[k] = v on an object whose class (or a singleton subclass of it) defines [] / []=: a method call
+      if n.receiver && !n.block && %i[[] []=].include?(n.name) && (k = kind_of(n.receiver)).is_a?(Symbol) && (kk = @classes[k]) && (kk.find_method(n.name) || @classes.each_value.any? { |c| c.superclass == kk && c.name.to_s.include?("$") && c.find_method(n.name) })
+        rv = expr(n.receiver)
+        return emit(:mcall, [n.name, rv, *object_args(n, args, kk, rv)])
       end
       if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send __send__ respond_to? extend define_singleton_method methods public_methods singleton_methods singleton_class instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
         rv = expr(n.receiver)
@@ -3991,6 +4026,14 @@ module Indus
       return true if node.is_a?(klass)
       node.compact_child_nodes.any? { has_node?(_1, klass) }
     end
+    # does the statement ask e's identity (e.class, e.inspect, e.is_a?, case e when ...)?
+    def reads_class_of?(node, name)
+      return false unless node.is_a?(Prism::Node)
+      return true if node.is_a?(Prism::CallNode) && node.receiver.is_a?(Prism::LocalVariableReadNode) && node.receiver.name == name && %i[class inspect is_a? kind_of? instance_of? to_s].include?(node.name)
+      return true if node.is_a?(Prism::CaseNode) && node.predicate.is_a?(Prism::LocalVariableReadNode) && node.predicate.name == name
+      node.compact_child_nodes.any? { reads_class_of?(_1, name) }
+    end
+
     def has_global?(node, name)
       return false unless node.is_a?(Prism::Node)
       return true if node.is_a?(Prism::GlobalVariableReadNode) && node.name == name

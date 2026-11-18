@@ -141,6 +141,7 @@ module Indus
           when Prism::YieldNode then (n.arguments&.arguments&.each { expr(_1, env, klass, fkey) }; nil)
           when Prism::AndNode, Prism::OrNode then (expr(n.left, env, klass, fkey); expr(n.right, env, klass, fkey); :bool)
           when Prism::CallNode then call(n, env, klass, fkey)
+          when Prism::SingletonClassNode then (expr(n.expression, env, klass, fkey) unless n.expression.is_a?(Prism::SelfNode); nil) # class << x: x's kind is needed
           when Prism::DefNode then (expr(n.receiver, env, klass, fkey) if n.receiver && !n.receiver.is_a?(Prism::SelfNode); nil) # def x.m: x's kind is wanted
           when Prism::LambdaNode, Prism::BreakNode, Prism::NextNode, Prism::ClassNode, Prism::ModuleNode then nil
           else nil

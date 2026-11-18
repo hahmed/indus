@@ -858,6 +858,16 @@ class KeyError < IndexError
 end
 class NameError < StandardError
 end
+class LocalJumpError < StandardError
+end
+class FrozenError < RuntimeError
+end
+class SyntaxError < ScriptError
+end
+class EncodingError < StandardError
+end
+class RegexpError < StandardError
+end
 class RangeError < StandardError
 end
 class FloatDomainError < RangeError
@@ -1553,6 +1563,7 @@ end
 def __raise_coerce(what, into)
   raise TypeError, what + " can't be coerced into " + into
 end
+def __raise_local_jump(msg) = raise(LocalJumpError, msg)
 def __raise_name_error(msg)
   raise NameError, msg
 end
