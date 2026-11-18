@@ -530,7 +530,7 @@ def __str_succ(s)
 end
 
 def __str_times(s, n)
-  __trap if n < 0
+  raise(ArgumentError, "negative argument") if n < 0
   len = s.length
   out = __salloc(len * n)
   i = 0
@@ -1226,7 +1226,7 @@ def __hash_values(h)
 end
 
 def __hash_fetch(h, k)
-  __trap unless __hkey_p(h, k) # KeyError
+  raise(KeyError, "key not found") unless __hkey_p(h, k)
   h[k]
 end
 
@@ -1592,6 +1592,8 @@ def __raise_coerce(what, into)
 end
 def __raise_local_jump(msg) = raise(LocalJumpError, msg)
 def __raise_type_error(msg) = raise(TypeError, msg)
+def __raise_no_method(msg) = raise(NoMethodError, msg)
+def __raise_index_error(msg) = raise(IndexError, msg)
 def __raise_arg_error(msg) = raise(ArgumentError, msg)
 def __raise_name_error(msg)
   raise NameError, msg

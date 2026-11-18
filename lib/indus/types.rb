@@ -1297,6 +1297,13 @@ module Indus
 
     # before `i`: branch on v being the nil word; the nil arm yields the String `nil_text`, the other arm what the
     # block builds in its block; the rest of i's block (from i on) continues at the join. Returns the join phi.
+    # a call the types prove undefined: Ruby's NoMethodError, rescuable (the old brk trap was not)
+    def self.no_method_error(i, msg)
+      m = Inst.new(:sconst, [msg]); m.ty = :str; m.block = i.block
+      i.block.insts.insert(i.block.insts.index(i), m)
+      i.op = :call; i.args = [fn(:__raise_no_method), m]; i.ty = :nil
+    end
+
     # a lambda called with the wrong number of arguments: the call becomes Ruby's ArgumentError
     def self.arity_error(f, i, given, expected)
       m = Inst.new(:sconst, ["wrong number of arguments (given #{given}, expected #{expected})"]); m.ty = :str; m.block = i.block
@@ -1508,7 +1515,7 @@ module Indus
         if arms.all? { |(_, kind, _)| kind == :trap }
           return unless @settled # a field read whose set is provisional (a tagged scalar may still arrive and make it dyn): wait
           # none of the classes has it: Ruby's NoMethodError if this ever runs (a shim's unused matcher, dead code typed anyway)
-          tr = Inst.new(:trap, ["undefined method '#{name}' for an instance of #{t[1].join('/')} (NoMethodError)"]); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr)
+          no_method_error(i, "undefined method '#{name}' for an instance of #{t[1].join('/')}"); return
           i.op = :const; i.args = [0]; i.ty = :nil; return
         end
         if arms.all? { |(_, kind, payload)| kind == :call && payload.equal?(arms[0][2]) } # one function for the whole set: no dispatch needed
@@ -1669,8 +1676,7 @@ module Indus
           i.op = :call; i.args = [of_, bx, *args]; i.ty = nil; of_.ptypes[0] = :dyn; return
         end
         return unless @settled
-        tr = Inst.new(:trap, ["undefined method '#{name}' for an instance of #{klass.name} (NoMethodError)"]); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr) # NoMethodError at run time
-        i.op = :const; i.args = [0]; i.ty = :nil; return # the value after a trap: never read
+        no_method_error(i, "undefined method '#{name}' for an instance of #{klass.name}"); return
       end
       kind, payload = resolve(klass, name, args.size, allow_missing: true)
       if kind == :call && klass.closure && name == :call && args.size != payload.params.size - 1 # proc arity: missing args are nil, extras dropped (or gathered by *rest)
@@ -1806,8 +1812,7 @@ module Indus
       elsif classes_of(t) # an object: its own [] / []= method
         i.args = [i.op == :idx ? :[] : :[]=, *i.args]; i.op = :mcall; i.ty = nil; bind(f, i)
       elsif t == :nil && @settled # indexing nil: dead code behind a nil? guard, or a NoMethodError at run time: trap, and the value is a constant
-        tr = Inst.new(:trap, ["undefined method '[]' for nil (NoMethodError)"]); tr.ty = :int; tr.block = i.block; i.block.insts.insert(i.block.insts.index(i), tr)
-        i.op = :const; i.args = [0]; i.ty = :nil
+        no_method_error(i, "undefined method '[]' for nil")
       elsif t == :nil then nil
       elsif t == :int && i.args.size == 2 && !@settled.nil? && of(f, i.args[1]) == :int # n[k]: bit k
         one = Inst.new(:const, [1]); one.ty = :int; one.block = i.block; i.block.insts.insert(i.block.insts.index(i), one)

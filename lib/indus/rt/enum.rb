@@ -817,7 +817,7 @@ def __arr_transpose(a)
     row = []
     i = 0
     while i < a.length
-      __trap if a[i].length != w # ragged rows: IndexError in Ruby
+      raise(IndexError, "element size differs") if a[i].length != w # ragged rows
       row.push(a[i][j])
       i = i + 1
     end
