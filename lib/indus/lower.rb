@@ -2743,9 +2743,11 @@ module Indus
       when :__box_arr then emit(:box, [expr(args[0]), [:arr, :dyn]])
       when :__box_hash then emit(:box, [expr(args[0]), [:hash, :dyn, :dyn]])
       when :__box_float then emit(:box, [expr(args[0]), :float])
+      when :__box_bignum then emit(:box, [expr(args[0]), Types::BIG])
       when :__unbox_int then emit(:unbox, [expr(args[0]), :int])
       when :__unbox_str then emit(:unbox, [expr(args[0]), :str])
       when :__unbox_arr then emit(:unbox, [expr(args[0]), [:arr, :dyn]])
+      when :__as_big then (c = emit(:nop, [expr(args[0])]); c.ty = Types::BIG; c) # an integer word that is a Bignum limb array's handle
       when :__unbox_float then emit(:unbox, [expr(args[0]), :float])
       when :__unbox_bool then emit(:unbox, [expr(args[0]), :bool])
       when :__sym_of_id then (c = emit(:nop, [expr(args[0])]); c.ty = :sym; c) # an integer id as a Symbol

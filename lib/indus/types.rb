@@ -19,6 +19,7 @@ module Indus
       return :float if (a == :int && b == :float) || (a == :float && b == :int)
       intish = ->(t) { t == :int || t == :int? || t.nil? }
       return BIG if (big?(a) && (intish.(b) || arr(b) && intish.(b[1]))) || (big?(b) && (intish.(a) || arr(a) && intish.(a[1])))
+      return :dyn if (big?(a) || big?(b)) && !(arr(a) && arr(b)) # a Bignum beside a float / string / object: tagged
       return :int? if (a == :int? && b == :nil) || (a == :nil && b == :int?)
       return :strbuf if (a == :str && b == :strbuf) || (a == :strbuf && b == :str) # a string that grew a stable handle
       return [:arr, join_elem(a[1], b[1])] if arr(a) && arr(b)
@@ -225,7 +226,7 @@ module Indus
               i.op = :aset; i.args = [i.args[0], len, i.args[1]]; changed = true
             end
             dsend(f, i) if i.op == :dsend
-            float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float
+            float_print(f, i) if %i[puts_v p_v print_v].include?(i.op) && of(f, i.args[0]) == :float && (@settled || i.args[0].op == :fconst || i.args[0].op == :itof) # a float that may still widen to dyn (an element, a sum of elements): wait
             if %i[puts_v p_v print_v to_s inspect_v].include?(i.op) && big?(of(f, i.args[0])) # Bignum prints through the prelude (p/inspect: the digits, unquoted)
               c = Inst.new(:call, [fn(:__big_to_s), i.args[0]]); c.ty = :str; c.block = i.block
               i.block.insts.insert(i.block.insts.index(i), c)
@@ -279,7 +280,7 @@ module Indus
               z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
               i.args = [c, z]; i.cond = i.cond == :eq ? :ne : :eq; changed = true # (a == b) is (eq_result != 0)
             end
-            if %i[add sub mul div mod cmp and or xor shl shr pow].include?(i.op) && (big?(of(f, i.args[0])) || big?(of(f, i.args[1]))) && !@no_big_rewrite
+            if %i[add sub mul div mod cmp and or xor shl shr pow].include?(i.op) && (big?(of(f, i.args[0])) || big?(of(f, i.args[1]))) && !@no_big_rewrite && i.args.all? { |a| (ta = of(f, a)) && (big?(ta) || %i[int int? dyn].include?(ta)) } # both operands typed and liftable
               big_op(f, i); changed = true
             end
             # 2**64 / 10**20: an integer power whose value cannot be 64-bit (both operands literal) is a Bignum
@@ -1040,6 +1041,7 @@ module Indus
     # unboxes it later finds raw words. Widened at the container's origin. True if changed.
     def self.widen_elements_to_dyn(f, v, dest = :dyn)
       t = of(f, v)
+      return false if big?(t) || (v.op == :call && v.args[0].is_a?(Func) && v.args[0].name.to_s.start_with?("__big_")) # a Bignum boxes as its own leaf (tag 14, 16 bytes): the limbs stay integers
       nt = if dest == :dyn then arr(t) ? [:arr, :dyn] : hsh(t) ? [:hash, :dyn, :dyn] : nil
            else (arr(t) && arr(dest) || hsh(t) && hsh(dest)) ? join(t, dest) : nil end # the slot's own shape
       return false if nt.nil? || t == nt
@@ -1428,6 +1430,7 @@ module Indus
     end
 
     # :mcall name, recv, args -> :call Func / :fld_get / :fld_set
+    BIG_INTARR_RESULTS = %i[__big_digits __big_twos __big_divmod __big_coerce __big_gcdlcm].freeze # __big_ functions whose arrays are not Bignums
     BIG_METHODS = { even?: [:__big_even_p, :bool], odd?: [:__big_odd_p, :bool], zero?: [:__big_zero_p, :bool], negative?: [:__big_negative_p, :bool],
                     abs: [:__big_abs, :big], magnitude: [:__big_abs, :big], :-@ => [:__big_neg, :big], :~ => [:__big_not, :big], to_s: [:__big_to_s, :str], inspect: [:__big_to_s, :str],
                     to_i: [nil, :big], to_int: [nil, :big], to_f: [:__big_to_f, :float], hash: [:__big_hash, :int], bit_length: [:__big_bit_length, :int], size: [:__big_size, :int],
@@ -1452,9 +1455,16 @@ module Indus
           return
         end
         if name == :digits && args.empty? then args = [Inst.new(:const, [10]).tap { _1.ty = :int; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) }] end
-        if %i[gcd lcm divmod remainder div modulo <=> eql? coerce].include?(name) # a binary op: the argument lifted to BIG; <=> with a non-integer is nil
+        if %i[gcd lcm divmod remainder div modulo <=> eql? coerce fdiv].include?(name) # a binary op: the argument lifted to BIG; <=> with a non-integer is nil
           at = of(f, args[0]); return unless at
           if name == :<=> && !(%i[int int? float].include?(at) || big?(at)) then i.op = :const; i.args = [0]; i.ty = :nil; return end
+          if at == :float # bignum <=> float / bignum.fdiv(float): through the float value
+            bf = Inst.new(:call, [fn(:__big_to_f), recv]); bf.ty = :float; bf.block = i.block; i.block.insts.insert(i.block.insts.index(i), bf)
+            if name == :<=> then i.op = :call; i.args = [fn(:__num_spaceship), bf, args[0]]; i.ty = :int
+            elsif name == :fdiv then i.op = :div; i.args = [bf, args[0]]; i.ty = :float
+            else i.op = :call; i.args = [fn(:__raise_type_error), Inst.new(:sconst, ["Float can't be coerced into Integer"]).tap { _1.ty = :str; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) }]; i.ty = :nil end
+            return
+          end
           if name == :eql? && !big?(at) then i.op = :const; i.args = [0]; i.ty = :bool; return end
           args[0] = coerce(f, i.block, i, args[0], BIG) unless big?(at)
         end
@@ -1500,6 +1510,7 @@ module Indus
       if name == :+ && args.size == 1 && t == :str then i.op = :scat; i.args = [recv, args[0]]; i.ty = :str; return end
       if name == :class && args.empty? && (cn = { int: "Integer", float: "Float", str: "String", sym: "Symbol", bool: "TrueClass", nil: "NilClass" }[t] || (arr(t) && "Array") || (hsh(t) && "Hash"))
         return if t == :bool || t == :nil && recv.op != :const # true/false share a type; a joined nil may still widen
+        return if !@settled && %i[aget hget hval_at idx phi apop].include?(recv.op) # an element may still widen to dyn
         i.op = :sconst; i.args = [cn]; i.ty = :str; return
       end
       if t == :str && args.empty? && name == :name then i.op = :nop; i.args = [recv]; i.ty = :str; return end # a class value is its name (no class objects at run time)
@@ -1698,8 +1709,8 @@ module Indus
       if t == :float && args.size == 1 && name == :fdiv then i.op = :div; i.args = [recv, args[0]]; i.ty = :float; return end
       if t == :float && args.size == 1 && name == :divmod then i.op = :call; i.args = [fn(:__float_divmod), recv, args[0]]; return end
       if t == :int && args.size == 1 && name == :divmod && of(f, args[0]) == :float then i.op = :call; i.args = [fn(:__float_divmod), recv, args[0]]; return end
-      fam = hsh(t) ? "hash" : (t == :int || t == :float || t == :int?) ? "num" : t == :str ? "str" : arr(t) ? "arr" : t == :sym ? "sym" : t == :nil ? "nil" : t == :bool ? "bool" : nil
-      if fam && %w[sym nil bool].include?(fam) && !prelude_method(fam, name, args.size) && prelude_method("obj", name, args.size) then fam = "obj" end # a `class Object` def reached through a Symbol/nil/bool
+      fam = hsh(t) ? "hash" : (t == :int || t == :float || t == :int?) ? "num" : t == :str ? "str" : big?(t) ? "big" : arr(t) ? "arr" : t == :sym ? "sym" : t == :nil ? "nil" : t == :bool ? "bool" : nil
+      if fam && %w[sym nil bool big].include?(fam) && !prelude_method(fam, name, args.size) && prelude_method("obj", name, args.size) then fam = "obj" end # a `class Object` def reached through a Symbol/nil/bool/Bignum
       if fam && (fn = prelude_method(fam, name, args.size))
         if fam == "str" && args.any? { |a| a.op == :const && a.ty == :nil } # "s".index(nil): TypeError, not a null read
           w = Inst.new(:sconst, ["String"]); w.ty = :str; w.block = i.block; i.block.insts.insert(i.block.insts.index(i), w)
@@ -2008,7 +2019,9 @@ module Indus
       when :call
         # a generic prelude function may still be swapped for an instance once the argument
         # types are known: commit to no result type before then
-        generic?(a[0]) && (a[1..].any? { |v| of(f, v).nil? } || deferred_generic?(a[0], a[1..].map { of(f, _1) })) ? nil : a[0].rtype
+        rt = generic?(a[0]) && (a[1..].any? { |v| of(f, v).nil? } || deferred_generic?(a[0], a[1..].map { of(f, _1) })) ? nil : a[0].rtype
+        rt = BIG if rt && arr(rt) && %i[int int?].include?(rt[1]) && a[0].name.to_s.start_with?("__big_") && !BIG_INTARR_RESULTS.include?(a[0].name) # the Bignum library's arrays are Bignums
+        rt
       when :todyn then :dyn
       when :itof, :ffrom then :float
       when :onew then (subs = @classes.values.select { |c| c.superclass.equal?(a[0]) && c.name.to_s.include?("$") }).empty? ? a[0].name : [:poly, [a[0].name, *subs.map(&:name)].sort] # an object that may be retagged to a hidden subclass (def x.m): the set
@@ -2147,7 +2160,7 @@ module Indus
       when :str then :__dyn_str
       when :sym then :__dyn_sym
       when :float then :__dyn_float
-      else arr(dest) ? :__dyn_arr : hsh(dest) ? :__dyn_hash : nil
+      else big?(dest) ? :__dyn_to_big : arr(dest) ? :__dyn_arr : hsh(dest) ? :__dyn_hash : nil
       end
     end
 
@@ -2158,8 +2171,10 @@ module Indus
       c = case
           when dest == :float && (t == :int || t == :int?) then Inst.new(:itof, [v]).tap { _1.ty = :float } # a nil here would have raised already
           when dest == :dyn && t != :dyn then Inst.new(:box, [v, t]).tap { _1.ty = :dyn }
+          when big?(dest) && t == :dyn then Inst.new(:call, [fn(:__dyn_to_big), v]).tap { _1.ty = BIG } # a Bignum that travelled boxed (an ivar, a container): tag 4 as its limbs, a fixnum lifted
           when t == :dyn && (un = unbox_fn(dest)) then Inst.new(:call, [fn(un), v]).tap { _1.ty = dest } # a tagged value into a typed slot: unbox, trapping on the wrong tag
           when big?(dest) && %i[int int?].include?(t) then Inst.new(:call, [fn(:__big_from_int), v]).tap { _1.ty = BIG }
+          when big?(dest) && arr(t) && t[1] == :dyn && v.op == :call && v.args[0].name == :__dyn_arr then Inst.new(:call, [fn(:__dyn_to_big), v.args[1]]).tap { _1.ty = BIG } # the same, already half-unboxed
           else return v
           end
       c.block = blk

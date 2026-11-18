@@ -284,7 +284,14 @@ module Indus
             @asm.emit(0x910043FF)                                              # add sp, sp, #16
             @asm.emit(0xB27F0800 | (0 << 5) | d)                               # orr d, x0, #14
           else
-            if t.is_a?(Array) && t[0] == :arr then @asm.emit(0xB27E0000 | (r << 5) | 16); @asm.cmpi(r, 0); @asm.emit(0x9A8003E0 | (16 << 16) | d)      # orr x16, r, #4 ; nil (0) stays 0
+            if t.is_a?(Array) && t[0] == :arr && t[2] == :big # a Bignum: a 16-byte leaf (word 0 the limb array) under the Float tag; the length tells them apart
+              @asm.emit(0xF81F0FE0 | (r & 31) | 0) if false
+              @asm.str_off(r, 31, -16) if false
+              @asm.emit(0xA9BF03E0 | (r << 10) | (r << 0) | (31 << 5)) # stp r, r, [sp, #-16]!
+              @asm.addi(0, 31, 0); @asm.mov_imm(1, 16); @asm.bl(:rt_str_new)
+              @asm.emit(0x910043FF)                                    # add sp, sp, #16
+              @asm.emit(0xB27F0800 | (0 << 5) | d)                     # orr d, x0, #14
+            elsif t.is_a?(Array) && t[0] == :arr then @asm.emit(0xB27E0000 | (r << 5) | 16); @asm.cmpi(r, 0); @asm.emit(0x9A8003E0 | (16 << 16) | d)      # orr x16, r, #4 ; nil (0) stays 0
             elsif t.is_a?(Array) && t[0] == :hash then @asm.emit(0xB27F0400 | (r << 5) | 16); @asm.cmpi(r, 0); @asm.emit(0x9A8003E0 | (16 << 16) | d)   # orr x16, r, #6
             else # object: orr d, r, #8 -- unless the slot holds nil (the 0 word), which stays the dyn nil (0)
               @asm.emit(0xB27D0000 | (r << 5) | 16)                                            # orr x16, r, #8

@@ -158,6 +158,7 @@ def __dyn_to_s(v)
     return __unbox_str(v)
   end
   if t == 14
+    return __big_to_s(__unbox_big(v)) if __big_p(v)
     return __float_to_s(__unbox_float(v))
   end
   if t == 10
@@ -223,6 +224,7 @@ def __dyn_num(v)
     return __unbox_int(v).to_f
   end
   if t == 14
+    return __big_to_f(__unbox_big(v)) if __big_p(v)
     return __unbox_float(v)
   end
   __trap
@@ -233,10 +235,15 @@ def __dyn_both_int(a, b)
   (__tag(a) & 1 == 1) && (__tag(b) & 1 == 1)
 end
 
+# a fixnum or a Bignum
+def __dyn_intish(v) = (__tag(v) & 1 == 1) || __big_p(v)
+# a Bignum result as a tagged value: a fixnum when it fits
+def __box_big(r) = __big_fits_p(r) ? __box_int(__big_to_int(r)) : __box_bignum(r)
 def __dyn_add(a, b)
   if __dyn_both_int(a, b)
     return __box_int(__unbox_int(a) + __unbox_int(b))
   end
+  return __box_big(__big_add(__dyn_to_big(a), __dyn_to_big(b))) if __dyn_intish(a) && __dyn_intish(b)
   if __tag(a) == 4 && __tag(b) == 4
     return __box_arr(__arr_plus(__unbox_arr(a), __unbox_arr(b)))
   end
@@ -250,6 +257,7 @@ def __dyn_sub(a, b)
   if __dyn_both_int(a, b)
     return __box_int(__unbox_int(a) - __unbox_int(b))
   end
+  return __box_big(__big_sub(__dyn_to_big(a), __dyn_to_big(b))) if __dyn_intish(a) && __dyn_intish(b)
   __box_float(__dyn_num(a) - __dyn_num(b))
 end
 
@@ -257,6 +265,7 @@ def __dyn_mul(a, b)
   if __dyn_both_int(a, b)
     return __box_int(__unbox_int(a) * __unbox_int(b))
   end
+  return __box_big(__big_mul(__dyn_to_big(a), __dyn_to_big(b))) if __dyn_intish(a) && __dyn_intish(b)
   __box_float(__dyn_num(a) * __dyn_num(b))
 end
 
@@ -264,6 +273,7 @@ def __dyn_mod(a, b)
   if __dyn_both_int(a, b)
     return __box_int(__unbox_int(a) % __unbox_int(b))
   end
+  return __box_big(__big_mod(__dyn_to_big(a), __dyn_to_big(b))) if __dyn_intish(a) && __dyn_intish(b)
   __box_float(__dyn_num(a) % __dyn_num(b))
 end
 
@@ -280,6 +290,11 @@ def __dyn_eq(a, b)
   end
   if __dyn_both_int(a, b)
     return __same(a, b)
+  end
+  if __big_p(a) || __big_p(b) # a Bignum against a Bignum / fixnum (exact) or a Float (by value)
+    return __big_eq(__dyn_to_big(a), __dyn_to_big(b)) if (__big_p(a) || __tag(a) & 1 == 1) && (__big_p(b) || __tag(b) & 1 == 1)
+    return __dyn_num(a) == __dyn_num(b) if __dyn_numeric(a) && __dyn_numeric(b)
+    return false
   end
   if __dyn_numeric(a) && __dyn_numeric(b)
     return __dyn_num(a) == __dyn_num(b)
@@ -322,6 +337,7 @@ def __dyn_lt(a, b)
   if __dyn_both_int(a, b)
     return __unbox_int(a) < __unbox_int(b)
   end
+  return __big_cmp(__dyn_to_big(a), __dyn_to_big(b)) < 0 if __dyn_intish(a) && __dyn_intish(b)
   if __tag(a) == 2 && __tag(b) == 2
     return __unbox_str(a) < __unbox_str(b)
   end
@@ -1307,6 +1323,7 @@ def __dyn_class_name(v)
   return "Array" if t == 4
   return "Hash" if t == 6
   return "Symbol" if t == 12
+  return "Integer" if t == 14 && __big_p(v)
   return "Float" if t == 14
   return (__unbox_bool(v) ? "TrueClass" : "FalseClass") if t == 10
   __class_name(__ld(__unbox_obj_addr(v)))
@@ -1415,6 +1432,7 @@ def __dyn_to_i(v)
   t = __tag(v)
   return __unbox_int(v) if t & 1 == 1
   return __unbox_str(v).to_i if t == 2
+  __trap if t == 14 && __big_p(v) # RangeError in Ruby: bignum too big to convert into 'long'
   return __unbox_float(v).to_i if t == 14
   return 0 if v == 0
   __trap
@@ -1424,6 +1442,7 @@ def __dyn_to_f(v)
   t = __tag(v)
   return __unbox_int(v).to_f if t & 1 == 1
   return __unbox_str(v).to_f if t == 2
+  return __big_to_f(__unbox_big(v)) if t == 14 && __big_p(v)
   return __unbox_float(v) if t == 14
   __trap
   0.0

@@ -186,6 +186,7 @@ end
 def __dyn_to_f(v)
   t = __tag(v)
   return __unbox_int(v).to_f if t & 1 == 1
+  return __big_to_f(__unbox_big(v)) if t == 14 && __big_p(v)
   return __unbox_float(v) if t == 14
   __trap
   0.0

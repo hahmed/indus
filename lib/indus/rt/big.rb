@@ -449,3 +449,13 @@ def __big_digits(a, base)
   out
 end
 def __big_coerce(a, b) = [b, a]
+# a tagged value as a Bignum: a boxed Bignum is tag 4 holding the limb array (the same words, read as integers); a fixnum is lifted
+# a boxed Bignum: tag 14 (shared with the Float box) with a 16-byte payload; word 0 is the limb array
+def __big_p(v) = __tag(v) == 14 && __ld(__handle(v) - 14 - 8) == 16
+def __unbox_big(v) = __as_big(__ld(__handle(v) - 14))
+def __dyn_to_big(v)
+  t = __tag(v)
+  return __big_from_int(__unbox_int(v)) if t & 1 == 1
+  raise(TypeError, "not an Integer") unless __big_p(v)
+  __unbox_big(v)
+end

@@ -37,6 +37,7 @@ classify_one() {
 export -f classify_one; export TDIR INDUS
 mkdir -p "$TDIR/rows"
 if [ -n "${RUBYSPEC_ONLY:-}" ]; then
+  cp "$RUBYSPEC_ONLY" "$TDIR/only"; RUBYSPEC_ONLY="$TDIR/only" # (a process substitution reads once)
   sed "s|^|$DIR/|; s|\$|.rb|" "$RUBYSPEC_ONLY" | xargs -P "$JOBS" -I{} bash -c 'classify_one "$@"' _ {}
   [ -f "$OUT" ] && grep -v -F -f <(sed 's/$/\t/' "$RUBYSPEC_ONLY") "$OUT" > "$TDIR/kept" || : > "$TDIR/kept"
   cat "$TDIR/kept" "$TDIR"/rows/* | sort > "$OUT"
