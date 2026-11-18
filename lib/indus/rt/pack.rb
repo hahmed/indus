@@ -221,6 +221,10 @@ def __arr_pack(a, fmt)
       raise(ArgumentError, "too few arguments") if ai >= a.length
       s = __dyn_to_s(a[ai]); ai = ai + 1
       out = out + __pack_uu(s)
+    elsif letter == "M"
+      raise(ArgumentError, "too few arguments") if ai >= a.length
+      s = __dyn_to_s(a[ai]); ai = ai + 1
+      out = out + __pack_qp(s, explicit == 1 && count > 1 ? count : 72)
     elsif letter == "x"
       n = count == -1 ? 0 : count
       k = 0
@@ -408,6 +412,9 @@ def __str_unpack(s, fmt)
     elsif letter == "u"
       out.push(__box_str(__unpack_uu(s[at, s.length - at])))
       at = s.length
+    elsif letter == "M"
+      out.push(__box_str(__unpack_qp(s[at, s.length - at])))
+      at = s.length
     elsif letter == "x"
       n = count == -1 ? s.length - at : count
       raise(ArgumentError, "x outside of string") if at + n > s.length
@@ -440,6 +447,50 @@ def __arr_to_dyn(a)
   while i < a.length
     out.push(__to_dyn(a[i]))
     i = i + 1
+  end
+  out
+end
+
+# quoted-printable: bytes outside printable ASCII (and = and trailing space) as =XX, soft breaks "=\n" before `width`
+def __pack_qp(s, width)
+  out = ""
+  line = ""
+  i = 0
+  while i < s.length
+    c = __ld8(s, i)
+    if c == 10
+      line = line[0, line.length - 1] + "=20" if line.length > 0 && __ld8(line, line.length - 1) == 32
+      line = line[0, line.length - 1] + "=09" if line.length > 0 && __ld8(line, line.length - 1) == 9
+      out = out + line + "\n"
+      line = ""
+    else
+      piece = (c == 61 || c < 32 || c > 126) && c != 9 && c != 32 ? "=" + __hex2(c) : s[i, 1]
+      if line.length + piece.length > width + 1
+        out = out + line + "=\n"
+        line = ""
+      end
+      line = line + piece
+    end
+    i = i + 1
+  end
+  out = out + line + "=\n" if line.length > 0
+  out
+end
+
+def __unpack_qp(s)
+  out = ""
+  i = 0
+  while i < s.length
+    c = __ld8(s, i)
+    if c == 61 && i + 1 < s.length && __ld8(s, i + 1) == 10 then i = i + 2
+    elsif c == 61 && i + 2 < s.length && __ld8(s, i + 1) == 13 && __ld8(s, i + 2) == 10 then i = i + 3
+    elsif c == 61 && i + 2 < s.length
+      out = out + ((__pack_hex_digit(__ld8(s, i + 1)) << 4) | __pack_hex_digit(__ld8(s, i + 2))).chr
+      i = i + 3
+    else
+      out = out + s[i, 1]
+      i = i + 1
+    end
   end
   out
 end
