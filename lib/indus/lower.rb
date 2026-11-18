@@ -30,6 +30,31 @@ module Indus
     # reads of the given locals become constant reads (an anonymous module/class held in a local)
     class << self; attr_accessor :prelude_lines; end
 
+    BUILTIN_ALIASABLE = %i[String Array Hash Integer Float Symbol Range Regexp].freeze
+    # drop empty `class X < Builtin; end` declarations and rewrite X (bare or Mod::X) to Builtin
+    def self.alias_builtins(node, aliases)
+      case node
+      when Array then node.filter_map { |st| alias_builtins(st, aliases) }
+      when Prism::ClassNode
+        return nil if aliases.key?(node.name) && node.superclass.is_a?(Prism::ConstantReadNode) && (node.body.nil? || node.body.body.empty?)
+        node.copy(body: node.body && alias_builtins(node.body, aliases), superclass: node.superclass && alias_builtins(node.superclass, aliases))
+      when Prism::ConstantReadNode then aliases.key?(node.name) ? Prism::ConstantReadNode.new(node.send(:source), 0, node.location, 0, aliases[node.name]) : node
+      when Prism::ConstantPathNode then aliases.key?(node.name) ? Prism::ConstantReadNode.new(node.send(:source), 0, node.location, 0, aliases[node.name]) : node
+      when Prism::Node
+        fields = node.class.instance_method(:deconstruct_keys).owner == node.class ? node.deconstruct_keys(nil) : {}
+        changed = {}
+        fields.each do |k, v|
+          nv = case v
+               when Prism::Node then alias_builtins(v, aliases)
+               when Array then v.map { |e| e.is_a?(Prism::Node) ? alias_builtins(e, aliases) : e }.compact
+               else v end
+          changed[k] = nv unless nv.equal?(v)
+        end
+        changed.empty? ? node : node.copy(**changed)
+      else node
+      end
+    end
+
     def self.rename_locals(node, names)
       return node.map { rename_locals(_1, names) } if node.is_a?(Array)
       return node unless node.is_a?(Prism::Node)
@@ -123,6 +148,22 @@ module Indus
       unless anon_locals.empty?
         body = Lower.rename_locals(body, anon_locals)
         @ast = @ast.copy(statements: @ast.statements.copy(body: body)) # the pre-typing and every later walk see the constants
+      end
+      # `class MyString < String; end` (empty): an alias of the builtin -- the declaration goes, every reference becomes String
+      aliases = {}
+      find_aliases = ->(stmts) do
+        stmts.each do |st|
+          if st.is_a?(Prism::ClassNode) && st.superclass.is_a?(Prism::ConstantReadNode) && BUILTIN_ALIASABLE.include?(st.superclass.name) && (st.body.nil? || st.body.body.empty?)
+            aliases[st.name] = aliases[st.superclass.name] || st.superclass.name
+          elsif st.is_a?(Prism::ModuleNode) || st.is_a?(Prism::ClassNode) then find_aliases.(st.body&.body || [])
+          end
+        end
+      end
+      find_aliases.(body)
+      unless aliases.empty?
+        body = Lower.alias_builtins(body, aliases)
+        @ast = @ast.copy(statements: @ast.statements.copy(body: body))
+        @builtin_aliases = aliases
       end
       # X.include(Module.new { }) / obj.extend(Module.new { }): the anonymous module gets a name and a declaration
       anon_n = 0
@@ -819,7 +860,7 @@ module Indus
       # the receiver's class unknown: candidates are user classes (the library's own classes -- MatchData, Set, exceptions --
       # take arguments as the builtin families do; packing a *rest for them would mis-shape a Hash#values_at(:a, :b))
       return args.map { expr(_1) } if klass.nil? && n.receiver && (bk = kind_of(n.receiver)) && (bk == :hash || bk == :array || bk == :str || bk == :int || bk == :float || bk == :range) # a builtin receiver: its methods take arguments as given
-      cands = klass ? [klass.find_method(n.name)].compact : @classes.values.filter_map { |k| k.methods[n.name] }
+      cands = klass ? [klass.find_method(n.name)].compact : @classes.values.reject { prelude_class?(_1) }.filter_map { |k| k.methods[n.name] }
       cands = cands.select { @defs_by_func[_1] }
       needs = args.last.is_a?(Prism::KeywordHashNode) || cands.any? { |f| f.rest || @defs_by_func[f].parameters&.then { |ps| ps.optionals.any? || ps.keywords.any? || ps.keyword_rest.is_a?(Prism::KeywordRestParameterNode) } }
       needs ||= args.any? { _1.is_a?(Prism::SplatNode) } # m(*a): the splat is spread by the callee's shape
@@ -4229,6 +4270,8 @@ module Indus
     end
 
     MATH_CONSTS = { PI: Math::PI, E: Math::E }.freeze
+    # Encoding constants by name; strings carry no encoding (all are UTF-8 bytes), the objects exist for comparison and names
+    ENCODINGS = { UTF_8: "UTF-8", US_ASCII: "US-ASCII", ASCII: "US-ASCII", BINARY: "ASCII-8BIT", ASCII_8BIT: "ASCII-8BIT", ISO_8859_1: "ISO-8859-1", UTF_16LE: "UTF-16LE", UTF_16BE: "UTF-16BE", UTF_32LE: "UTF-32LE", UTF_32BE: "UTF-32BE", Shift_JIS: "Shift_JIS", EUC_JP: "EUC-JP", Windows_1252: "Windows-1252", UTF_16: "UTF-16", UTF_32: "UTF-32" }.freeze
     FLOAT_CONSTS = { INFINITY: Float::INFINITY, NAN: Float::NAN, MAX: Float::MAX, MIN: Float::MIN, EPSILON: Float::EPSILON }.freeze
     FLOAT_INT_CONSTS = { DIG: Float::DIG, MAX_EXP: Float::MAX_EXP, MIN_EXP: Float::MIN_EXP, MANT_DIG: Float::MANT_DIG }.freeze
     # the class whose constant a bare name means here: the current class (or class-method owner), then its ancestors
@@ -4241,7 +4284,7 @@ module Indus
       [node.receiver.name, node.arguments.arguments.first.unescaped.to_sym, obj]
     end
 
-    PRELUDE_CLASSES = %i[Exception StandardError RuntimeError ArgumentError TypeError NameError NoMethodError ZeroDivisionError IndexError KeyError StopIteration RangeError FloatDomainError IOError FrozenError NotImplementedError ScriptError NoMemoryError IndusThrow Set Regexp MatchData Struct Comparable Enumerable].freeze
+    PRELUDE_CLASSES = %i[Exception StandardError RuntimeError ArgumentError TypeError NameError NoMethodError ZeroDivisionError IndexError KeyError StopIteration RangeError FloatDomainError IOError FrozenError NotImplementedError ScriptError NoMemoryError IndusThrow Set Regexp MatchData Struct Comparable Enumerable Encoding].freeze
     def prelude_class?(k) = PRELUDE_CLASSES.include?(k.name) || k.name.to_s.start_with?("__")
 
     def has_const?(name) # Klass::X or a top-level X
@@ -4284,6 +4327,9 @@ module Indus
         return emit(:mcall, [:"__const_#{n.name}", expr(n.parent.receiver)]) # self.class::X: the receiver's class decides at run time (a synthesized reader per class)
       end
       return fconst(MATH_CONSTS.fetch(n.name)) if n.parent.is_a?(Prism::ConstantReadNode) && n.parent.name == :Math
+      if n.parent.is_a?(Prism::ConstantReadNode) && n.parent.name == :Encoding && ENCODINGS.key?(n.name) # Encoding::UTF_8: the library's Encoding object
+        return emit(:call, [demand(:__encoding_of), emit(:sconst, [ENCODINGS[n.name]])])
+      end
       if n.parent.is_a?(Prism::ConstantReadNode) && n.parent.name == :Float
         return fconst(FLOAT_CONSTS[n.name]) if FLOAT_CONSTS.key?(n.name)
         return const(FLOAT_INT_CONSTS[n.name]) if FLOAT_INT_CONSTS.key?(n.name)

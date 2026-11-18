@@ -866,6 +866,33 @@ class SyntaxError < ScriptError
 end
 class EncodingError < StandardError
 end
+# Strings here are byte strings read as UTF-8; an Encoding is a name. force_encoding / encode keep the bytes.
+class Encoding
+  def initialize(name) = @name = name
+  def name = @name
+  def to_s = @name
+  def inspect = "#<Encoding:" + @name + ">"
+  def ==(o) = o.is_a?(Encoding) && @name == o.name
+  def ascii_compatible? = @name != "UTF-16LE" && @name != "UTF-16BE" && @name != "UTF-32LE" && @name != "UTF-32BE" && @name != "UTF-16" && @name != "UTF-32"
+  def dummy? = @name == "UTF-16" || @name == "UTF-32"
+end
+def __encoding_of(name) = Encoding.new(__encoding_canonical(name))
+def __encoding_canonical(name)
+  u = name.upcase
+  return "UTF-8" if u == "UTF-8" || u == "UTF8"
+  return "US-ASCII" if u == "US-ASCII" || u == "ASCII"
+  return "ASCII-8BIT" if u == "ASCII-8BIT" || u == "BINARY"
+  name
+end
+def __str_encoding(s) = Encoding.new("UTF-8")
+def __str_force_encoding(s, e) = s
+def __str_encode(s, e) = s
+def __str_encode0(s) = s
+def __str_b(s) = s
+def __str_valid_encoding_p(s) = true
+def __str_ascii_only_p(s) = __ascii_p(s)
+def __str_unicode_normalize(s) = s
+def __str_scrub(s) = s
 class RegexpError < StandardError
 end
 class RangeError < StandardError
