@@ -1602,3 +1602,92 @@ end
 def __raise_no_conversion(into)
   raise TypeError, "no implicit conversion of nil into " + into
 end
+
+# the bang variants: the non-bang result written into s's bytes (never longer than s), nil when nothing changed
+def __str_bang_apply(s, r)
+  return nil if r == s
+  __str_replace_bytes(s, r)
+  s
+end
+def __str_chomp_bang(s) = __str_bang_apply(s, __str_chomp(s))
+def __str_chomp_bang1(s, suffix) = __str_bang_apply(s, __str_chomp1(s, suffix))
+def __str_chop_bang(s) = s.length == 0 ? nil : __str_bang_apply(s, __str_chop(s))
+def __str_strip_bang(s) = __str_bang_apply(s, __str_strip(s))
+def __str_lstrip_bang(s) = __str_bang_apply(s, __str_lstrip(s))
+def __str_rstrip_bang(s) = __str_bang_apply(s, __str_rstrip(s))
+def __str_squeeze_bang(s) = __str_bang_apply(s, __str_squeeze(s))
+def __str_squeeze_bang1(s, set) = __str_bang_apply(s, __str_squeeze1(s, set))
+def __str_delete_bang(s, chars) = __str_bang_apply(s, __str_delete(s, chars))
+def __str_tr_bang(s, from, to) = __str_bang_apply(s, __str_tr(s, from, to))
+def __str_downcase_bang(s) = __str_bang_apply(s, __str_downcase(s))
+def __str_upcase_bang(s) = __str_bang_apply(s, __str_upcase(s))
+def __str_swapcase_bang(s) = __str_bang_apply(s, __str_swapcase(s))
+def __str_capitalize_bang(s) = __str_bang_apply(s, __str_capitalize(s))
+def __str_delete_prefix_bang(s, p) = __str_bang_apply(s, __str_delete_prefix(s, p))
+def __str_delete_suffix_bang(s, p) = __str_bang_apply(s, __str_delete_suffix(s, p))
+def __str_reverse_bang(s) = (__str_replace_bytes(s, __str_reverse(s)); s)
+def __str_succ_bang(s)
+  r = __str_succ(s)
+  __trap if r.length > __ld(__handle(s) - 16)
+  __str_replace_bytes(s, r)
+  s
+end
+def __str_next_bang(s) = __str_succ_bang(s)
+# sub!/gsub! with string patterns: the replacement may lengthen the string -- only when it fits the capacity
+def __str_sub_bang(s, pat, rep)
+  r = __str_sub(s, pat, rep)
+  return nil if r == s
+  __trap if r.length > __ld(__handle(s) - 16)
+  __str_replace_bytes(s, r)
+  s
+end
+def __str_gsub_bang(s, pat, rep)
+  r = __str_gsub(s, pat, rep)
+  return nil if r == s
+  __trap if r.length > __ld(__handle(s) - 16)
+  __str_replace_bytes(s, r)
+  s
+end
+# tr_s: tr, then runs of translated characters squeezed to one
+def __str_tr_s(s, from, to)
+  t = __str_tr(s, from, to)
+  out = ""
+  i = 0
+  prev = -1
+  while i < t.length
+    c = __ld8(t, i)
+    changed = __ld8(s, i) != c
+    out = out + t[i] unless changed && c == prev
+    prev = changed ? c : -1
+    i = i + 1
+  end
+  out
+end
+def __str_tr_s_bang(s, from, to) = __str_bang_apply(s, __str_tr_s(s, from, to))
+def __str_clear(s) = (__st(__handle(s) - 8, 0); s)
+# slice!(i) / slice!(i, len): removes and returns the part
+def __str_slice_bang1(s, i)
+  i = s.length + i if i < 0
+  return nil if i < 0 || i >= s.length
+  r = s[i]
+  __str_replace_bytes(s, s[0, i] + s[i + 1, s.length - i - 1])
+  r
+end
+def __str_slice_bang2(s, start, len)
+  start = s.length + start if start < 0
+  return nil if start < 0 || start > s.length || len < 0
+  len = s.length - start if start + len > s.length
+  r = s[start, len]
+  __str_replace_bytes(s, s[0, start] + s[start + len, s.length - start - len])
+  r
+end
+# byte-position searches: positions here are bytes already
+def __str_byteindex(s, sub, from = 0) = __str_index(s, sub, from)
+def __str_byterindex(s, sub) = __str_rindex(s, sub)
+def __str_bytesplice(s, start, len, v)
+  r = s[0, start] + v + s[start + len, s.length - start - len]
+  __trap if r.length > __ld(__handle(s) - 16)
+  __str_replace_bytes(s, r)
+  s
+end
+def __str_append_as_bytes(s, v) = (s << v; s)

@@ -200,6 +200,7 @@ module Indus
       when :to_s, :upcase, :downcase, :capitalize, :swapcase, :strip, :lstrip, :rstrip, :chomp, :chop, :succ, :next, :tr,
            :delete, :squeeze, :center, :ljust, :rjust, :inspect, :join, :chr, :sub, :gsub, :slice, :insert, :prepend then :str
       when :to_f then :float
+      when :+@, :-@, :dup, :clone, :freeze, :itself then recv # unary plus/minus and copies keep the kind
       when :match then (recv == :str || n.receiver.is_a?(Prism::RegularExpressionNode) || recv == :Regexp) && !n.block ? :MatchData : nil
       when :new
         cname = n.receiver.is_a?(Prism::ConstantReadNode) || n.receiver.is_a?(Prism::ConstantPathNode) ? n.receiver.name : nil
@@ -230,7 +231,7 @@ module Indus
         else [:array, nil] end
       when :group_by, :tally, :to_h, :transform_values, :transform_keys, :merge, :invert, :each_with_object, :slice, :except, :filter_map_h, :keep_if, :delete_if, :clear, :store
         if n.name == :each_with_object then (akinds[0].is_a?(Array) ? akinds[0] : nil)
-        elsif %i[slice except keep_if delete_if clear].include?(n.name) then (recv.is_a?(Array) && recv[0] == :hash ? recv : (n.name == :slice ? recv : [:array, nil]))
+        elsif %i[slice except keep_if delete_if clear].include?(n.name) then (recv.is_a?(Array) && recv[0] == :hash ? recv : (n.name == :slice || recv == :str ? recv : [:array, nil]))
         elsif n.name == :store then akinds[1]
         else [:hash, nil, nil] end
       when :dup, :clone, :freeze, :itself then recv

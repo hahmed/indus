@@ -1525,6 +1525,11 @@ module Indus
         i.op = :call; i.args = [fn, recv, *args]; return
       end
       if name == :<=> && (t == :int || t == :str || t == :float)
+        at = of(f, args[0])
+        return unless at # the argument's type decides the callee
+        if at != :dyn && !(t == :str ? at == :str : %i[int float int?].include?(at)) # 1 <=> "a": nil (not comparable)
+          i.op = :const; i.args = [0]; i.ty = :nil; return
+        end
         i.op = :call; i.args = [fn(t == :str ? :__str_spaceship : :__num_spaceship), recv, *args]; return
       end
       t = :int if t == :int? # a nullable int used as a receiver: nil would have raised

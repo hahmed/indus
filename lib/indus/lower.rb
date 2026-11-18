@@ -1915,6 +1915,11 @@ module Indus
         end
         return expr(n.copy(arguments: n.arguments.copy(arguments: expanded)))
       end
+      if n.name == :default && args.empty? && n.receiver && kind_of(n.receiver) == :hash # h.default: the Hash.new(v) default when known here, else nil
+        d = hash_default_of(n.receiver)
+        return d.is_a?(Prism::Node) ? expr(d) : nil_const
+      end
+      if n.name == :default_proc && args.empty? && n.receiver && kind_of(n.receiver) == :hash then return nil_const end
       # a MatchData-valued expression (a match that may have missed) asked something nil answers: nil's answer when the word is 0
       if n.receiver && !n.block && (kd0 = kind_of(n.receiver)) == :MatchData && %i[to_a to_s inspect captures].include?(n.name) && args.empty?
         rv = expr(n.receiver)

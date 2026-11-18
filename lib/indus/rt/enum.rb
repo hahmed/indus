@@ -1758,3 +1758,171 @@ def __arr_concat(a, b) = __arr_plus(a, b)
 def __arr_concat2(a, b, c) = __arr_plus(__arr_plus(a, b), c)
 def __str_concat(a, b) = a + b
 def __str_concat2(a, b, c) = a + b + c
+
+# pop(n) / shift(n): the last / first n as an array (fewer when the array is shorter)
+def __arr_pop1(a, n)
+  n = a.length if n > a.length
+  out = __arr_slice(a, a.length - n, n)
+  i = 0
+  while i < n
+    a.pop
+    i = i + 1
+  end
+  out
+end
+def __arr_shift1(a, n)
+  n = a.length if n > a.length
+  out = __arr_slice(a, 0, n)
+  i = n
+  while i < a.length
+    a[i - n] = a[i]
+    i = i + 1
+  end
+  i = 0
+  while i < n
+    a.pop
+    i = i + 1
+  end
+  out
+end
+# slice!(i) / slice!(start, len): removed and returned
+def __arr_slice_bang1(a, i)
+  i = a.length + i if i < 0
+  return nil if i < 0 || i >= a.length
+  __arr_delete_at(a, i)
+end
+def __arr_slice_bang2(a, start, len)
+  start = a.length + start if start < 0
+  return nil if start < 0 || start > a.length || len < 0
+  len = a.length - start if start + len > a.length
+  out = __arr_slice(a, start, len)
+  i = start + len
+  while i < a.length
+    a[i - len] = a[i]
+    i = i + 1
+  end
+  i = 0
+  while i < len
+    a.pop
+    i = i + 1
+  end
+  out
+end
+def __arr_at(a, i) = a[i]
+def __arr_rotate_bang(a) = __arr_rotate_bang1(a, 1)
+def __arr_rotate_bang1(a, k)
+  r = __arr_rotate1(a, k)
+  i = 0
+  while i < a.length
+    a[i] = r[i]
+    i = i + 1
+  end
+  a
+end
+def __arr_sample1(a, n) = __arr_slice(__arr_shuffle(a), 0, n)
+# fill(v, start) / fill(v, start, len)
+def __arr_fill2(a, v, start)
+  start = a.length + start if start < 0
+  i = start
+  while i < a.length
+    a[i] = v
+    i = i + 1
+  end
+  a
+end
+def __arr_fill3(a, v, start, len)
+  start = a.length + start if start < 0
+  i = start
+  while i < start + len
+    a[i] = v
+    i = i + 1
+  end
+  a
+end
+# repeated_combination(k) / repeated_permutation(k): multisets / tuples with repetition, in Ruby's order
+def __arr_repeated_combination(a, k)
+  out = []
+  return out if k < 0
+  return [[]] if k == 0
+  return out if a.length == 0
+  idx = []
+  i = 0
+  while i < k
+    idx.push(0)
+    i = i + 1
+  end
+  loop_on = true
+  while loop_on
+    row = []
+    i = 0
+    while i < k
+      row.push(a[idx[i]])
+      i = i + 1
+    end
+    out.push(row)
+    j = k - 1
+    j = j - 1 while j >= 0 && idx[j] == a.length - 1
+    if j < 0
+      loop_on = false
+    else
+      idx[j] = idx[j] + 1
+      t = j + 1
+      while t < k
+        idx[t] = idx[j]
+        t = t + 1
+      end
+    end
+  end
+  out
+end
+def __arr_repeated_permutation(a, k)
+  out = []
+  return out if k < 0
+  return [[]] if k == 0
+  return out if a.length == 0
+  idx = []
+  i = 0
+  while i < k
+    idx.push(0)
+    i = i + 1
+  end
+  loop_on = true
+  while loop_on
+    row = []
+    i = 0
+    while i < k
+      row.push(a[idx[i]])
+      i = i + 1
+    end
+    out.push(row)
+    j = k - 1
+    while j >= 0 && idx[j] == a.length - 1
+      idx[j] = 0
+      j = j - 1
+    end
+    if j < 0 then loop_on = false else idx[j] = idx[j] + 1 end
+  end
+  out
+end
+# [[k, v], ...].rassoc(v): the first pair whose second element is v
+def __arr_rassoc(a, v)
+  i = 0
+  while i < a.length
+    return a[i] if a[i][1] == v
+    i = i + 1
+  end
+  nil
+end
+def __hash_rassoc(h, v)
+  ks = __hash_keys(h)
+  i = 0
+  while i < ks.length
+    return [ks[i], h[ks[i]]] if h[ks[i]] == v
+    i = i + 1
+  end
+  nil
+end
+# Integer
+def __num_div(a, b) = (a / b).floor
+def __num_gcdlcm(a, b) = [__num_gcd(a, b), __num_lcm(a, b)]
+def __num_coerce(a, b) = [b, a]
