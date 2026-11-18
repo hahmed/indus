@@ -114,12 +114,34 @@ def __quote(s)
     c = __ld8(s, i)
     if c == 10 then out = out + "\\n"
     elsif c == 9 then out = out + "\\t"
+    elsif c == 13 then out = out + "\\r"
+    elsif c == 27 then out = out + "\\e"
+    elsif c == 12 then out = out + "\\f"
+    elsif c == 11 then out = out + "\\v"
+    elsif c == 8 then out = out + "\\b"
+    elsif c == 7 then out = out + "\\a"
     elsif c == 34 then out = out + "\\\""
     elsif c == 92 then out = out + "\\\\"
+    elsif c == 35 && i + 1 < s.length && (__ld8(s, i + 1) == 123 || __ld8(s, i + 1) == 36 || __ld8(s, i + 1) == 64) then out = out + "\\#" # #{ #$ #@
+    elsif c < 32 || c == 127 then out = out + "\\x" + __hex2(c)
+    elsif c >= 128
+      n = __utf8_len(c)
+      if n > 1 && i + n <= s.length && __utf8_valid_at(s, i, n) then out = out + s[i, n]; i = i + n - 1
+      else out = out + "\\x" + __hex2(c) end
     else out = out + s[i, 1] end
     i = i + 1
   end
   out + "\""
+end
+def __hex2(c) = "0123456789ABCDEF"[c >> 4] + "0123456789ABCDEF"[c & 15]
+# a well-formed UTF-8 sequence of n bytes at i (lead byte already read)
+def __utf8_valid_at(s, i, n)
+  k = 1
+  while k < n
+    return false if (__ld8(s, i + k) & 192) != 128
+    k = k + 1
+  end
+  true
 end
 
 # Tagged scalars (:dyn): to_s / inspect by tag. Tags: 0 nil, odd fixnum,

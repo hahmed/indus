@@ -2047,6 +2047,13 @@ module Indus
         @classes.each_value { |k| (k.methods.keys + k.readers.keys + k.writers.keys).each { sym_id(_1.to_s) } } # every method name is a symbol the table knows: a computed name interns to the same id
         return emit(:dsend, [nv, recv_v, *rest.map { expr(_1) }]) # switch over the class's methods
       end
+      if %i[unpack unpack1].include?(n.name) && args.size == 1 && n.receiver && (kind_of(n.receiver) == :str || n.receiver.is_a?(Prism::StringNode))
+        return emit(:call, [demand(n.name == :unpack ? :__str_unpack : :__str_unpack1), expr(n.receiver), expr(args[0])])
+      end
+      if n.name == :pack && args.size == 1 && n.receiver && (n.receiver.is_a?(Prism::ArrayNode) || kind_of(n.receiver) == :array) # arr.pack(fmt): the elements as a :dyn array
+        av = n.receiver.is_a?(Prism::ArrayNode) && n.receiver.elements.none? { _1.is_a?(Prism::SplatNode) } ? dyn_array(n.receiver.elements) : emit(:call, [demand(:__arr_to_dyn), expr(n.receiver)])
+        return emit(:call, [demand(:__arr_pack), av, expr(args[0])])
+      end
       if n.name == :% && n.receiver && (kind_of(n.receiver) == :str || n.receiver.is_a?(Prism::StringNode) || n.receiver.is_a?(Prism::InterpolatedStringNode))
         list = args[0].is_a?(Prism::ArrayNode) ? args[0].elements : [args[0]] # "fmt" % args
         return emit(:call, [demand(:__format), expr(n.receiver), dyn_array(list)])

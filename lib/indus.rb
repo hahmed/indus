@@ -37,7 +37,7 @@ module Indus
 
   # standalone: nil (run in-process via libc write), :darwin or :linux
   PRELUDE_GC = File.read(File.join(__dir__, "indus/rt/gc.rb"))
-  PRELUDE_CORE = %w[grisu core big format enum libm regex].map { File.read(File.join(__dir__, "indus/rt/#{_1}.rb")) }.join("\n")
+  PRELUDE_CORE = %w[grisu core big format enum libm regex pack].map { File.read(File.join(__dir__, "indus/rt/#{_1}.rb")) }.join("\n")
 
   # require_relative "x" / require "./x" splice the file in, once, where the call is (a
   # program is one compilation unit). require of a library name: a few are built in (set is
