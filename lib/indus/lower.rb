@@ -1280,7 +1280,7 @@ module Indus
     end
     def me_val = @name_pfx ? @locals.fetch(:"#{@name_pfx}self") : @locals.fetch(:self)
     # @x outside any class (main, top-level defs): the toplevel object's ivars, as globals
-    def ivar_owner = @owner || (@klass.nil? && !@locals.key?(:self) && !(@name_pfx && @locals.key?(:"#{@name_pfx}self")) ? :main : nil)
+    def ivar_owner = @owner || (@klass.nil? && !@locals.key?(:self) && !(@name_pfx && @locals.key?(:"#{@name_pfx}self")) ? :main : nil) || (@klass&.closure && @klass.outer.nil? && !@klass.ie_self && !@in_block_of_object ? :main : nil) # a closure made at the top level: its ivars are main's
     # append to the *current* block after the arguments have been evaluated
     # (lowering an argument may move @cur: loops, inlining)
     def emit(op, args = [], cond = nil) = (@cur << Inst.new(op, args, cond))

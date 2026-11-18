@@ -435,6 +435,7 @@ def __re_match_data(re, s)
 end
 def __str_match_p_re(s, re) = __re_match_p(re.prog, re.ncap, s)
 def __str_index_re(s, re) = __re_index(re.prog, re.ncap, s)
+def __str_not_match_re(s, re) = !__re_match_p(re.prog, re.ncap, s)
 def __str_scan_re(s, re) = __re_scan(re.prog, re.ncap, s)
 def __str_scan_groups_re(s, re) = __re_scan_groups(re.prog, re.ncap, s)
 def __str_sub_re(s, re, rep) = __re_sub(re.prog, re.ncap, s, rep)

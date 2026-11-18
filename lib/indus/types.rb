@@ -1406,6 +1406,19 @@ module Indus
       if %i[=~ match match? !~].include?(name) && args.size == 1 && of(f, args[0]) == :nil && @settled # `s =~ nil` in a branch the guard rules out: nil (never a match)
         i.op = :const; i.args = [0]; i.ty = name == :!~ ? :bool : :nil; return
       end
+      if %i[=~ match match? !~].include?(name) && args.size == 1 && t == :str && (at = of(f, args[0]))
+        if at == :Regexp # s =~ re with re a value typed late (a parameter)
+          case name
+          when :=~ then i.op = :call; i.args = [fn(:__str_index_re), recv, args[0]]; i.ty = nil
+          when :match then i.op = :call; i.args = [fn(:__str_match_re), recv, args[0]]; i.ty = nil
+          when :match? then i.op = :call; i.args = [fn(:__str_match_p_re), recv, args[0]]; i.ty = :bool
+          when :!~ then i.op = :call; i.args = [fn(:__str_not_match_re), recv, args[0]]; i.ty = :bool
+          end
+          return
+        elsif at == :str && @settled && name == :=~ # "s" =~ "t": TypeError in Ruby (a guarded branch that is never taken)
+          i.op = :call; i.args = [fn(:__raise_type_error), Inst.new(:sconst, ["wrong argument type String (expected Regexp)"]).tap { _1.ty = :str; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) }]; i.ty = :nil; return
+        end
+      end
       if name == :__ancestors_of && args.empty? && t # obj.class.ancestors: the table row for the object's class id
         return unless @settled
         cid = if classes_of(t) && classes_of(t).size == 1 && !@classes[classes_of(t)[0]].tagged then Inst.new(:const, [@classes[classes_of(t)[0]].id]).tap { _1.ty = :int }
