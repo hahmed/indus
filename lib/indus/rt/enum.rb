@@ -1926,3 +1926,23 @@ end
 def __num_div(a, b) = (a / b).floor
 def __num_gcdlcm(a, b) = [__num_gcd(a, b), __num_lcm(a, b)]
 def __num_coerce(a, b) = [b, a]
+
+# bsearch (find-minimum mode): the first element for which the block is truthy; the block answers true/false (or nil)
+def __arr_bsearch_fn(a, pred)
+  lo = 0
+  hi = a.length
+  while lo < hi
+    mid = (lo + hi) / 2
+    if pred.call(a[mid]) then hi = mid else lo = mid + 1 end
+  end
+  lo < a.length ? a[lo] : nil
+end
+def __arr_bsearch_index_fn(a, pred)
+  lo = 0
+  hi = a.length
+  while lo < hi
+    mid = (lo + hi) / 2
+    if pred.call(a[mid]) then hi = mid else lo = mid + 1 end
+  end
+  lo < a.length ? lo : nil
+end

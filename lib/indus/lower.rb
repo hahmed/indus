@@ -2880,6 +2880,10 @@ module Indus
           mask = iterate_array_value(n.copy(name: :map), args, pairs)
           return emit(:call, [demand(:"__arr_#{n.name}_mask"), arr, mask])
         when :to_h then return emit(:call, [demand(:__pairs_to_hash), mapped.()]) if kind_of(n.receiver) != :hash
+        when :bsearch, :bsearch_index # the block as a closure value: the prelude's binary search calls it
+          params = blk.parameters&.parameters&.requireds&.map(&:name) || []
+          c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
+          return emit(:call, [demand(n.name == :bsearch ? :__arr_bsearch_fn : :__arr_bsearch_index_fn), @recv_value || expr(n.receiver), c])
         when :sort # a comparator: the block as a closure value, the prelude merge sort calls it
           params = blk.parameters&.parameters&.requireds&.map(&:name) || []
           c = closure_value(params, free_locals(blk.body, params).select { |nm| @locals.key?(lname(nm)) }, blk.body&.body || [])
@@ -2946,6 +2950,21 @@ module Indus
       case n.name
       when :times then counted_loop(const(0), expr(recv), :lt, params, body)
       when :upto then counted_loop(expr(recv), expr(args[0]), :le, params, body)
+      when :downto then counted_loop(expr(recv), expr(args[0]), :ge, params, body, step: -1)
+      when :combination, :permutation, :repeated_combination, :repeated_permutation, :each_slice, :each_cons, :cycle, :product, :transpose, :each_char, :each_byte, :chars, :bytes, :each_line, :lines
+        # xs.combination(2) { |c| } : the array of results, then each over it (cycle(n): the array repeated n times)
+        if recv && n.block.is_a?(Prism::BlockNode) && !(n.name == :cycle && args.empty?)
+          src = n.send(:source); loc = n.location
+          produced = n.name == :cycle ? Prism::CallNode.new(src, 0, loc, 0, recv, nil, :*, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, args), nil, nil, nil) : n.copy(block: nil)
+          return block_call(Prism::CallNode.new(src, 0, loc, 0, produced, nil, :each, loc, nil, nil, nil, nil, n.block), [])
+        end
+      when :fill # xs.fill { |i| v }: xs.replace(Array.new(xs.size) { |i| v })
+        if recv && n.block.is_a?(Prism::BlockNode) && args.empty?
+          src = n.send(:source); loc = n.location
+          size = Prism::CallNode.new(src, 0, loc, 0, recv, nil, :size, loc, nil, nil, nil, nil, nil)
+          made = Prism::CallNode.new(src, 0, loc, 0, Prism::ConstantReadNode.new(src, 0, loc, 0, :Array), nil, :new, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, [size]), nil, nil, n.block)
+          return call(Prism::CallNode.new(src, 0, loc, 0, recv, nil, :replace, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, [made]), nil, nil, nil))
+        end
       when :new # Thread.new(args) { |params| body }: the thread runs to completion here (one legal
                 # schedule under the GVL: nothing else is required to run). Its value is the body's.
         if recv.is_a?(Prism::ConstantReadNode) && recv.name == :Thread
