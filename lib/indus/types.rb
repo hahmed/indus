@@ -1297,6 +1297,13 @@ module Indus
 
     # before `i`: branch on v being the nil word; the nil arm yields the String `nil_text`, the other arm what the
     # block builds in its block; the rest of i's block (from i on) continues at the join. Returns the join phi.
+    # a lambda called with the wrong number of arguments: the call becomes Ruby's ArgumentError
+    def self.arity_error(f, i, given, expected)
+      m = Inst.new(:sconst, ["wrong number of arguments (given #{given}, expected #{expected})"]); m.ty = :str; m.block = i.block
+      i.block.insts.insert(i.block.insts.index(i), m)
+      i.op = :call; i.args = [fn(:__raise_arg_error), m]; i.ty = :nil
+    end
+
     PRELUDE_NILABLE = %i[MatchData].freeze # library classes whose methods commonly return nil instead of an instance (match misses)
     # what nil answers to a method the class lacks (NilClass's own), as a builder of the instruction in the nil arm
     def self.nil_answer(name, argc)
@@ -1675,11 +1682,11 @@ module Indus
         if payload.rest # the last parameter takes the extras as an array
           fixed = want - 1
           extras = args[fixed..] || []
-          raise "#{f.name}: a lambda called with #{args.size} arguments, takes at least #{fixed}" if payload.strict_arity && args.size < fixed
+          if payload.strict_arity && args.size < fixed then arity_error(f, i, args.size, "#{fixed}+"); return end # Ruby's ArgumentError, at run time
           while extras.size < 0 do end
           pack = pack_insts(i, extras); args = (args[0, fixed] + Array.new([fixed - args.size, 0].max) { c = Inst.new(:const, [0]); c.ty = :nil; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); c } + [pack])
         else
-          if payload.strict_arity then raise "#{f.name}: a lambda called with #{args.size} arguments, takes #{want} (ArgumentError in Ruby)" end
+          if payload.strict_arity then arity_error(f, i, args.size, want.to_s); return end # Ruby's ArgumentError, at run time
           args = args[0, want]
           while args.size < want
             c = Inst.new(:const, [0]); c.ty = :nil; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); args << c

@@ -2906,7 +2906,9 @@ module Indus
           raise "a block inside a method cannot yet refer to self or @ivars" if @klass && refers_to_self?(blk.body)
           fparams, pre = flatten_params(blk.parameters&.parameters) # |a, (b, c)|
           fparams = params if blk.parameters.is_a?(Prism::NumberedParametersNode) || blk.parameters.nil?
-          return closure_value(fparams, free_locals(blk.body, fparams).select { |nm| @locals.key?(lname(nm)) }, pre + (body.is_a?(Array) ? body : []))
+          c = closure_value(fparams, free_locals(blk.body, fparams).select { |nm| @locals.key?(lname(nm)) }, pre + (body.is_a?(Array) ? body : []))
+          @deferred_lambdas.last[1].strict_arity = true if n.name == :lambda && @deferred_lambdas.last[0].equal?(c.args[0]) # lambda {} checks its argument count like ->
+          return c
         end
       when :open # File.open(path, mode) { |f| ... }: f is the descriptor, closed after the block
         raise "block passed to #{recv&.name}.open" unless recv.is_a?(Prism::ConstantReadNode) && recv.name == :File
@@ -4186,7 +4188,11 @@ module Indus
     def inline_lambda(lam, args)
       ps = lam.parameters&.parameters
       params = ps&.requireds&.map(&:name) || []
-      raise "a lambda taking #{params.size} argument#{"s" if params.size != 1} called with #{args.size} (ArgumentError in Ruby)" if params.size != args.size && !ps&.optionals&.any? && !ps&.rest
+      if params.size != args.size && !ps&.optionals&.any? && !ps&.rest # Ruby's ArgumentError, at run time
+        args.each { expr(_1) }
+        emit(:call, [demand(:__raise_arg_error), emit(:sconst, ["wrong number of arguments (given #{args.size}, expected #{params.size})"])])
+        return nil_const
+      end
       pfx = :"lam#{@f.blocks.size}:"
       args = args.dup; kw = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
       params.each_with_index { |p, k| @locals[:"#{pfx}#{p}"] = expr(args[k]) }

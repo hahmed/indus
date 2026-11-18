@@ -1565,6 +1565,7 @@ def __raise_coerce(what, into)
 end
 def __raise_local_jump(msg) = raise(LocalJumpError, msg)
 def __raise_type_error(msg) = raise(TypeError, msg)
+def __raise_arg_error(msg) = raise(ArgumentError, msg)
 def __raise_name_error(msg)
   raise NameError, msg
 end
