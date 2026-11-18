@@ -1257,6 +1257,23 @@ module Indus
 
     # obj.x = v with the receiver already evaluated: the class's writer (an attr_accessor's
     # field store, or a user-defined x=)
+    # self.a += v / self.a ||= v / self[k] += v / self[k] ||= v at main: main's reader and writer defs, called directly
+    def main_self_rmw(n)
+      src = n.send(:source); loc = n.location
+      idx = n.is_a?(Prism::IndexOperatorWriteNode) || n.is_a?(Prism::IndexOrWriteNode) || n.is_a?(Prism::IndexAndWriteNode)
+      keys = idx ? n.arguments.arguments : []
+      rname, wname = idx ? [:[], :[]=] : [n.read_name, n.write_name]
+      read = Prism::CallNode.new(src, 0, loc, 0, Prism::SelfNode.new(src, 0, loc, 0), nil, rname, loc, nil, keys.empty? ? nil : Prism::ArgumentsNode.new(src, 0, loc, 0, keys), nil, nil, nil)
+      cur = call(read)
+      write = ->(v) { emit(:call, [@funcs.fetch(wname) { raise "main has no #{wname}" }, *keys.map { expr(_1) }, v]) }
+      case n
+      when Prism::CallOperatorWriteNode, Prism::IndexOperatorWriteNode
+        v = emit(ARITH.fetch(n.binary_operator), [cur, expr(n.value)]); write.(v); v
+      when Prism::CallOrWriteNode, Prism::IndexOrWriteNode then cond_assign(cur, false, -> { expr(n.value) }, write)
+      else cond_assign(cur, true, -> { expr(n.value) }, write)
+      end
+    end
+
     def attr_assign(recv_node, rv, writer, v)
       emit(:mcall, [writer, rv, v])
       v
@@ -1336,6 +1353,7 @@ module Indus
       when Prism::LocalVariableAndWriteNode # x &&= v
         cond_assign(@locals.fetch(lname(n.name)), true, -> { expr(n.value) }, ->(v) { @locals[lname(n.name)] = v })
       when Prism::IndexOperatorWriteNode # a[i] += v
+        return main_self_rmw(n) if n.receiver.is_a?(Prism::SelfNode) && ivar_owner == :main
         recv = expr(n.receiver); k = expr(n.arguments.arguments[0])
         cur = hash_default_of(n.receiver) ? hash_read_with_default(recv, n.arguments.arguments[0], n.receiver) : emit(:idx, [recv, k])
         rhs = expr(n.value)
@@ -1343,10 +1361,11 @@ module Indus
         r = emit(:idx_set, [recv, k, v])
         case n.receiver
         when Prism::LocalVariableReadNode then @locals[lname(n.receiver.name)] = r
-        when Prism::InstanceVariableReadNode then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
+        when Prism::InstanceVariableReadNode then (ow = ivar_owner) ? emit(:gset, [:"#{ow}#{n.receiver.name}", r]) : emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
         end
         v
       when Prism::CallOperatorWriteNode # obj.x += v  ->  obj.x = (obj.x + v)
+        return main_self_rmw(n) if n.receiver.is_a?(Prism::SelfNode) && ivar_owner == :main
         recv = n.receiver
         read = Prism::CallNode.new(n.send(:source), 0, n.location, 0, recv, nil, n.read_name, nil, nil, nil, nil, nil, nil)
         rv = expr(recv)
@@ -1354,6 +1373,7 @@ module Indus
         v = emit(ARITH.fetch(n.binary_operator), [cur, expr(n.value)])
         attr_assign(recv, rv, n.write_name, v)
       when Prism::CallOrWriteNode, Prism::CallAndWriteNode # obj.x ||= v / obj.x &&= v
+        return main_self_rmw(n) if n.receiver.is_a?(Prism::SelfNode) && ivar_owner == :main
         recv = n.receiver
         read = Prism::CallNode.new(n.send(:source), 0, n.location, 0, recv, nil, n.read_name, nil, nil, nil, nil, nil, nil)
         rv = expr(recv)
@@ -1364,6 +1384,7 @@ module Indus
       when Prism::GlobalVariableOrWriteNode then cond_assign(emit(:gget, [n.name]), false, -> { expr(n.value) }, ->(v) { emit(:gset, [n.name, v]) })
       when Prism::GlobalVariableAndWriteNode then cond_assign(emit(:gget, [n.name]), true, -> { expr(n.value) }, ->(v) { emit(:gset, [n.name, v]) })
       when Prism::IndexOrWriteNode # h[k] ||= v
+        return main_self_rmw(n) if n.receiver.is_a?(Prism::SelfNode) && ivar_owner == :main
         recv = expr(n.receiver); k = expr(n.arguments.arguments[0])
         cur = emit(:idx, [recv, k])
         cond_assign(cur, false, -> { expr(n.value) }, ->(v) {
@@ -1523,7 +1544,10 @@ module Indus
           return emit(:mcall, [:call, bv, *(n.arguments&.arguments || []).map { expr(_1) }])
         end
         if @block == :none then emit(:call, [demand(:__raise_local_jump), emit(:sconst, ["no block given (yield)"])]); return nil_const end # a yielder called without a block
-        raise "yield outside an inlined block method" unless @block
+        unless @block # a yield in a method lowered without a block (define_method inside a class method yielding outward): a raise; refused if reachable
+          @f.unbound_yield = "yield outside an inlined block method (#{@f.name})"
+          emit(:call, [demand(:__raise_local_jump), emit(:sconst, ["no block given (yield)"])]); return nil_const
+        end
         yield_block(n.arguments&.arguments || [])
       when Prism::RangeNode then range_array(n) # a Range as a value: its elements (each/map/times fuse before reaching here)
       when Prism::SourceLineNode then const(n.location.start_line - (Lower.prelude_lines || 0)) # __LINE__, in the user's file
@@ -1794,6 +1818,13 @@ module Indus
 
     def call(n)
       args = n.arguments&.arguments || []
+      # self.m(...) where self is main (top level or a top-level def): main has no object; the call is a bare call
+      if n.receiver.is_a?(Prism::SelfNode) && ivar_owner == :main && (f0 = @funcs[n.name]) && (n.name.to_s.end_with?("=") || n.name == :[]) && !%i[== != <= >= ===].include?(n.name)
+        return emit(:call, [f0, *args.map { expr(_1) }]) # self.a = v / self[k] = v / self[k] at main: main's own def
+      end
+      if n.receiver.is_a?(Prism::SelfNode) && ivar_owner == :main && !%i[class to_s inspect frozen? freeze instance_variable_get instance_variable_set instance_variables instance_variable_defined? singleton_class object_id equal? == != send __send__ public_send respond_to? is_a? kind_of? instance_of? methods].include?(n.name)
+        return call(n.copy(receiver: nil))
+      end
       # Outer::Inner.m / Mod::Klass.new: classes are hoisted and known by their own name -- the path is the leaf
       if n.receiver.is_a?(Prism::ConstantPathNode) && (@classes[n.receiver.name] || @modules.include?(n.receiver.name)) && !(n.receiver.parent.is_a?(Prism::ConstantReadNode) && @class_const_owners && @class_const_owners[n.receiver.name].any?)
         return call(n.copy(receiver: Prism::ConstantReadNode.new(n.send(:source), 0, n.receiver.location, 0, n.receiver.name)))
@@ -2479,11 +2510,15 @@ module Indus
         emit(:hnew, []) # a default (value or block), if any, is recorded by the assignment (hash_default_of)
       elsif n.name == :[]=
         # a[i] = v may grow a: the result is the (possibly new) container, rebound to its home
+        if n.receiver.is_a?(Prism::ParenthesesNode) && n.receiver.body.is_a?(Prism::StatementsNode) && n.receiver.body.body.size == 1 && (iw = n.receiver.body.body[0]).is_a?(Prism::InstanceVariableOrWriteNode)
+          expr(iw) # (@h ||= {})[k] = v: the assignment, then the store through the variable (so growth writes back)
+          return call(n.copy(receiver: Prism::InstanceVariableReadNode.new(n.send(:source), 0, iw.location, 0, iw.name)))
+        end
         a = expr(n.receiver); i = expr(args[0]); v = expr(args[1])
         r = emit(:idx_set, [a, i, v])
         case n.receiver
         when Prism::LocalVariableReadNode then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
-        when Prism::InstanceVariableReadNode then emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
+        when Prism::InstanceVariableReadNode then (ow = ivar_owner) ? emit(:gset, [:"#{ow}#{n.receiver.name}", r]) : emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r])
         when Prism::CallNode then nil # a[i][j] = v, obj.attr[i] = v: the element store is in place; growth would need the cell design
         when Prism::ConstantReadNode, Prism::GlobalVariableReadNode, Prism::ClassVariableReadNode then emit(:gset, [n.receiver.name, r]) # TABLE[k] = v: the global takes the grown handle
         else raise "[]= on #{n.receiver.class}"

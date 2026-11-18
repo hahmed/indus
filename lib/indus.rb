@@ -86,6 +86,7 @@ module Indus
     Types.standalone = standalone
     Types.run(funcs, lower.classes, lower)
     funcs = Passes.prune(funcs)
+    funcs.each { |f| raise f.unbound_yield if f.unbound_yield && f.name != :main }
     funcs.each { Passes.run(_1) unless ENV["NOPASS"] }
     funcs.each { Peephole.run(_1) unless ENV["NOPEEP"] }
     funcs.each { Ranges.run(_1) unless ENV["NORANGES"] } # overflow checks that cannot fire

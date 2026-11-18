@@ -83,6 +83,7 @@ module Indus
 
   class Func
     attr_accessor :strict_arity # a lambda (->(){} / lambda {}): the wrong argument count is an error, not nil-padding
+    attr_accessor :unbound_yield # a yield with no block to bind: compiled as a raise; a refusal if the function turns out reachable
     attr_accessor :primary, :versions # a method defined again later: versions behind the primary's slot (see Lower#register_class_body)
     attr_accessor :name, :params, :blocks, :ptypes, :rtype, :cls, :patchable, :leaks, :stores_param, :stores_other, :returns_fresh, :rest, :allocates, :result_unused,
                   :shadowed # the definition this one overrides in the same class's chain (a mixin's, or the one a prepend covers): super's target
