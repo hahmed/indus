@@ -111,9 +111,9 @@ module Indus
             vs = n.value.is_a?(Prism::ArrayNode) ? n.value.elements.map { expr(_1, env, klass, fkey) } : []
             n.lefts.each_with_index { |t, i| env[t.name] = join(env[t.name], vs[i]) if t.is_a?(Prism::LocalVariableTargetNode) }
             nil
-          when Prism::InstanceVariableReadNode then klass && @ivars[klass][n.name]
+          when Prism::InstanceVariableReadNode then @ivars[klass || :main][n.name] # top-level ivars (main's) under :main
           when Prism::InstanceVariableWriteNode
-            v = expr(n.value, env, klass, fkey); set_ivar(klass, n.name, v) if klass; v
+            v = expr(n.value, env, klass, fkey); set_ivar(klass || :main, n.name, v); v
           when Prism::ConstantReadNode, Prism::ConstantPathNode then @classes[n.name] ? :"class:#{n.name}" : (@const_kinds ||= {})[n.name]
           when Prism::ConstantWriteNode then (v = expr(n.value, env, klass, fkey); (@const_kinds ||= {})[n.name] = join(@const_kinds[n.name], v); v)
           when Prism::ClassVariableWriteNode then (v = expr(n.value, env, klass, fkey); (@cvars ||= {})[n.name] = join(@cvars[n.name], v); v)
@@ -143,7 +143,19 @@ module Indus
           when Prism::CallNode then call(n, env, klass, fkey)
           when Prism::SingletonClassNode then (expr(n.expression, env, klass, fkey) unless n.expression.is_a?(Prism::SelfNode); nil) # class << x: x's kind is needed
           when Prism::DefNode then (expr(n.receiver, env, klass, fkey) if n.receiver && !n.receiver.is_a?(Prism::SelfNode); nil) # def x.m: x's kind is wanted
-          when Prism::LambdaNode, Prism::BreakNode, Prism::NextNode, Prism::ClassNode, Prism::ModuleNode then nil
+          when Prism::BeginNode # begin/rescue/else/ensure: every part is walked (the value is the body's or the handlers')
+            r = nil
+            (n.statements&.body || []).each { r = expr(_1, env, klass, fkey) }
+            rc = n.rescue_clause
+            while rc
+              (rc.statements&.body || []).each { r = join(r, expr(_1, env, klass, fkey)) }
+              rc = rc.subsequent
+            end
+            (n.else_clause&.statements&.body || []).each { r = expr(_1, env, klass, fkey) }
+            (n.ensure_clause&.statements&.body || []).each { expr(_1, env, klass, fkey) }
+            r
+          when Prism::LambdaNode then ((n.body&.body || []).each { expr(_1, env.dup, klass, fkey) } if n.body.is_a?(Prism::StatementsNode); nil) # the body's receivers get kinds; its value stays opaque
+          when Prism::BreakNode, Prism::NextNode, Prism::ClassNode, Prism::ModuleNode then nil
           else nil
           end
       note(n, k)
