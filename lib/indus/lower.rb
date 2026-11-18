@@ -822,6 +822,7 @@ module Indus
       cands = klass ? [klass.find_method(n.name)].compact : @classes.values.filter_map { |k| k.methods[n.name] }
       cands = cands.select { @defs_by_func[_1] }
       needs = args.last.is_a?(Prism::KeywordHashNode) || cands.any? { |f| f.rest || @defs_by_func[f].parameters&.then { |ps| ps.optionals.any? || ps.keywords.any? || ps.keyword_rest.is_a?(Prism::KeywordRestParameterNode) } }
+      needs ||= args.any? { _1.is_a?(Prism::SplatNode) } # m(*a): the splat is spread by the callee's shape
       return args.map { expr(_1) } unless needs
       raise "#{n.name}: a default that reads self needs the receiver evaluated first" if klass.nil? && recv.nil? && cands.any? { |f| @defs_by_func[f].parameters.then { |ps| (ps.optionals + ps.keywords).any? { |o| o.respond_to?(:value) && o.value && !o.value.is_a?(Prism::IntegerNode) && !o.value.is_a?(Prism::StringNode) && !o.value.is_a?(Prism::NilNode) && !o.value.is_a?(Prism::TrueNode) && !o.value.is_a?(Prism::FalseNode) && !o.value.is_a?(Prism::FloatNode) && !o.value.is_a?(Prism::SymbolNode) && !o.value.is_a?(Prism::ArrayNode) && !o.value.is_a?(Prism::HashNode) } } }
       shapes = cands.map { |f| @defs_by_func[f].parameters&.slice.to_s }.uniq
@@ -1274,6 +1275,14 @@ module Indus
       end
     end
 
+    # return *a / return a, b / break *a: one value -- the array (a lone *x is x.to_a; several are an Array)
+    def jump_value(args)
+      return args[0] unless args.size > 1 || args[0].is_a?(Prism::SplatNode)
+      src = args[0].send(:source); loc = args[0].location
+      return args[0].expression if args.size == 1 # return *a: a itself (an Array already)
+      Prism::ArrayNode.new(src, 0, loc, 0, args, nil, nil)
+    end
+
     def attr_assign(recv_node, rv, writer, v)
       emit(:mcall, [writer, rv, v])
       v
@@ -1514,13 +1523,13 @@ module Indus
         @cur = @f.new_block(:dead); const(0)
       when Prism::BreakNode
         raise "break outside loop" unless @loop
-        bv = n.arguments ? expr(n.arguments.arguments[0]) : nil
+        bv = n.arguments ? expr(jump_value(n.arguments.arguments)) : nil
         (@loop[:break_values] ||= []) << [@cur, bv] if bv
         @loop[:breaks] << [@cur, @locals.dup]
         emit(:br, [@loop[:exit]])
         @cur = @f.new_block(:dead); const(0)
       when Prism::ReturnNode
-        v = n.arguments ? expr(n.arguments.arguments[0]) : const(0)
+        v = n.arguments ? expr(jump_value(n.arguments.arguments)) : const(0)
         if @ret_exit # returning from an inlined callee: jump to its exit with the value
           @ret_exit[:arms] << [@cur, @locals.dup, v]
           emit(:br, [@ret_exit[:block]])
@@ -1530,6 +1539,10 @@ module Indus
         @cur = @f.new_block(:dead); const(0)
       when Prism::StatementsNode then n.body.map { expr(_1) }.last
       when Prism::NextNode
+        if @loop.nil? && @klass&.closure && !@ret_exit # next in a proc/lambda body: the closure returns the value (nil when none)
+          v = n.arguments ? expr(jump_value(n.arguments.arguments)) : nil_const
+          emit(:ret, [v]); @cur = @f.new_block(:dead); return const(0)
+        end
         raise "next outside a loop" unless @loop
         if @loop[:next].nil? # a plain while: jump to the header
           @loop[:nexts] << [@cur, @locals.dup] if @loop[:nexts]
@@ -3652,7 +3665,9 @@ module Indus
       return ->() { expr(c) } unless subj
       return ->() { emit(:isa, [subj, c.name]) } if class_const?(c) # `when Klass` is Klass === subj
       return ->() { emit(:cmp, [emit(:call, [demand(:__str_index_re), subj, expr(c)]), nil_const], :ne) } if c.is_a?(Prism::RegularExpressionNode) # `when /re/` is re === subj, and sets $1..
-      if c.is_a?(Prism::RangeNode)
+      if c.is_a?(Prism::SplatNode) # when *arr: membership
+        ->() { emit(:mcall, [:include?, expr(c.expression), subj]) }
+      elsif c.is_a?(Prism::RangeNode)
         ->() { lo = expr(c.left); hi = expr(c.right)
                a = emit(:cmp, [subj, lo], :ge); b = emit(:cmp, [subj, hi], c.exclude_end? ? :lt : :le)
                emit(:and, [a, b]) }

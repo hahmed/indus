@@ -5,11 +5,12 @@
 # Classify extracted ruby/spec examples (tools/rubyspec/extract.rb, Spinel's extractor, unchanged) against Indus,
 # with Spinel's rules (run.sh): PASS / FAIL / REJECT (compile refused) / ERROR (ran but crashed or no MSPEC-DONE) /
 # HARNESS-SKEW (CRuby itself does not pass the extracted program: excluded). One TSV row per example.
-#   RUBYSPEC_JOBS=n  parallelism (default 2: the memory discipline)
+#   RUBYSPEC_JOBS=n  parallelism (default 4)
+#   RUBYSPEC_ONLY=file  rerun only the examples named (one basename per line); other rows of RESULTS_TSV are kept
 set -u
 DIR="${1:?usage: run-indus.sh EXTRACTED_DIR [out.tsv]}"
 OUT="${2:-$DIR/results.tsv}"
-JOBS="${RUBYSPEC_JOBS:-2}"
+JOBS="${RUBYSPEC_JOBS:-4}"
 TDIR=$(mktemp -d /tmp/rubyspec-indus.XXXXXX)
 trap 'rm -rf "$TDIR"; pkill -9 -P $$ 2>/dev/null' EXIT
 INDUS="$(cd "$(dirname "$0")/../.." && pwd)/bin/indus"
@@ -35,7 +36,13 @@ classify_one() {
 }
 export -f classify_one; export TDIR INDUS
 mkdir -p "$TDIR/rows"
-ls "$DIR"/*.rb | xargs -P "$JOBS" -I{} bash -c 'classify_one "$@"' _ {}
-: > "$OUT"; for row in $(ls "$TDIR/rows" | sort); do cat "$TDIR/rows/$row" >> "$OUT"; done
+if [ -n "${RUBYSPEC_ONLY:-}" ]; then
+  sed "s|^|$DIR/|; s|\$|.rb|" "$RUBYSPEC_ONLY" | xargs -P "$JOBS" -I{} bash -c 'classify_one "$@"' _ {}
+  [ -f "$OUT" ] && grep -v -F -f <(sed 's/$/\t/' "$RUBYSPEC_ONLY") "$OUT" > "$TDIR/kept" || : > "$TDIR/kept"
+  cat "$TDIR/kept" "$TDIR"/rows/* | sort > "$OUT"
+else
+  ls "$DIR"/*.rb | xargs -P "$JOBS" -I{} bash -c 'classify_one "$@"' _ {}
+  : > "$OUT"; for row in $(ls "$TDIR/rows" | sort); do cat "$TDIR/rows/$row" >> "$OUT"; done
+fi
 for s in PASS FAIL REJECT ERROR HARNESS-SKEW; do printf '%s=%s ' $s $(awk -F'\t' -v s=$s '$2==s' "$OUT" | wc -l | tr -d ' '); done; echo
 echo "--- top reject reasons ---"; awk -F'\t' '$2=="REJECT"{print $3}' "$OUT" | sed 's/[0-9]\+/N/g' | sort | uniq -c | sort -rn | head -15

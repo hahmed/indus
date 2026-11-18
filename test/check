@@ -5,19 +5,28 @@
 # CRuby output frozen because some take seconds), otherwise CRuby run right now.
 # Each program runs twice: plain, and with 2 MB semispaces so the collector works.
 # Prints failures only, then one summary line. Exit 1 on any failure.
+# TEST_JOBS=n runs n programs at a time (default 4).
 cd "$(dirname "$0")/.."
 trap 'pkill -9 -P $$ 2>/dev/null' EXIT INT TERM   # compiled programs ignore SIGTERM
 [ $# -gt 0 ] && files=("$@") || files=(test/programs/*.rb)
-pass=0; fail=0
-run() { timeout -k 2 60 env "$@" 2>/dev/null; }
-for f in "${files[@]}"; do
-  exp="${f%.rb}.expected"
-  if [ -f "$exp" ]; then want=$(cat "$exp"); else want=$(ruby --disable-gems "$f" 2>/dev/null); fi   # stdout is the truth, for both
+jobs=${TEST_JOBS:-4}
+out=$(mktemp -d)
+one() { # one program, both modes; writes P/F lines to its own file
+  f=$1; exp="${f%.rb}.expected"
+  if [ -f "$exp" ]; then want=$(cat "$exp"); else want=$(ruby --disable-gems "$f" 2>/dev/null); fi
   for mode in "" "INDUS_HEAP_MB=2"; do
-    got=$(run $mode bin/indus "$f")
-    if [ "$want" == "$got" ]; then pass=$((pass+1)); else
-      fail=$((fail+1)); echo "FAIL $f ${mode:+($mode)}"; diff <(echo "$want") <(echo "$got") | head -6; fi
+    got=$(timeout -k 2 60 env $mode bin/indus "$f" 2>/dev/null)
+    if [ "$want" == "$got" ]; then echo P; else
+      echo F; echo "FAIL $f ${mode:+($mode)}"; diff <(echo "$want") <(echo "$got") | head -6; fi
   done
+}
+export -f one
+printf '%s\0' "${files[@]}" | xargs -0 -P "$jobs" -I{} bash -c 'one "$1" > "$2/$(echo "$1" | tr / _)"' _ {} "$out"
+pass=0; fail=0
+for r in "$out"/*; do
+  grep -v '^[PF]$' "$r"
+  pass=$((pass + $(grep -c '^P$' "$r"))); fail=$((fail + $(grep -c '^F$' "$r")))
 done
+rm -rf "$out"
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

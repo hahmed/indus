@@ -1,0 +1,8 @@
+#!/bin/bash
+# tools/rubyspec/bucket RESULTS_TSV 'reason substring'   -- rerun just the examples whose reason matches, update the TSV
+cd "$(dirname "$0")/../.."
+tsv=$1; pat=$2; dir=build/rubyspec-ex-$(basename "$tsv" .tsv | sed 's/rubyspec-indus-//')
+list=$(mktemp); awk -F'\t' -v p="$pat" 'index($3, p) {print $1}' "$tsv" > "$list"
+echo "$(wc -l < "$list" | tr -d ' ') examples"
+RUBYSPEC_ONLY=$list tools/rubyspec/run-indus.sh "$dir" "$tsv" | tail -1
+rm -f "$list"
