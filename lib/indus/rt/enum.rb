@@ -2167,3 +2167,21 @@ def __arr_uniq_by(a, keys)
   end
   out
 end
+def __hash_eq(a, b)
+  return false if __hcount(a) != __hcount(b)
+  i = 0
+  while i < __hcount(a)
+    k = __hkey_at(a, i)
+    return false unless __hkey_p(b, k)
+    return false unless __hval_at(a, i) == b[k]
+    i = i + 1
+  end
+  true
+end
+def __hash_eql_p(a, b) = __hash_eq(a, b)
+def __hash_take(h, n) = __arr_take(__hash_to_a(h), n)
+def __hash_drop(h, n) = __arr_drop(__hash_to_a(h), n)
+def __hash_uniq(h) = __hash_to_a(h)
+def __hash_to_h(h) = h
+def __hash_each_cons1(h, n) = __arr_each_cons1(__hash_to_a(h), n)
+def __hash_find_index(h, pair) = __arr_index(__hash_to_a(h), pair)

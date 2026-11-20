@@ -274,6 +274,12 @@ module Indus
               z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
               i.args = [c, z]; changed = true
             end
+            if i.op == :cmp && hsh(of(f, i.args[0])) && hsh(of(f, i.args[1])) && %i[eq ne].include?(i.cond) && !i.args[0].equal?(i.args[1]) # Hash#==: same keys, equal values
+              l, r = i.args
+              c = Inst.new(:call, [fn(:__hash_eq), l, r]); c.ty = :bool; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+              z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
+              i.args = [c, z]; i.cond = i.cond == :eq ? :ne : :eq; changed = true
+            end
             if i.op == :cmp && arr(of(f, i.args[0])) && arr(of(f, i.args[1])) && %i[eq ne].include?(i.cond) # Array#== is elementwise
               l, r = i.args; fn = fn(:__arr_eq)
               c = Inst.new(:call, [fn, l, r]); c.ty = :bool; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
@@ -1349,6 +1355,7 @@ module Indus
       i.op = :call; i.args = [fn(:__raise_arg_error), m]; i.ty = :nil
     end
 
+    HASH_VIA_PAIRS = %i[cycle zip take drop take_while drop_while each_cons each_slice first min max minmax sort tally uniq to_a entries reverse_each each_entry lazy chunk_while slice_when flat_map sum inject reduce find_index min_by max_by sort_by group_by partition each_with_index each_with_object].freeze
     PRELUDE_NILABLE = %i[MatchData].freeze # library classes whose methods commonly return nil instead of an instance (match misses)
     # what nil answers to a method the class lacks (NilClass's own), as a builder of the instruction in the nil arm
     def self.nil_answer(name, argc)
@@ -1754,6 +1761,10 @@ module Indus
       if t == :int && args.size == 1 && name == :divmod && of(f, args[0]) == :float then i.op = :call; i.args = [fn(:__float_divmod), recv, args[0]]; return end
       fam = hsh(t) ? "hash" : (t == :int || t == :float || t == :int?) ? "num" : t == :str ? "str" : big?(t) ? "big" : arr(t) ? "arr" : t == :sym ? "sym" : t == :nil ? "nil" : t == :bool ? "bool" : nil
       if fam && %w[sym nil bool big].include?(fam) && !prelude_method(fam, name, args.size) && prelude_method("obj", name, args.size) then fam = "obj" end # a `class Object` def reached through a Symbol/nil/bool/Bignum
+      if fam == "hash" && !prelude_method("hash", name, args.size) && HASH_VIA_PAIRS.include?(name) && prelude_method("arr", name, args.size) # an Enumerable method a Hash answers through its pairs
+        pairs = Inst.new(:call, [fn(:__hash_to_a), recv]); pairs.ty = nil; pairs.block = i.block; i.block.insts.insert(i.block.insts.index(i), pairs)
+        i.args[1] = pairs; return
+      end
       if fam && (fn = prelude_method(fam, name, args.size))
         if fam == "str" && args.any? { |a| a.op == :const && a.ty == :nil } # "s".index(nil): TypeError, not a null read
           w = Inst.new(:sconst, ["String"]); w.ty = :str; w.block = i.block; i.block.insts.insert(i.block.insts.index(i), w)

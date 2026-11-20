@@ -1979,6 +1979,14 @@ module Indus
       end
       if n.name == :rehash && args.empty? && n.receiver && kind_of(n.receiver) == :hash then return expr(n.receiver) end
       if n.name == :append && n.receiver && kind_of(n.receiver) == :array then return call(n.copy(name: :push)) end # alias
+      to_a_of = ->(node) { Prism::CallNode.new(node.send(:source), 0, node.location, 0, node, nil, :to_a, node.location, nil, nil, nil, nil, nil) }
+      if %i[zip cycle take drop take_while drop_while each_cons tally uniq reverse_each lazy chunk_while slice_when find_index].include?(n.name) && n.receiver && kind_of(n.receiver) == :hash && !n.receiver.is_a?(Prism::HashNode)
+        return call(n.copy(receiver: to_a_of.(n.receiver))) # Enumerable on a Hash: over its pairs
+      end
+      if n.name == :zip && args.any? { kind_of(_1) == :hash } then return call(n.copy(arguments: n.arguments.copy(arguments: args.map { kind_of(_1) == :hash ? to_a_of.(_1) : _1 }))) end
+      if n.name == :first && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :cycle && n.receiver.receiver && kind_of(n.receiver.receiver) == :hash
+        return call(n.copy(receiver: n.receiver.copy(receiver: to_a_of.(n.receiver.receiver))))
+      end
       if n.name == :round && n.receiver && args.last.is_a?(Prism::KeywordHashNode) && args.last.elements.size == 1 && args.last.elements[0].key.is_a?(Prism::SymbolNode) && args.last.elements[0].key.unescaped == "half"
         mode = args.last.elements[0].value; kd = kind_of(n.receiver)
         if kd == :float && args.size == 1 then return emit(:call, [demand(:__float_round_half), expr(n.receiver), expr(mode)]) end
@@ -2651,7 +2659,7 @@ module Indus
         outv = :"toa#{@f.blocks.size}:out"; @locals[outv] = arr
         counted_loop(const(0), len, :lt, [], []) { |i, _ps, _pfx| @locals[outv] = emit(:aset, [@locals[outv], i, emit(:add, [lo, i])]) }
         @locals.delete(outv)
-      elsif %i[unshift prepend].include?(n.name) && args.size >= 1 && kind_of(n.receiver) == :array && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode) || n.receiver.is_a?(Prism::ArrayNode))
+      elsif %i[unshift prepend].include?(n.name) && args.size >= 1 && kind_of(n.receiver) != :str && !((kk = kind_of(n.receiver)).is_a?(Symbol) && @classes[kk]) && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode) || n.receiver.is_a?(Prism::ArrayNode))
         # a.unshift(x[, y]): insert at 0 (grows: the home is rebound, as insert does)
         src = n.send(:source); loc = n.location; zero = Prism::IntegerNode.new(src, 0, loc, 0, 0)
         return call(n.copy(name: :insert, arguments: n.arguments.copy(arguments: [zero, *args]))) if args.size == 1
@@ -2795,6 +2803,7 @@ module Indus
         named = ps.keywords.map(&:name)
         raise "**hash with several splats into **rest: not supported" if splats.size > 1
         h = splats.empty? ? emit(:hnew, []) : emit(:mcall, [:dup, splats[0]]) # m(**other): a copy of other's pairs (its type is other's)
+        named.each { |nm| emit(:call, [demand(:__hash_delete), h, (c = const(sym_id(nm.to_s)); c.ty = :sym; c)]) } unless splats.empty? # the named keywords took theirs
         given.each { |nm, node| h = emit(:hset, [h, (c = const(sym_id(nm.to_s)); c.ty = :sym; c), expr(node)]) unless named.include?(nm) }
         vals[idx] = h
       end
@@ -2841,6 +2850,9 @@ module Indus
       when :__dbg then emit(:puts_i, [expr(args[0])])
       when :__mmap then emit(:rawmmap, [expr(args[0])])
       when :__munmap then emit(:rawmunmap, [expr(args[0]), expr(args[1])])
+      when :__method__ # the enclosing method's name as a Symbol (nil at the top level)
+        mn = @f && @f.name.to_s !~ /\Amain\z|\A__/ ? @f.name.to_s.split(/[#.]/).last.sub(/@v\d+\z/, "").sub(/\$\d+.*\z/, "") : nil
+        return mn ? (c = const(sym_id(mn)); c.ty = :sym; c) : nil_const
       when :__trap then emit(:trap, [])
       # unsigned / wrapping 64-bit arithmetic for the float printer
       when :__fbits then emit(:fbits, [expr(args[0])])
