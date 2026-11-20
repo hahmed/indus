@@ -1443,6 +1443,7 @@ module Indus
       if %i[int int?].include?(t) && args.size == 1 && big?(of(f, args[0])) && %i[gcd lcm fdiv divmod remainder div modulo pow eql? coerce].include?(name) # 6.lcm(bignum): the receiver lifted
         recv = coerce(f, i.block, i, recv, BIG); i.args[1] = recv; t = BIG
       end
+      if big?(t) && name == :to_s && args.size == 1 then i.op = :call; i.args = [fn(:__big_to_s1), recv, args[0]]; i.ty = :str; return end # a Bignum in a base
       if big?(t) && (bm = BIG_METHODS[name]) && (bm[0].nil? || args.size <= 1) # a method on a Bignum: the prelude's
         callee, rt = bm
         if callee.nil?

@@ -459,3 +459,15 @@ def __dyn_to_big(v)
   raise(TypeError, "not an Integer") unless __big_p(v)
   __unbox_big(v)
 end
+def __big_to_s1(a, base)
+  return __big_to_s(a) if base == 10
+  return "0" if __big_zero_p(a)
+  out = ""
+  cur = __big_abs(a)
+  rem = [0]
+  while !__big_zero_p(cur)
+    cur = __big_divmod_small(cur, base, rem)
+    out = "0123456789abcdefghijklmnopqrstuvwxyz"[rem[0]] + out
+  end
+  a[0] == 1 ? "-" + out : out
+end

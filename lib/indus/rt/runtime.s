@@ -1157,8 +1157,15 @@ rt_str_to_i:
         sub     w5, w5, #48
         cmp     w5, #9
         b.hi    8f
+        movz    x6, #0xCCCC                     // 0x0CCCCCCCCCCCCCCC: x3 at or past this and the next digit overflows (the magnitude stays below 2^64, so the sign bit shows it)
+        movk    x6, #0xCCCC, lsl #16
+        movk    x6, #0xCCCC, lsl #32
+        movk    x6, #0x0CCC, lsl #48
+        cmp     x3, x6
+        b.hi    7f
         mov     x6, #10
         madd    x3, x3, x6, x5
+        tbnz    x3, #63, 7f
 5:      add     x0, x0, #1
         sub     x2, x2, #1
         b       4b
@@ -1166,6 +1173,7 @@ rt_str_to_i:
         neg     x3, x3
 9:      mov     x0, x3
         ret
+7:      brk     #0                              // a Bignum literal in a String: to_i would need a Bignum result
 
 // rt_print_str(x0 s): write without newline
 rt_print_str:
