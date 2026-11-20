@@ -1441,6 +1441,7 @@ module Indus
           r = emit(:idx_set, [recv, k, v])
           @locals[lname(n.receiver.name)] = r if n.receiver.is_a?(Prism::LocalVariableReadNode) })
       when Prism::SelfNode then me_val
+      when Prism::KeywordHashNode then expr(Prism::HashNode.new(n.send(:source), 0, n.location, 0, n.location, n.elements, n.location)) # bare `k: v` arguments to a builtin: a Hash
       when Prism::ArrayNode
         if n.elements.any? { _1.is_a?(Prism::SplatNode) } # [*a, x, *b]: the runs between splats are literals, joined with +
           runs = n.elements.chunk_while { |x, y| !x.is_a?(Prism::SplatNode) && !y.is_a?(Prism::SplatNode) }.to_a
@@ -1914,6 +1915,13 @@ module Indus
           (a.left.value..(a.exclude_end? ? a.right.value - 1 : a.right.value)).map { |k| a.left.copy(value: k) }
         end
         return expr(n.copy(arguments: n.arguments.copy(arguments: expanded)))
+      end
+      if %i[merge! update].include?(n.name) && args.size == 1 && !n.block && n.receiver && kind_of(n.receiver) == :hash && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode))
+        # h.merge!(o) on a variable: h = h.merge(o) (the handle may move; the variable takes the merged hash)
+        src = n.send(:source); loc = n.location
+        merged = n.copy(name: :merge)
+        w = n.receiver.is_a?(Prism::LocalVariableReadNode) ? Prism::LocalVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, 0, loc, merged, loc) : Prism::InstanceVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, loc, merged, loc)
+        return expr(w)
       end
       if n.name == :default && args.empty? && n.receiver && kind_of(n.receiver) == :hash # h.default: the Hash.new(v) default when known here, else nil
         d = hash_default_of(n.receiver)
@@ -2555,6 +2563,14 @@ module Indus
         if n.receiver.is_a?(Prism::LocalVariableReadNode) then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
         else emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
         r
+      elsif n.name == :[] && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash # Hash[] / Hash[k, v, ...] / Hash[pairs] / Hash[hash]
+        src = n.send(:source); loc = n.location
+        if args.empty? then expr(Prism::HashNode.new(src, 0, loc, 0, loc, [], loc))
+        elsif args.size == 1 && args[0].is_a?(Prism::KeywordHashNode) then expr(Prism::HashNode.new(src, 0, loc, 0, loc, args[0].elements, loc))
+        elsif args.size == 1 && (kind_of(args[0]) == :hash || args[0].is_a?(Prism::HashNode)) then emit(:mcall, [:dup, expr(args[0])])
+        elsif args.size == 1 then emit(:call, [demand(:__pairs_to_hash), expr(args[0])])
+        elsif args.size.even? then expr(Prism::HashNode.new(src, 0, loc, 0, loc, args.each_slice(2).map { |k, v| Prism::AssocNode.new(src, 0, loc, 0, k, v, nil) }, loc))
+        else emit(:call, [demand(:__raise_arg_error), emit(:sconst, ["odd number of arguments for Hash"])]) end
       elsif n.name == :[] && n.receiver.is_a?(Prism::ConstantReadNode) && (sf = @funcs[:"#{n.receiver.name}.[]"]) # Klass[x]: the class method
         emit(:call, [sf, *call_args(sf, args)])
       elsif n.name == :[] && args.size == 1 && args[0].is_a?(Prism::RangeNode) # s[a..b], a[2..], a[..-2]

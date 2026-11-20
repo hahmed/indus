@@ -1946,3 +1946,25 @@ def __arr_bsearch_index_fn(a, pred)
   end
   lo < a.length ? lo : nil
 end
+
+def __hash_assoc(h, k) = __hkey_p(h, k) ? [k, h[k]] : nil
+# shift: the first pair, removed
+def __hash_shift(h)
+  return nil if __hcount(h) == 0
+  k = __hkey_at(h, 0)
+  v = h[k]
+  __hash_delete(h, k)
+  [k, v]
+end
+def __hash_fetch_values(h, ks)
+  out = []
+  i = 0
+  while i < ks.length
+    out.push(__hash_fetch(h, ks[i]))
+    i = i + 1
+  end
+  out
+end
+def __hash_fetch_values1(h, k) = __hash_fetch_values(h, [k])
+def __hash_fetch_values2(h, a, b) = __hash_fetch_values(h, [a, b])
+def __hash_fetch_values3(h, a, b, c) = __hash_fetch_values(h, [a, b, c])
