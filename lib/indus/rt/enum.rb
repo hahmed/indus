@@ -364,7 +364,7 @@ def __str_delete(s, chars)
   out = ""
   i = 0
   while i < s.length
-    out = out + s[i, 1] unless __str_include_p(chars, s[i, 1])
+    out = out + s[i, 1] unless __charset_p(chars, __ld8(s, i))
     i = i + 1
   end
   out
@@ -1702,7 +1702,7 @@ def __str_squeeze1(s, set)
   i = 0
   while i < s.length
     c = __ld8(s, i)
-    out = out + s[i, 1] unless i > 0 && c == __ld8(s, i - 1) && __str_include_p(set, s[i, 1])
+    out = out + s[i, 1] unless i > 0 && c == __ld8(s, i - 1) && __charset_p(set, c)
     i = i + 1
   end
   out
@@ -2044,8 +2044,6 @@ def __arr_flatten_bang1(a, depth)
 end
 def __arr_values_at3(a, i, j, k) = __arr_values_at(a, [i, j, k])
 def __arr_values_at4(a, i, j, k, l) = __arr_values_at(a, [i, j, k, l])
-def __arr_sum0(a) = __arr_sum(a)
-def __arr_none_p0(a) = __arr_none_p(a)
 def __str_codepoints(s)
   out = []
   i = 0
@@ -2111,3 +2109,61 @@ def __hash_entries(h) = __hash_to_a(h)
 def __hash_zip1(h, other) = __arr_zip(__hash_to_a(h), other)
 def __hash_each_slice1(h, n) = __arr_each_slice1(__hash_to_a(h), n)
 def __hash_sum0(h) = __arr_sum(__hash_to_a(h))
+def __hash_flatten1(h, depth) = depth <= 0 ? __hash_to_a(h) : __arr_flatten1(__hash_to_a(h), depth)
+# predicates without a block: truthiness of the elements
+def __arr_any_p(a)
+  i = 0
+  while i < a.length
+    return true if __truthy_elem(a[i])
+    i = i + 1
+  end
+  false
+end
+def __arr_all_p(a)
+  i = 0
+  while i < a.length
+    return false unless __truthy_elem(a[i])
+    i = i + 1
+  end
+  true
+end
+def __arr_none_p(a) = !__arr_any_p(a)
+def __arr_one_p(a)
+  n = 0
+  i = 0
+  while i < a.length
+    n = n + 1 if __truthy_elem(a[i])
+    i = i + 1
+  end
+  n == 1
+end
+def __truthy_elem(e) = __dyn_truthy(__to_dyn(e))
+def __dyn_truthy(v) = !(__same(v, 0) || (__tag(v) == 10 && !__unbox_bool(v)))
+def __arr_each_index(a)
+  out = []
+  i = 0
+  while i < a.length
+    out.push(i)
+    i = i + 1
+  end
+  out
+end
+def __arr_cycle1(a, n) = __arr_times(a, n)
+def __arr_dig1(a, i) = a[i]
+def __arr_eql_p(a, b) = __arr_eq(a, b)
+def __arr_sample0(a) = a[__rand_int(a.length)]
+def __arr_minmax_by(a, keys) = a.length == 0 ? [nil, nil] : [__arr_min_by(a, keys), __arr_max_by(a, keys)]
+# uniq { |x| key }: the first element for each distinct key
+def __arr_uniq_by(a, keys)
+  out = []
+  seen = []
+  i = 0
+  while i < a.length
+    unless __arr_include_p(seen, keys[i])
+      seen.push(keys[i])
+      out.push(a[i])
+    end
+    i = i + 1
+  end
+  out
+end

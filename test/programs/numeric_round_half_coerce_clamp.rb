@@ -1,0 +1,1 @@
+p 7.5.round(half: :even), 8.5.round(half: :even), 7.5.round(half: :down), 7.5.round(half: :up), 25.round(-1, half: :even), 35.round(-1, half: :even), 25.round(-1, half: :up), 7.coerce(2.5), 7.clamp(..5), 7.clamp(8..), 3.14.truncate(1), Math.log(8, 2), 3.respond_to?(:+), "s".respond_to?(:upcase), [].respond_to?(:each)

@@ -192,6 +192,7 @@ module Indus
       case n.name
       when *ARITH
         return recv if recv == :str && n.name == :+
+        return :str if n.name == :* && recv.is_a?(Array) && recv[0] == :array && akinds[0] == :str # arr * "," is join
         l, r = recv, akinds[0]
         return :float if l == :float || r == :float
         return l == :int? ? :int : l

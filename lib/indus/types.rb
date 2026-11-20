@@ -287,8 +287,8 @@ module Indus
             if i.op == :pow && i.args.all? { _1.op == :const && _1.args[0].is_a?(Integer) } && i.args[1].args[0] >= 0 && (i.args[0].args[0] ** i.args[1].args[0]).then { |v| v > 2**62 || v < -2**62 } && !@no_big_rewrite
               big_op(f, i); changed = true
             end
-            if %i[add sub and or mul].include?(i.op) && arr(of(f, i.args[0])) # a + b, a - b, a & b, a | b, a * n on arrays
-              fnm = { add: :__arr_plus, sub: :__arr_minus, and: :__arr_and, or: :__arr_or, mul: :__arr_times }.fetch(i.op)
+            if %i[add sub and or mul].include?(i.op) && arr(of(f, i.args[0])) && !big?(of(f, i.args[0])) && !(i.op == :mul && of(f, i.args[1]).nil?) # a + b, a - b, a & b, a | b, a * n on arrays (a * x waits for x's type: a count or a join separator)
+              fnm = i.op == :mul && of(f, i.args[1]) == :str ? :__arr_join : { add: :__arr_plus, sub: :__arr_minus, and: :__arr_and, or: :__arr_or, mul: :__arr_times }.fetch(i.op)
               fn = fn(fnm); i.op = :call; i.args = [fn, *i.args]; i.ty = nil; changed = true
             end
             if @settled && i.op == :is_sym && ((t = of(f, i.args[0])) || true) then i.op = :const; i.args = [t == :sym ? 1 : 0]; i.ty = :bool; changed = true end
@@ -346,7 +346,9 @@ module Indus
               if i.op == :respond_to_q && (t = of(f, i.args[0])) && @settled
                 nm = i.args[1]
                 has = ->(cn) { k = @classes[cn]; k && (k.find_method(nm) || k.find_reader(nm) || k.find_writer(nm)) && !k.hidden&.[](nm) }
-                builtin = ->(fam) { prelude_method(fam, nm, 0) || prelude_method(fam, nm, 1) || %i[to_s inspect class nil? == != hash size length].include?(nm) }
+                builtin = ->(fam) { prelude_method(fam, nm, 0) || prelude_method(fam, nm, 1) || %i[to_s inspect class nil? == != hash size length dup clone freeze frozen? is_a? kind_of? instance_of? respond_to? send object_id equal? eql? tap then itself].include?(nm) ||
+                                    (fam == "num" && %i[+ - * / % ** <=> < <= > >= & | ^ ~ << >> -@ +@ [] abs to_i to_f to_s zero? succ pred times upto downto step div divmod fdiv floor ceil round truncate coerce integer? even? odd? chr ord digits pow gcd lcm].include?(nm)) ||
+                                    (fam == "str" && %i[+ * % <=> == =~ [] []= << length size upcase downcase].include?(nm)) || (fam == "arr" && %i[+ - * & | <=> == [] []= << length size each map].include?(nm)) || (fam == "hash" && %i[[] []= == each map keys values].include?(nm)) }
                 if (cs = classes_of(t))
                   yes = cs.select { has.(_1) }
                   if cs.size == 1 && yes.empty? && (rtm = @classes[cs[0]]&.find_method(:respond_to_missing?)) # the class decides at run time
@@ -809,7 +811,8 @@ module Indus
           end
         when :to_s # (by type, resolved in the fixpoint's settled round; anything left is an int)
           t = of(f, i.args[0])
-          if t == :int? then i.op = :call; i.args = [fn(:__opt_to_s), i.args[0]]
+          if t == :int? && !f.name.to_s.start_with?("__opt_") then i.op = :call; i.args = [fn(:__opt_to_s), i.args[0]]
+          elsif t == :int? then i.op = :itos # inside __opt_to_s / __opt_inspect: the nil case was tested already
           elsif t == :nil then i.op = :sconst; i.args = [""] # nil.to_s: "" (after the fixpoint a nil is final)
           elsif t == :bool then i.op = :bool_to_s
           elsif t == :float then i.op = :call; i.args = [fn(:__float_to_s), i.args[0]]
@@ -1540,6 +1543,8 @@ module Indus
         i.args = [recv, args[0]]; i.ty = nil; return
       end
       if name == :+ && args.size == 1 && t == :str then i.op = :scat; i.args = [recv, args[0]]; i.ty = :str; return end
+      if %i[inspect to_s].include?(name) && args.empty? && t == :int? && !prelude?(f) then i.op = :call; i.args = [fn(name == :inspect ? :__opt_inspect : :__opt_to_s), recv]; i.ty = :str; return end # a nullable int: nil or the digits (user code; the prelude narrows its own)
+      if name == :class && args.empty? && t == :int? && @settled then i.op = :call; i.args = [fn(:__opt_class_name), recv]; i.ty = :str; return end # Integer or NilClass by the sentinel
       if name == :class && args.empty? && (cn = { int: "Integer", float: "Float", str: "String", sym: "Symbol", bool: "TrueClass", nil: "NilClass" }[t] || (arr(t) && "Array") || (hsh(t) && "Hash"))
         return if t == :bool || t == :nil && recv.op != :const # true/false share a type; a joined nil may still widen
         return if !@settled && %i[aget hget hval_at idx phi apop].include?(recv.op) # an element may still widen to dyn
@@ -1625,7 +1630,8 @@ module Indus
         if arr(at) then i.op = :call; i.args = [fn(:__arr_spaceship), recv, args[0]]; i.ty = :int?; return
         elsif at != :dyn then i.op = :const; i.args = [0]; i.ty = :nil; return end
       end
-      if name == :<=> && (t == :int || t == :str || t == :float)
+      if name == :<=> && (t == :int || t == :str || t == :float || t == :int?)
+        t = :int if t == :int?
         at = of(f, args[0])
         return unless at # the argument's type decides the callee
         if t != :str && big?(at) # 1 <=> bignum: through the Bignum compare

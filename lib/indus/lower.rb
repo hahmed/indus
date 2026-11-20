@@ -1230,6 +1230,7 @@ module Indus
       when Prism::HashNode then :hash
       when Prism::RangeNode then :range
       when Prism::IntegerNode then :int
+      when Prism::FloatNode then :float
       when Prism::StringNode, Prism::InterpolatedStringNode then :str
       when Prism::ParenthesesNode then kind_of(n.body.body.last)
       when Prism::LocalVariableReadNode then (@kinds || {})[lname(n.name)]
@@ -1969,6 +1970,41 @@ module Indus
         w = n.receiver.is_a?(Prism::LocalVariableReadNode) ? Prism::LocalVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, 0, loc, plain, loc) : Prism::InstanceVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, loc, plain, loc)
         return expr(w)
       end
+      # h.transform_values! { } / transform_keys! { } / select! / reject! / filter_map... as a statement on a hash variable: h = h.transform_values { }
+      if %i[transform_values! transform_keys! select! filter! reject! compact! sort_by!].include?(n.name) && n.receiver && kind_of(n.receiver) == :hash && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode)) && @stmt_node.equal?(n)
+        src = n.send(:source); loc = n.location
+        plain = n.copy(name: n.name.to_s.chomp("!").to_sym)
+        w = n.receiver.is_a?(Prism::LocalVariableReadNode) ? Prism::LocalVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, 0, loc, plain, loc) : Prism::InstanceVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, loc, plain, loc)
+        return expr(w)
+      end
+      if n.name == :rehash && args.empty? && n.receiver && kind_of(n.receiver) == :hash then return expr(n.receiver) end
+      if n.name == :append && n.receiver && kind_of(n.receiver) == :array then return call(n.copy(name: :push)) end # alias
+      if n.name == :round && n.receiver && args.last.is_a?(Prism::KeywordHashNode) && args.last.elements.size == 1 && args.last.elements[0].key.is_a?(Prism::SymbolNode) && args.last.elements[0].key.unescaped == "half"
+        mode = args.last.elements[0].value; kd = kind_of(n.receiver)
+        if kd == :float && args.size == 1 then return emit(:call, [demand(:__float_round_half), expr(n.receiver), expr(mode)]) end
+        if kd == :int && args.size == 2 then return emit(:call, [demand(:__num_round_half), expr(n.receiver), expr(args[0]), expr(mode)]) end
+      end
+      if n.name == :coerce && args.size == 1 && n.receiver && kind_of(n.receiver) == :int && kind_of(args[0]) == :float then return emit(:call, [demand(:__num_coerce_f), expr(n.receiver), expr(args[0])]) end
+      if n.name == :clamp && args.size == 1 && args[0].is_a?(Prism::RangeNode) && n.receiver # x.clamp(lo..hi) / clamp(..hi) / clamp(lo..)
+        r = args[0]; src = n.send(:source); loc = n.location
+        lo = r.left || Prism::CallNode.new(src, 0, loc, 0, n.receiver, nil, :itself, loc, nil, nil, nil, nil, nil)
+        hi = r.right || Prism::CallNode.new(src, 0, loc, 0, n.receiver, nil, :itself, loc, nil, nil, nil, nil, nil)
+        return call(n.copy(arguments: n.arguments.copy(arguments: [lo, hi])))
+      end
+      if %i[grep grep_v].include?(n.name) && args.size == 1 && !n.block && n.receiver && kind_of(n.receiver) == :array && (args[0].is_a?(Prism::RangeNode) || args[0].is_a?(Prism::RegularExpressionNode))
+        # a.grep(lo..hi) / grep(/re/): select by === (a Range: bounds; a Regexp: match), grep_v the complement
+        src = n.send(:source); loc = n.location
+        x = Prism::LocalVariableReadNode.new(src, 0, loc, 0, :__g, 0)
+        test = if args[0].is_a?(Prism::RangeNode)
+                 r = args[0]
+                 lo = r.left && Prism::CallNode.new(src, 0, loc, 0, x, nil, :>=, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, [r.left]), nil, nil, nil)
+                 hi = r.right && Prism::CallNode.new(src, 0, loc, 0, x, nil, r.exclude_end? ? :< : :<=, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, [r.right]), nil, nil, nil)
+                 lo && hi ? Prism::AndNode.new(src, 0, loc, 0, lo, hi, loc) : (lo || hi)
+               else Prism::CallNode.new(src, 0, loc, 0, x, nil, :match?, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, [args[0]]), nil, nil, nil) end
+        params = Prism::BlockParametersNode.new(src, 0, loc, 0, Prism::ParametersNode.new(src, 0, loc, 0, [Prism::RequiredParameterNode.new(src, 0, loc, 0, :__g)], [], nil, [], [], nil, nil), [], nil, nil)
+        blk = Prism::BlockNode.new(src, 0, loc, 0, [:__g], params, Prism::StatementsNode.new(src, 0, loc, 0, [test]), loc, loc)
+        return call(Prism::CallNode.new(src, 0, loc, 0, n.receiver, nil, n.name == :grep ? :select : :reject, loc, nil, nil, nil, nil, blk))
+      end
       if %i[merge! update].include?(n.name) && args.size == 1 && !n.block && n.receiver && kind_of(n.receiver) == :hash && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode))
         # h.merge!(o) on a variable: h = h.merge(o) (the handle may move; the variable takes the merged hash)
         src = n.send(:source); loc = n.location
@@ -2344,6 +2380,9 @@ module Indus
         @cur = mb2; inner = mb2.phi; inner.args = [[tb2, hi], [eb2, x]]; emit(:br, [mb])
         @cur = mb; p = mb.phi; p.args = [[tb, lo], [mb2, inner]]; p
       elsif n.name == :~ && args.empty? && n.receiver then emit(:xor, [expr(n.receiver), const(-1)]) # bitwise not
+      elsif %i[[] slice].include?(n.name) && args.size.between?(1, 2) && (args[0].is_a?(Prism::RegularExpressionNode) || kind_of(args[0]) == :Regexp) && n.receiver && (kind_of(n.receiver) == :str || n.receiver.is_a?(Prism::StringNode)) # s[/re/] / s[/re/, n]: the match (group n), or nil
+        re = expr(args[0]); sv = expr(n.receiver)
+        emit(:call, [demand(:__str_match_group), sv, re, args[1] ? expr(args[1]) : const(0)])
       elsif %i[index rindex byteindex byterindex start_with? match?].include?(n.name) && args.size.between?(1, 2) && (args[0].is_a?(Prism::RegularExpressionNode) || kind_of(args[0]) == :Regexp) && n.receiver && !(n.name == :match? && args.size == 1)
         re = expr(args[0]); sv = expr(n.receiver)
         base = n.name == :start_with? ? :__str_start_with_re : :"__str_#{n.name.to_s.sub("?", "_p")}_re"
@@ -2379,6 +2418,8 @@ module Indus
         emit(:call, [demand(:__num_step_to), expr(n.receiver), expr(args[0]), expr(args[1])])
       elsif n.name == :sqrt && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Integer
         emit(:call, [demand(:__num_isqrt), expr(args[0])])
+      elsif n.name == :log && args.size == 2 && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math # Math.log(x, base) = log(x) / log(base)
+        emit(:div, [emit(:libm, [:log, expr(args[0])]), emit(:libm, [:log, expr(args[1])])])
       elsif %i[cbrt hypot log2 log10 log exp atan2 atan tan asin acos].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
         emit(:libm, [n.name, *args.map { expr(_1) }]) # libm in-process; the Ruby libm (rt/libm.rb) standalone
       elsif n.name == :rand && n.receiver.nil? && args.size <= 1
@@ -2610,6 +2651,12 @@ module Indus
         outv = :"toa#{@f.blocks.size}:out"; @locals[outv] = arr
         counted_loop(const(0), len, :lt, [], []) { |i, _ps, _pfx| @locals[outv] = emit(:aset, [@locals[outv], i, emit(:add, [lo, i])]) }
         @locals.delete(outv)
+      elsif %i[unshift prepend].include?(n.name) && args.size >= 1 && kind_of(n.receiver) == :array && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode) || n.receiver.is_a?(Prism::ArrayNode))
+        # a.unshift(x[, y]): insert at 0 (grows: the home is rebound, as insert does)
+        src = n.send(:source); loc = n.location; zero = Prism::IntegerNode.new(src, 0, loc, 0, 0)
+        return call(n.copy(name: :insert, arguments: n.arguments.copy(arguments: [zero, *args]))) if args.size == 1
+        v = nil; args.each_with_index { |a, k| v = call(n.copy(name: :insert, arguments: n.arguments.copy(arguments: [Prism::IntegerNode.new(src, 0, loc, 0, k), a]))) }
+        v
       elsif n.name == :insert && args.size == 2 && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode) || n.receiver.is_a?(Prism::ArrayNode))
         r = emit(:call, [demand(:__arr_insert), expr(n.receiver), expr(args[0]), expr(args[1])]); r.routed = :insert # grows: rebind the home, as push does (Types reroutes a String to __str_insert)
         if n.receiver.is_a?(Prism::LocalVariableReadNode) then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
@@ -3087,13 +3134,14 @@ module Indus
       when :each_line # fd.each_line { |line| }: the whole file, split keeping each newline
         lines = emit(:call, [demand(:__fd_lines), expr(recv)])
         return array_loop(lines, :each, params, body)
-      when :sort_by, :min_by, :max_by # Schwartzian: keys once by `map`, then the prelude sorts/selects by key
+      when :sort_by, :min_by, :max_by, :minmax_by, :uniq, :group_by_keys # Schwartzian: keys once by `map`, then the prelude sorts/selects by key
         if recv && !@recv_value && kind_of(recv) == :hash # a hash: sort its pairs
           return iterate_array_value(n, args, hash_pairs(expr(recv)))
         end
         arr = recv_val(recv)
         keys = array_loop(arr, :map, params, body)
-        return emit(:call, [demand(:"__arr_#{n.name}"), arr, keys])
+        return emit(:call, [demand(n.name == :uniq ? :__arr_uniq_by : :"__arr_#{n.name}"), arr, keys])
+      when :keep_if then return block_call(n.copy(name: :select!), args) # keep_if is select!
       when :reduce, :inject # a fold: acc = body(acc, elem)
         arr = recv_val(recv)
         accv = :"fold#{@f.blocks.size}:v"

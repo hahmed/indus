@@ -1194,15 +1194,23 @@ def __str_sub(s, pat, rep)
   s[0, at] + rep + s[at + pat.length, s.length - at - pat.length]
 end
 
+# a tr-style character set ("a-z", "^aeiou", "lo"): is byte c in it?
+def __charset_p(set, c)
+  neg = set.length > 1 && __ld8(set, 0) == 94
+  body = __tr_expand(neg ? set[1, set.length - 1] : set)
+  found = false
+  j = 0
+  while j < body.length
+    found = true if __ld8(body, j) == c
+    j = j + 1
+  end
+  neg ? !found : found
+end
 def __str_count(s, set)
   n = 0
   i = 0
   while i < s.length
-    j = 0
-    while j < set.length
-      n = n + 1 if __ld8(s, i) == __ld8(set, j)
-      j = j + 1
-    end
+    n = n + 1 if __charset_p(set, __ld8(s, i))
     i = i + 1
   end
   n
@@ -1290,6 +1298,8 @@ end
 def __opt_to_s(v)
   v == -9223372036854775808 ? "" : v.to_s
 end
+def __opt_inspect(v) = v == -9223372036854775808 ? "nil" : v.to_s
+def __opt_class_name(v) = v == -9223372036854775808 ? "NilClass" : "Integer"
 
 def __class_name(id) = CLASS_NAMES[id]
 def __obj_default_inspect(id) = "#<" + CLASS_NAMES[id] + ">"
@@ -1505,7 +1515,7 @@ def __float_mod(a, b)
 end
 def __float_divmod(a, b)
   q = __num_floor(a / b)
-  [q, a - b * q.to_f]
+  [q, a % b]
 end
 def __float_floor1(f, digits)
   m = 1.0
@@ -1760,4 +1770,36 @@ def __str_setbyte(s, i, b)
   raise(IndexError, "index out of string") if i < 0 || i >= s.length
   __st8(s, i, b & 255)
   b
+end
+# round(half: :even / :down / :up) on a Float (digits 0) and an Integer (round(-n, half:))
+def __float_round_half(f, mode)
+  fl = __num_floor(f)
+  diff = f - fl.to_f
+  return fl if diff < 0.5
+  return fl + 1 if diff > 0.5
+  return (fl % 2 == 0 ? fl : fl + 1) if mode == :even
+  return fl if mode == :down
+  f >= 0.0 ? fl + 1 : fl
+end
+def __num_round_half(n, d, mode)
+  return n if d >= 0
+  m = __num_pow10(0 - d)
+  q = n / m
+  r = n - q * m
+  twice = r * 2
+  return q * m if twice < m
+  return (q + 1) * m if twice > m
+  return ((q % 2 == 0) ? q : q + 1) * m if mode == :even
+  return q * m if mode == :down
+  n >= 0 ? (q + 1) * m : q * m
+end
+def __num_coerce_f(a, b) = [b, a.to_f]
+def __num_truncate1(f, digits)
+  m = 1.0
+  i = 0
+  while i < digits
+    m = m * 10.0
+    i = i + 1
+  end
+  (f * m).to_i.to_f / m
 end

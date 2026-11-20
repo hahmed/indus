@@ -530,3 +530,11 @@ def __str_match_p_re1(s, re, from)
   caps = __re_caps(re.ncap)
   __re_search(re.prog, s, from, caps, re.ncap) >= 0
 end
+# s[/re/, n]: group n of the first match (0 the whole), nil when no match
+def __str_match_group(s, re, n)
+  caps = __re_caps(re.ncap)
+  at = __re_search(re.prog, s, 0, caps, re.ncap)
+  return nil if at < 0
+  return nil if n * 2 + 1 >= caps.length || caps[n * 2] < 0
+  s[caps[n * 2], caps[n * 2 + 1] - caps[n * 2]]
+end
