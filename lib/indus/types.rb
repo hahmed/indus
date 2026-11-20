@@ -1048,13 +1048,26 @@ module Indus
       v = v.args[0] while %i[aset hset].include?(v.op)
       case v.op
       when :param then f.ptypes[f.params.index(v)] = nt
-      when :call then v.args[0].rtype = nt # the callee's returned container: its stores box, through its own ret flow
+      when :call
+        callee = v.args[0]
+        if generic?(callee) && (rp = returned_param_index(callee)) && v.args[rp + 1] # a generic that returns one of its arguments (to_a, itself, tap): widen that argument instead -- retyping the instance's return would fight its instancing
+          return widen_elements_to_dyn(f, v.args[rp + 1], dest)
+        end
+        callee.rtype = nt # the callee's returned container: its stores box, through its own ret flow
       when :hval_at, :hkey_at
         return false # a value read out of a hash's own storage: relabelling it would promise tagged
                      # elements the hash does not hold. The flow inserts a converting copy instead.
       else v.ty = nt
       end
       true
+    end
+
+    # the index of the parameter a function returns unchanged (every ret is that param), else nil
+    def self.returned_param_index(g)
+      rets = g.all.select { _1.op == :ret }.map { _1.args[0] }
+      return nil if rets.empty? || rets.any? { !_1.is_a?(Inst) || _1.op != :param }
+      ix = g.params.index(rets[0])
+      rets.all? { g.params.index(_1) == ix } ? ix : nil
     end
 
     # replace v by w in one instruction's operands (phi operands are [pred, value] pairs)
