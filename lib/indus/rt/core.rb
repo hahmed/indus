@@ -1735,15 +1735,19 @@ def __str_bytesplice(s, start, len, v)
   s
 end
 def __str_append_as_bytes(s, v) = (s << v; s)
-# case methods with an option (:ascii, :fold, :turkic, :lithuanian): the mapping here is ASCII, the option is accepted
-def __str_downcase1(s, opt) = __str_downcase(s)
-def __str_upcase1(s, opt) = __str_upcase(s)
-def __str_swapcase1(s, opt) = __str_swapcase(s)
-def __str_capitalize1(s, opt) = __str_capitalize(s)
-def __str_downcase_bang1(s, opt) = __str_downcase_bang(s)
-def __str_upcase_bang1(s, opt) = __str_upcase_bang(s)
-def __str_swapcase_bang1(s, opt) = __str_swapcase_bang(s)
-def __str_capitalize_bang1(s, opt) = __str_capitalize_bang(s)
+# case methods with an option (:ascii, :turkic, :lithuanian; :fold only for downcase): the mapping here is ASCII
+def __str_case_opt(opt, fold_ok)
+  raise(ArgumentError, "option :fold only allowed for downcasing") if opt == :fold && !fold_ok
+  raise(ArgumentError, "invalid option") unless opt == :ascii || opt == :turkic || opt == :lithuanian || opt == :fold
+end
+def __str_downcase1(s, opt) = (__str_case_opt(opt, true); __str_downcase(s))
+def __str_upcase1(s, opt) = (__str_case_opt(opt, false); __str_upcase(s))
+def __str_swapcase1(s, opt) = (__str_case_opt(opt, false); __str_swapcase(s))
+def __str_capitalize1(s, opt) = (__str_case_opt(opt, false); __str_capitalize(s))
+def __str_downcase_bang1(s, opt) = (__str_case_opt(opt, true); __str_downcase_bang(s))
+def __str_upcase_bang1(s, opt) = (__str_case_opt(opt, false); __str_upcase_bang(s))
+def __str_swapcase_bang1(s, opt) = (__str_case_opt(opt, false); __str_swapcase_bang(s))
+def __str_capitalize_bang1(s, opt) = (__str_case_opt(opt, false); __str_capitalize_bang(s))
 def __str_scrub_bang(s) = nil
 def __str_scrub1(s, rep) = s
 def __str_getbyte(s, i)
