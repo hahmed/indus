@@ -1006,6 +1006,22 @@ def __arr_sum(a)
   end
   t
 end
+# floats: Kahan-Babuska compensated summation (what CRuby does), so [0.1, 0.2, 0.3].sum is 0.6
+def __arr_sum_f(a)
+  t = 0.0
+  c = 0.0
+  i = 0
+  while i < a.length
+    x = a[i]
+    s = t + x
+    ta = t < 0.0 ? 0.0 - t : t
+    xa = x < 0.0 ? 0.0 - x : x
+    if ta >= xa then c = c + ((t - s) + x) else c = c + ((x - s) + t) end
+    t = s
+    i = i + 1
+  end
+  t + c
+end
 
 def __arr_uniq(a)
   out = []

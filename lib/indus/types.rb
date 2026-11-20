@@ -274,6 +274,11 @@ module Indus
               z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
               i.args = [c, z]; changed = true
             end
+            if @settled && i.op == :call && i.args[0].is_a?(Func) && %w[__arr_join __arr_flatten __arr_flatten1].include?(i.args[0].name.to_s.sub(/\$.*/, "")) && (at = of(f, i.args[1])) && arr(at) && arr(at[1]) && at[1][1] != :dyn && !(i.args[1].is_a?(Inst) && mixed_literal?(i.args[1]))
+              # a typed nested array into flatten/join: flatten its typed levels first (the prelude's versions see tagged elements)
+              c = Inst.new(:call, [fn(:__arr_flat1_typed), i.args[1]]); c.ty = nil; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+              i.args[1] = c; changed = true
+            end
             if i.op == :cmp && hsh(of(f, i.args[0])) && hsh(of(f, i.args[1])) && %i[eq ne].include?(i.cond) && !i.args[0].equal?(i.args[1]) # Hash#==: same keys, equal values
               l, r = i.args
               c = Inst.new(:call, [fn(:__hash_eq), l, r]); c.ty = :bool; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
@@ -1788,6 +1793,14 @@ module Indus
       if t == :int && args.size == 1 && name == :divmod && of(f, args[0]) == :float then i.op = :call; i.args = [fn(:__float_divmod), recv, args[0]]; return end
       fam = hsh(t) ? "hash" : (t == :int || t == :float || t == :int?) ? "num" : t == :str ? "str" : big?(t) ? "big" : arr(t) ? "arr" : t == :sym ? "sym" : t == :nil ? "nil" : t == :bool ? "bool" : nil
       if fam && %w[sym nil bool big].include?(fam) && !prelude_method(fam, name, args.size) && prelude_method("obj", name, args.size) then fam = "obj" end # a `class Object` def reached through a Symbol/nil/bool/Bignum
+      if fam == "arr" && %i[flatten join].include?(name) && arr(t[1]) && t[1][1] != :dyn && (name == :flatten || args.size <= 1) && @settled && !(recv.is_a?(Inst) && mixed_literal?(recv)) # a typed nested array: flatten the typed levels first (the prelude's flatten/join see tagged elements)
+        inner = recv; it = t
+        while arr(it) && arr(it[1]) && it[1][1] != :dyn
+          c = Inst.new(:call, [fn(:__arr_flat1_typed), inner]); c.ty = nil; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+          inner = c; it = it[1]
+        end
+        i.args[1] = inner; return
+      end
       if fam == "hash" && !prelude_method("hash", name, args.size) && HASH_VIA_PAIRS.include?(name) && prelude_method("arr", name, args.size) # an Enumerable method a Hash answers through its pairs
         pairs = Inst.new(:call, [fn(:__hash_to_a), recv]); pairs.ty = nil; pairs.block = i.block; i.block.insts.insert(i.block.insts.index(i), pairs)
         i.args[1] = pairs; return

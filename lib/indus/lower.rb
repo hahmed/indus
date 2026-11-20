@@ -3191,6 +3191,11 @@ module Indus
         end
         arr = recv_val(recv)
         keys = array_loop(arr, :map, params, body)
+        if %i[min_by max_by].include?(n.name) && args.size == 1 # min_by(n) / max_by(n): the n smallest / largest by key
+          sorted = emit(:call, [demand(:__arr_sort_by), arr, keys])
+          sorted = emit(:call, [demand(:__arr_reverse), sorted]) if n.name == :max_by
+          return emit(:call, [demand(:__arr_take), sorted, expr(args[0])])
+        end
         return emit(:call, [demand(n.name == :uniq ? :__arr_uniq_by : :"__arr_#{n.name}"), arr, keys])
       when :keep_if then return block_call(n.copy(name: :select!), args) # keep_if is select!
       when :reduce, :inject # a fold: acc = body(acc, elem)

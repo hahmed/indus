@@ -2236,3 +2236,18 @@ def __arr_firsts(pairs)
   end
   out
 end
+# one level of a typed nested array ([[1, 2], [3]] -> [1, 2, 3]); the compiler applies it before flatten/join on such arrays
+def __arr_flat1_typed(a)
+  out = []
+  i = 0
+  while i < a.length
+    inner = a[i]
+    j = 0
+    while j < inner.length
+      out.push(inner[j])
+      j = j + 1
+    end
+    i = i + 1
+  end
+  out
+end
