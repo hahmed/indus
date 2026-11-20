@@ -291,7 +291,7 @@ module Indus
               z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
               i.args = [c, z]; i.cond = i.cond == :eq ? :ne : :eq; changed = true # (a == b) is (eq_result != 0)
             end
-            if %i[add sub mul div mod cmp and or xor shl shr pow].include?(i.op) && (big?(of(f, i.args[0])) || big?(of(f, i.args[1]))) && !@no_big_rewrite && i.args.all? { |a| (ta = of(f, a)) && (big?(ta) || %i[int int? dyn].include?(ta)) } # both operands typed and liftable
+            if %i[add sub mul div mod cmp and or xor shl shr pow].include?(i.op) && (big?(of(f, i.args[0])) || big?(of(f, i.args[1]))) && !@no_big_rewrite && i.args.all? { |a| (ta = of(f, a)) && (big?(ta) || %i[int int? dyn float].include?(ta)) } # both operands typed and liftable
               big_op(f, i); changed = true
             end
             # 2**64 / 10**20: an integer power whose value cannot be 64-bit (both operands literal) is a Bignum
@@ -1007,6 +1007,18 @@ module Indus
       callee.all.each { |u| forget_params(u.args[0], funcs, seen) if u.op == :call && u.args[0].is_a?(Func) } # what it calls was typed from its parameters
     end
 
+    # an array literal whose every stored value is a literal nil
+    def self.all_nil_literal?(v)
+      loop do
+        case v.op
+        when :aset then return false unless v.args[2].op == :const && v.args[2].ty == :nil; v = v.args[0]
+        when :anew then return true
+        else return false
+        end
+        return false unless v.is_a?(Inst)
+      end
+    end
+
     # a container literal (anew/hnew + stores) whose stored values are of more than one kind
     def self.mixed_literal?(v)
       kinds = []
@@ -1259,6 +1271,11 @@ module Indus
     # the op becomes a prelude call. Compares go through __big_cmp and test its sign.
     BIG_OPS = { add: :__big_add, sub: :__big_sub, mul: :__big_mul, div: :__big_div, mod: :__big_mod, and: :__big_and, or: :__big_or, xor: :__big_xor }.freeze
     def self.big_op(f, i)
+      if (ft = i.args.find { of(f, _1) == :float }) && !%i[shl shr pow and or xor].include?(i.op) # bignum + 1.5: both sides as floats
+        i.args = i.args.map { |v| big?(of(f, v)) ? Inst.new(:call, [fn(:__big_to_f), v]).tap { _1.ty = :float; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) } : v }
+        i.ty = :float unless i.op == :cmp
+        return
+      end
       if %i[shl shr pow].include?(i.op) # the right operand stays a machine integer (a shift count / an exponent)
         l = big?(of(f, i.args[0])) ? i.args[0] : coerce(f, i.block, i, i.args[0], BIG)
         r = i.args[1]
@@ -1468,7 +1485,8 @@ module Indus
       when :nil
         # :nil as a joined type can still widen (an arm whose type has not arrived yet joins as
         # nil); only a literal nil is certainly nil
-        return unless i.args[0].op == :const || i.args[0].op == :phi && i.args[0].args.all? { |(_, v)| v.op == :const && v.ty == :nil }
+        all_nil_elem = i.args[0].op == :aget && @settled && (ct = of(f, i.args[0].args[0])) && arr(ct) && ct[1] == :nil && i.args[0].args[0].is_a?(Inst) && literal_origin?(i.args[0].args[0]) && !mixed_literal?(i.args[0].args[0]) && all_nil_literal?(i.args[0].args[0]) # an element of an all-nil literal ([nil, nil])
+        return unless all_nil_elem || i.args[0].op == :const || i.args[0].op == :phi && i.args[0].args.all? { |(_, v)| v.op == :const && v.ty == :nil }
         i.op = :sconst; i.args = ["nil"]
       when :sym then i.op = :call; i.args = [fn(:__sym_inspect), i.args[0]]
       else
@@ -1499,6 +1517,7 @@ module Indus
       if %i[int int?].include?(t) && args.size == 1 && big?(of(f, args[0])) && %i[gcd lcm fdiv divmod remainder div modulo pow eql? coerce].include?(name) # 6.lcm(bignum): the receiver lifted
         recv = coerce(f, i.block, i, recv, BIG); i.args[1] = recv; t = BIG
       end
+      if name == :__isqrt_of && t then i.op = :call; i.args = [fn(big?(t) ? :__big_isqrt : :__num_isqrt), recv]; i.ty = big?(t) ? BIG : :int; return end
       if big?(t) && name == :to_s && args.size == 1 then i.op = :call; i.args = [fn(:__big_to_s1), recv, args[0]]; i.ty = :str; return end # a Bignum in a base
       if big?(t) && (bm = BIG_METHODS[name]) && (bm[0].nil? || args.size <= 1) # a method on a Bignum: the prelude's
         callee, rt = bm
@@ -1579,6 +1598,9 @@ module Indus
       end
       if name == :+ && args.size == 1 && t == :str then i.op = :scat; i.args = [recv, args[0]]; i.ty = :str; return end
       if %i[inspect to_s].include?(name) && args.empty? && t == :int? && !prelude?(f) then i.op = :call; i.args = [fn(name == :inspect ? :__opt_inspect : :__opt_to_s), recv]; i.ty = :str; return end # a nullable int: nil or the digits (user code; the prelude narrows its own)
+      if name == :integer? && args.empty? && %i[int int? float].include?(t) then i.op = :const; i.args = [t == :float ? 0 : 1]; i.ty = :bool; return end
+      if name == :coerce && args.size == 1 && t == :float && (at = of(f, args[0])) && %i[int float].include?(at) then i.op = :call; i.args = [fn(:__float_coerce), recv, args[0]]; i.ty = [:arr, :float]; return end
+      if name == :class && args.empty? && big?(t) then i.op = :sconst; i.args = ["Integer"]; i.ty = :str; return end
       if name == :class && args.empty? && t == :int? && @settled then i.op = :call; i.args = [fn(:__opt_class_name), recv]; i.ty = :str; return end # Integer or NilClass by the sentinel
       if name == :class && args.empty? && (cn = { int: "Integer", float: "Float", str: "String", sym: "Symbol", bool: "TrueClass", nil: "NilClass" }[t] || (arr(t) && "Array") || (hsh(t) && "Hash"))
         return if t == :bool || t == :nil && recv.op != :const # true/false share a type; a joined nil may still widen

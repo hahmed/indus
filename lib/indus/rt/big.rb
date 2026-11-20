@@ -471,3 +471,15 @@ def __big_to_s1(a, base)
   end
   a[0] == 1 ? "-" + out : out
 end
+# Integer.sqrt of a Bignum: Newton's method on Bignums
+def __big_isqrt(a)
+  __trap if a[0] == 1 && a.length > 1 # Math::DomainError in Ruby
+  return [0] if __big_zero_p(a)
+  x = __big_shl([0, 1], (__big_bits(a) + 1) / 2) # a power of two above the root
+  loop_on = true
+  while loop_on
+    y = __big_shr(__big_add(x, __big_div(a, x)), 1)
+    if __big_cmp(y, x) >= 0 then loop_on = false else x = y end
+  end
+  x
+end

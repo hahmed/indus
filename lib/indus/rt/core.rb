@@ -1850,3 +1850,21 @@ def __num_truncate1(f, digits)
   end
   (f * m).to_i.to_f / m
 end
+# floor(-n) / ceil(-n) / truncate(-n) on a Float: an Integer, to tens / hundreds
+def __float_floor_neg(f, digits)
+  m = __num_pow10(0 - digits)
+  __num_floor(f / m.to_f) * m
+end
+def __float_ceil_neg(f, digits)
+  m = __num_pow10(0 - digits)
+  __num_ceil(f / m.to_f) * m
+end
+def __float_truncate_neg(f, digits)
+  m = __num_pow10(0 - digits)
+  (f / m.to_f).to_i * m
+end
+def __num_truncate_int(n, d)
+  return n if d >= 0
+  m = __num_pow10(0 - d)
+  (n / m) * m + (n < 0 && n % m != 0 ? m : 0)
+end

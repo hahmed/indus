@@ -1735,7 +1735,6 @@ def __num_digits1(n, base)
   end
   out
 end
-def __num_integer_p(n) = true
 def __num_ord(n) = n
 def __num_size(n) = 8
 def __arr_sort_sym(a) = __arr_sort_by(a, __arr_sym_names(a))
@@ -2251,3 +2250,5 @@ def __arr_flat1_typed(a)
   end
   out
 end
+def __rand_float_max(m) = __rand_float * m
+def __float_coerce(a, b) = [b.to_f, a]

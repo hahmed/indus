@@ -226,7 +226,7 @@ module Indus
           @asm.emit(0xF81F0FE0 | rb); @asm.ldr_off(0, rb, 0)
           @asm.bl(:rt_str_append)
           @asm.emit(0xF84107F0); @asm.str_off(0, 16, 0); @asm.mov(d, 16)
-        when :nop then @asm.mov(d, reg(i.args[0]))
+        when :nop then i.float? ? @asm.fmov(d, freg(i.args[0])) : @asm.mov(d, reg(i.args[0])) # (a float nop copies the float register)
         when :str_or_empty # s.to_s where s may be the nil word: "" then
           r = reg(i.args[0]); @asm.adr(16, :rt_empty_str); @asm.cmpi(r, 0); @asm.emit(0x9A801000 | (16 << 16) | (r << 5) | d) # csel d, r, x16, ne
         when :rawld then @asm.ldr_off(d, reg(i.args[0]), 0)

@@ -2181,6 +2181,15 @@ module Indus
         list = args[0].is_a?(Prism::ArrayNode) ? args[0].elements : [args[0]] # "fmt" % args
         return emit(:call, [demand(:__format), expr(n.receiver), dyn_array(list)])
       end
+      if (op = ARITH[n.name]) && %i[+ - * << ** ].include?(n.name) && args.size == 1 && [n.receiver, args[0]].all? { |x| x.is_a?(Prism::IntegerNode) || (x.is_a?(Prism::CallNode) && x.name == :-@ && x.receiver.is_a?(Prism::IntegerNode)) }
+        # literal arithmetic past 63 bits (9223372036854775807 + 1, 1 << 64): a Bignum literal, folded here
+        lv = n.receiver.is_a?(Prism::IntegerNode) ? n.receiver.value : -n.receiver.receiver.value
+        rv = args[0].is_a?(Prism::IntegerNode) ? args[0].value : -args[0].receiver.value
+        folded = case n.name when :+ then lv + rv when :- then lv - rv when :* then lv * rv when :<< then rv >= 0 ? lv << rv : lv >> -rv when :** then rv >= 0 ? lv ** rv : nil end
+        if folded && (folded >= (1 << 63) || folded < -(1 << 63))
+          return expr(Prism::IntegerNode.new(n.send(:source), 0, n.location, 0, folded))
+        end
+      end
       if (op = ARITH[n.name])
         l = expr(n.receiver); r = expr(args[0])
         return emit(:mcall, [n.name, l, r]) if (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] # an operator the class defines
@@ -2453,7 +2462,7 @@ module Indus
       elsif n.name == :step && args.size == 2 && n.receiver # a.step(b, by)
         emit(:call, [demand(:__num_step_to), expr(n.receiver), expr(args[0]), expr(args[1])])
       elsif n.name == :sqrt && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Integer
-        emit(:call, [demand(:__num_isqrt), expr(args[0])])
+        r = emit(:mcall, [:__isqrt_of, expr(args[0])]); r.routed = :isqrt; r # Types: an Integer -> __num_isqrt, a Bignum -> __big_isqrt
       elsif n.name == :log && args.size == 2 && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math # Math.log(x, base) = log(x) / log(base)
         emit(:div, [emit(:libm, [:log, expr(args[0])]), emit(:libm, [:log, expr(args[1])])])
       elsif %i[cbrt hypot log2 log10 log exp atan2 atan tan asin acos].include?(n.name) && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Math
@@ -2461,6 +2470,8 @@ module Indus
       elsif n.name == :rand && n.receiver.nil? && args.size <= 1
         if args.empty? then emit(:call, [demand(:__rand_float)])
         elsif args[0].is_a?(Prism::RangeNode) then emit(:call, [demand(:__rand_range), expr(args[0].left), expr(args[0].right)])
+        elsif args[0].is_a?(Prism::FloatNode) || kind_of(args[0]) == :float then emit(:call, [demand(:__rand_int), emit(:to_i, [expr(args[0])])]) # Kernel#rand(1.5): rand(1), an Integer
+        elsif args[0].is_a?(Prism::IntegerNode) && args[0].value == 0 then emit(:call, [demand(:__rand_float)]) # rand(0): a Float
         else emit(:call, [demand(:__rand_int), expr(args[0])]) end
       elsif n.name == :new && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array
         len = args[0] ? expr(args[0]) : const(0); fill = args[1] ? expr(args[1]) : (c = const(0); c.ty = :nil; c)
@@ -2615,8 +2626,14 @@ module Indus
         emit(:clock, [])                 # Process.clock_gettime(any clock): monotonic seconds as a Float
       elsif n.name == :round && args.empty? && n.receiver && (kind_of(n.receiver) == :float || n.receiver.is_a?(Prism::FloatNode) || n.receiver.is_a?(Prism::ParenthesesNode) && kind_of(n.receiver.body.body.last) == :float)
         emit(:call, [demand(:__float_round0), expr(n.receiver)])
-      elsif %i[floor ceil].include?(n.name) && args.size == 1 && n.receiver && (kind_of(n.receiver) == :float || n.receiver.is_a?(Prism::FloatNode))
-        emit(:call, [demand(n.name == :floor ? :__float_floor1 : :__float_ceil1), expr(n.receiver), expr(args[0])])
+      elsif %i[floor ceil truncate].include?(n.name) && args.size == 1 && n.receiver && (kind_of(n.receiver) == :float || n.receiver.is_a?(Prism::FloatNode))
+        if args[0].is_a?(Prism::IntegerNode) && args[0].value <= 0 # x.floor(0) / x.ceil(-2): an Integer
+          emit(:call, [demand({ floor: :__float_floor_neg, ceil: :__float_ceil_neg, truncate: :__float_truncate_neg }.fetch(n.name)), expr(n.receiver), expr(args[0])])
+        else
+          emit(:call, [demand({ floor: :__float_floor1, ceil: :__float_ceil1, truncate: :__num_truncate1 }.fetch(n.name)), expr(n.receiver), expr(args[0])])
+        end
+      elsif n.name == :truncate && args.size == 1 && n.receiver && (kind_of(n.receiver) == :int || n.receiver.is_a?(Prism::IntegerNode))
+        emit(:call, [demand(:__num_truncate_int), expr(n.receiver), expr(args[0])])
       elsif n.name == :divmod && args.size == 1 && n.receiver && (kind_of(n.receiver) == :float || n.receiver.is_a?(Prism::FloatNode) || kind_of(args[0]) == :float)
         emit(:call, [demand(:__float_divmod), expr(n.receiver), expr(args[0])])
       elsif n.name == :round && args.size == 1 && n.receiver
