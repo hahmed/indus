@@ -10,6 +10,8 @@ module Indus
     attr_accessor :nonneg # a div/mod whose operands are provably non-negative: no floor fix-up
     attr_accessor :op, :args, :block, :reg, :cond, :slot, :shared, :ty, :stack, :home, :uses
     attr_accessor :strict # to_i from Kernel#Integer: junk raises
+    attr_accessor :single # ssub from s[i] (one index): nil past the end
+    attr_accessor :truthed # a truthiness test inserted for a boolean operator (not to be wrapped again)
     attr_accessor :raw_shift # a shift the helper itself performs (count already checked)
     attr_accessor :key_copied # an hset whose String key was copied (Ruby's dup-freeze of string keys)
     attr_accessor :destructure # an idx that binds a block parameter from an element: a scalar element destructures to [el, nil, ...]

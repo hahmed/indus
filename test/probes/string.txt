@@ -1,0 +1,288 @@
+s.length
+s.bytesize
+s.upcase
+s.capitalize
+s.swapcase
+s.reverse
+s.center(20, "*")
+s.ljust(15, ".")
+s.rjust(15, ".")
+s * 2
+s + "!"
+s % []
+s[0]
+s[-1]
+s[0, 5]
+s[0..4]
+s[6..]
+s[..4]
+s[100]
+s[/o\w+/]
+s.slice(1, 3)
+s.chars.length
+s.bytes.first
+s.lines
+s.split
+s.split("o")
+s.split("o", 2)
+s.split(//)
+s.split(/\s+/)
+s.scan(/o/)
+s.scan(/(l)(o)/)
+s.index("o")
+s.index("o", 5)
+s.rindex("o")
+s.include?("wor")
+s.start_with?("hell")
+s.end_with?("rld")
+s.count("lo")
+s.delete("l")
+s.squeeze
+s.squeeze("l")
+s.tr("lo", "01")
+s.tr("a-y", "b-z")
+s.gsub("l", "L")
+s.gsub(/l+/) { |m| m.upcase }
+s.gsub(/(l)/, '<\1>')
+s.sub("o", "0")
+s.sub(/o/) { "0" }
+s.replace("x").size rescue 1
+s.insert(5, ",")
+s.prepend(">> ")
+s.concat("!", "?")
+s.chomp("d")
+s.chop
+s.strip
+"  x ".lstrip
+"  x ".rstrip
+s.succ
+s.ord
+s.sum
+s.hash.class
+s.hex
+s.oct
+s.to_i
+s.to_f
+s.to_sym
+s.to_s.equal?(s)
+s.to_str
+s.inspect
+s.dump
+s.encoding.to_s
+s.force_encoding("ASCII-8BIT").encoding.to_s
+s.valid_encoding?
+s.ascii_only?
+s.unicode_normalize
+s.each_char.to_a.size
+s.each_byte.first
+s.each_line.to_a
+s.each_grapheme_cluster.count
+s.partition("o")
+s.rpartition("o")
+s.casecmp("HELLO WORLD")
+s.casecmp?("HELLO WORLD")
+s <=> "hello"
+s == "hello world"
+s.eql?("hello world")
+s.equal?(s)
+s.empty?
+"".empty?
+s.frozen?
+s.dup.frozen?
+s.between?("a", "z")
+s.clamp("a", "m")
+s.match(/w(or)/)[1]
+s.match?(/w/)
+s =~ /w/
+s !~ /z/
+s.unpack("a5")
+s.unpack1("a5")
+s.byteslice(0, 5)
+s.getbyte(0)
+s.codepoints.first
+s.chr
+s.each_char.with_index.first
+s.start_with?(/h/)
+s.delete_prefix("hello ")
+s.delete_suffix(" world")
+s.tr_s("l", "r")
+s.each_char.select { |c| "aeiou".include?(c) }.join
+s.chars.sort.join
+s.chars.uniq.size
+s.chars.tally.max_by { |k, v| v }
+s.split.map(&:capitalize).join(" ")
+s.upcase.center(15).length
+"%s=%d" % ["a", 1]
+"%05.2f" % 3.14159
+"%x %o %b %e" % [255, 8, 5, 1234.5]
+"%-10s|" % "ab"
+"%+d %+d" % [1, -1]
+"%c%c" % [72, "i"]
+"%%"
+"%3$s %1$s %2$s" % ["a", "b", "c"]
+"%.3s" % "abcdef"
+"%10.4f|" % 3.14159
+"% d" % 5
+"%#x %#o %#b" % [255, 8, 5]
+"%08.3f" % -3.14159
+"%s" % nil
+"%s" % [[1, 2]]
+"%p" % ["s"]
+"%d" % 3.99
+"%f" % 1
+"%.0f" % 2.5
+"%.0f" % 3.5
+"%g" % 1234567.0
+"%g" % 0.00001234
+"%10s" % "x"
+"abc".succ
+"az".succ
+"zz".succ
+"a9".succ
+"Zz".succ
+"1.9".succ
+"".succ
+"abc".ord
+"abc".sum
+"abc" <=> "abd"
+"abc".casecmp("ABC")
+"abc".eql?("abc")
+"a".upto("e").to_a
+"abc".each_char.map(&:ord)
+"abc".bytes.sum
+"hello"[1..-2]
+"hello"[-3..]
+"hello"[1...-1]
+"hello"[5]
+"hello"[5, 1]
+"hello"[6, 1]
+"hello".slice(1..)
+"hello".chars.each_slice(2).map(&:join)
+"héllo".length
+"héllo".bytesize
+"héllo".reverse
+"héllo".upcase
+"héllo"[1]
+"héllo".chars
+"héllo".index("l")
+"日本語".length
+"日本語".chars
+"日本語"[1]
+"日本語".reverse
+"日本語".bytes.size
+"a\nb\nc".lines
+"a\nb\nc".lines(chomp: true)
+"a\nb\nc".each_line.map(&:chomp)
+"a\tb".expand_tabs rescue "x"
+"CamelCase".gsub(/([A-Z])/) { "_" + $1.downcase }
+"snake_case".split("_").map.with_index { |w, i| i.zero? ? w : w.capitalize }.join
+"a-b_c d".split(/[-_ ]/)
+"  multiple   spaces  ".split(" ")
+"  multiple   spaces  ".squeeze(" ").strip
+"x".ljust(3, "ab")
+"x".center(6, "ab")
+"abc".each_char.each_cons(2).map(&:join)
+"hello world".scan(/\w+/).map(&:length)
+"The quick brown".split.map(&:size).max
+"a,b;c".split(/[,;]/)
+"2024-01-15".split("-").map(&:to_i)
+"key=value".split("=", 2)
+"a=1&b=2".split("&").map { |kv| kv.split("=") }.to_h
+"hello"*0
+"abc".freeze.frozen?
+"abc".dup.frozen?
+("abc" + "").frozen?
+"abc".to_sym.to_proc.call("xyz") rescue "nope"
+"Hello World".swapcase
+"hello world".split.map(&:reverse).join(" ")
+"racecar" == "racecar".reverse
+"hello".tr("el", "ip")
+"hello".delete("l")
+"hello".squeeze("l")
+"hello".count("l")
+"hello".index("l")
+"hello".rindex("l")
+"hello".chars.rotate(2).join
+"hello".sub(/l/, "L")
+"hello".gsub(/l/, "L")
+"hello" =~ /ll/
+"hello".match(/l+/)[0]
+"hello".match(/l+/).pre_match
+"hello".match(/l+/).post_match
+"hello".match(/(?<x>l+)/)[:x]
+"hello".match(/(?<x>l+)/)["x"]
+"hello".match(/(l)(l)/).captures
+"hello".match(/(l)(l)/).to_a
+"hello".match(/z/)
+"hello".match(/l/, 3)[0]
+"hello".start_with?("he", "x")
+"hello".end_with?("lo", "x")
+"hello".each_char.to_a.last
+"hello".sum % 256
+"hello".hash == "hello".hash
+"hello".crypt("ab") rescue "x"
+"hello".encode("UTF-8").length
+"hello".b.length
+"hello".scrub
+"hello".unicode_normalized? rescue true
+"%.2e" % 12345.678
+"%s and %p" % ["x", "y"]
+"abc".intern
+:"abc".to_s
+"a b".to_sym.inspect
+"abc".to_c rescue 0
+"abc".to_r rescue 0
+"12abc".to_i
+"abc12".to_i
+"  12  ".to_i
+"1_000".to_i
+"0b101".to_i(0)
+"0o17".to_i(0)
+"0x1f".to_i(0)
+"1e3".to_f
+"1.5e-3".to_f
+".5".to_f
+"5.".to_f
+"abc".to_f
+"1,000".to_i
+"١٢".to_i
+"abc".unpack("C*")
+"abc".each_byte.to_a
+"abc".bytes.map { |b| b.to_s(16) }.join
+["61", "62"].map { |h| h.hex.chr }.join
+"abc".succ!
+"abc".upcase!
+"ABC".upcase!
+"abc".capitalize!
+"Abc".capitalize!
+"abc".swapcase!
+"abc".reverse!
+"abc".squeeze!
+"aab".squeeze!
+"abc".strip!
+" abc ".strip!
+"abc".chomp!
+"abc\n".chomp!
+"abc".chop!
+"abc".slice!(1)
+"abc".sub!("z", "y")
+"abc".sub!("a", "y")
+"abc".gsub!("z", "y")
+"abc".gsub!("b", "y")
+"abc".delete!("z")
+"abc".delete!("b")
+"abc".tr!("z", "y")
+"abc".tr!("b", "y")
+"abc".lstrip!
+"abc".rstrip!
+"abc".downcase!
+"ABC".downcase!
+"abc".clear
+"abc".replace("xyz")
+"abc".insert(-1, "d")
+"abc".insert(0, "z")
+"abc".prepend("x", "y")
+"abc".concat("d", "e")
+"abc" << "d" << "e"
+"abc".freeze.upcase
+"abc".dup.upcase!

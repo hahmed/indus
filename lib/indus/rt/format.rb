@@ -12,6 +12,13 @@ def __format(fmt, args)
       i = i + 1
     else
       i = i + 1
+      pos = -1 # %N$...: an explicit argument position
+      j = i
+      j = j + 1 while j < n && __ld8(fmt, j) >= 48 && __ld8(fmt, j) <= 57
+      if j > i && j < n && __ld8(fmt, j) == 36
+        pos = __str_to_i_base(fmt[i, j - i], 10) - 1
+        i = j + 1
+      end
       left = false; zero = false; plus = false; space = false; alt = false
       while i < n && (__ld8(fmt, i) == 45 || __ld8(fmt, i) == 48 || __ld8(fmt, i) == 43 || __ld8(fmt, i) == 32 || __ld8(fmt, i) == 35)
         f = __ld8(fmt, i)
@@ -23,6 +30,15 @@ def __format(fmt, args)
         i = i + 1
       end
       width = 0
+      if i < n && __ld8(fmt, i) == 42 # *: the width comes from the arguments (negative: left-justify)
+        width = __dyn_to_int(args[ai])
+        ai = ai + 1
+        i = i + 1
+        if width < 0
+          left = true
+          width = 0 - width
+        end
+      end
       while i < n && __ld8(fmt, i) >= 48 && __ld8(fmt, i) <= 57
         width = width * 10 + (__ld8(fmt, i) - 48)
         i = i + 1
@@ -41,8 +57,12 @@ def __format(fmt, args)
       if conv == 37
         out = out + "%"
       else
-        arg = args[ai]
-        ai = ai + 1
+        if pos >= 0
+          arg = args[pos]
+        else
+          arg = args[ai]
+          ai = ai + 1
+        end
         body = ""
         if conv == 100 || conv == 105 # d i
           body = __fmt_int(__dyn_to_int(arg), 10, plus, space)

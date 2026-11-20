@@ -951,6 +951,7 @@ module Indus
         end
         return r if r.arguments.nil? && r.block.nil? && r.receiver.nil? && @owner && @funcs[:"#{@owner}.#{r.name}"] # `registry << o` in a class method: the class object's ivar, through its reader
       when Prism::ConstantReadNode, Prism::GlobalVariableReadNode, Prism::ClassVariableReadNode then r # LIST << v: the global is rebound
+      when Prism::StringNode, Prism::InterpolatedStringNode, Prism::ArrayNode, Prism::XStringNode then r # "lit" << v / [] << v: a fresh value, no home to rebind
       end
     end
 
@@ -1891,7 +1892,7 @@ module Indus
     # a receiver known frozen (x = "s".freeze / x.freeze earlier / "lit".freeze): mutators raise FrozenError (no frozen bit at run time; this is the static part)
     def frozen_receiver?(r)
       return false unless r
-      return true if r.is_a?(Prism::CallNode) && r.name == :freeze && r.arguments.nil? && (r.receiver.is_a?(Prism::StringNode) || r.receiver.is_a?(Prism::ArrayNode) || r.receiver.is_a?(Prism::HashNode) || r.receiver.is_a?(Prism::InterpolatedStringNode))
+      return true if r.is_a?(Prism::CallNode) && r.name == :freeze && r.arguments.nil? && r.receiver # x.freeze.<mutator> / x.freeze.frozen?
       return true if r.is_a?(Prism::LocalVariableReadNode) && @frozen_locals&.include?(lname(r.name))
       return true if r.is_a?(Prism::InstanceVariableReadNode) && @frozen_locals&.include?(r.name)
       false
@@ -1979,6 +1980,23 @@ module Indus
       end
       if n.name == :rehash && args.empty? && n.receiver && kind_of(n.receiver) == :hash then return expr(n.receiver) end
       if n.name == :append && n.receiver && kind_of(n.receiver) == :array then return call(n.copy(name: :push)) end # alias
+      if %i[lines each_line].include?(n.name) && args.size == 1 && args[0].is_a?(Prism::KeywordHashNode) && n.receiver && !n.block # lines(chomp: true)
+        return emit(:call, [demand(:__str_lines_chomp), expr(n.receiver)])
+      end
+      if n.name == :replace && args.size == 1 && n.receiver && (kind_of(n.receiver) == :str || n.receiver.is_a?(Prism::StringNode)) # s.replace(t): the variable takes t's bytes (a fresh copy)
+        if n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode)
+          src = n.send(:source); loc = n.location
+          dupd = Prism::CallNode.new(src, 0, loc, 0, args[0], nil, :dup, loc, nil, nil, nil, nil, nil)
+          w = n.receiver.is_a?(Prism::LocalVariableReadNode) ? Prism::LocalVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, 0, loc, dupd, loc) : Prism::InstanceVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, loc, dupd, loc)
+          return expr(w)
+        end
+        return emit(:mcall, [:dup, expr(args[0])])
+      end
+      if n.name == :slice && args.size == 1 && args[0].is_a?(Prism::RangeNode) && n.receiver then return call(n.copy(name: :[])) end
+      if %i[inspect to_s name].include?(n.name) && args.empty? && n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :class && n.receiver.arguments.nil? && n.receiver.receiver then return expr(n.receiver) end # x.class.inspect: the class's name (classes are their names here)
+      if n.name == :[] && args.size == 1 && n.receiver && (args[0].is_a?(Prism::SymbolNode) || args[0].is_a?(Prism::StringNode)) && kind_of(n.receiver) == :MatchData # m[:name] / m["name"]
+        return emit(:mcall, [:named, expr(n.receiver), emit(:sconst, [args[0].unescaped])])
+      end
       to_a_of = ->(node) { Prism::CallNode.new(node.send(:source), 0, node.location, 0, node, nil, :to_a, node.location, nil, nil, nil, nil, nil) }
       if %i[zip cycle take drop take_while drop_while each_cons tally uniq reverse_each lazy chunk_while slice_when find_index].include?(n.name) && n.receiver && kind_of(n.receiver) == :hash && !n.receiver.is_a?(Prism::HashNode)
         return call(n.copy(receiver: to_a_of.(n.receiver))) # Enumerable on a Hash: over its pairs
@@ -2047,7 +2065,7 @@ module Indus
         rv = expr(n.receiver)
         return emit(:mcall, [n.name, rv, *object_args(n, args, kk, rv)])
       end
-      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? ! << send public_send __send__ respond_to? extend define_singleton_method methods public_methods singleton_methods singleton_class instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
+      if n.receiver && !n.block && !n.receiver.is_a?(Prism::ConstantReadNode) && (k = kind_of(n.receiver)).is_a?(Symbol) && @classes[k] && !%i[== != < <= > >= + - * / % [] []= nil? is_a? kind_of? instance_of? ! << send public_send __send__ respond_to? extend define_singleton_method methods public_methods singleton_methods singleton_class instance_variable_get instance_variable_set instance_variable_defined? instance_variables instance_eval instance_exec define_method method class_eval instance_variable_get].include?(n.name)
         rv = expr(n.receiver)
         return emit(:mcall, [n.name, rv, *object_args(n, args, @classes[k], rv)])
       end
@@ -2166,6 +2184,10 @@ module Indus
       if (op = ARITH[n.name])
         l = expr(n.receiver); r = expr(args[0])
         return emit(:mcall, [n.name, l, r]) if (kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd] # an operator the class defines
+        if %i[& | ^].include?(n.name) && (n.receiver.is_a?(Prism::NilNode) || n.receiver.is_a?(Prism::TrueNode) || n.receiver.is_a?(Prism::FalseNode)) # nil | x, true & x: x's truthiness (user code; the compiler's own bool arithmetic is elsewhere)
+          r = (t = emit(:cmp, [r, const(0)], :ne); t.truthed = true; t) unless args[0].is_a?(Prism::NilNode) || args[0].is_a?(Prism::TrueNode) || args[0].is_a?(Prism::FalseNode)
+          r = (c = const(1); c.ty = :bool; c.truthed = true; c) if args[0].is_a?(Prism::IntegerNode) || args[0].is_a?(Prism::FloatNode) || args[0].is_a?(Prism::SymbolNode) || args[0].is_a?(Prism::StringNode)
+        end
         emit(op, [l, r])
       elsif (c = CMP[n.name])
         l = expr(n.receiver); r = expr(args[0])
@@ -2208,8 +2230,14 @@ module Indus
         a = args[0]
         if a.is_a?(Prism::NilNode) then emit(:anew, [const(0), (c = const(0); c.ty = :nil; c)])
         elsif a.is_a?(Prism::RangeNode) || a.is_a?(Prism::ParenthesesNode) && a.body.body.last.is_a?(Prism::RangeNode) then range_array(a.is_a?(Prism::ParenthesesNode) ? a.body.body.last : a)
-        elsif a.is_a?(Prism::ArrayNode) || kind_of(a).is_a?(Array) && kind_of(a)[0] == :array then expr(a)
+        elsif a.is_a?(Prism::ArrayNode) || kind_of(a) == :array then expr(a)
+        elsif a.is_a?(Prism::HashNode) || kind_of(a) == :hash then emit(:mcall, [:to_a, expr(a)]) # Array(hash): its pairs
         else expr(Prism::ArrayNode.new(a.send(:source), 0, a.location, 0, [a], nil, nil)) end
+      elsif n.name == :Hash && n.receiver.nil? && args.size == 1 # Hash(x): nil / [] -> {}, a hash itself, pairs -> a hash
+        a = args[0]
+        if a.is_a?(Prism::NilNode) || a.is_a?(Prism::ArrayNode) && a.elements.empty? then emit(:hnew, [])
+        elsif a.is_a?(Prism::HashNode) || kind_of(a) == :hash then expr(a)
+        else (expr(a); emit(:call, [demand(:__raise_type_error), emit(:sconst, ["can't convert into Hash"])])) end
       elsif n.name == :respond_to? && n.receiver && (kd = kind_of(n.receiver)).is_a?(Symbol) && (rk = @classes[kd]) && (um = rk.find_method(:respond_to?)) # the class's own respond_to?
         rv = expr(n.receiver); emit(:call, [um, rv, *method_args(um, args, rv)])
       elsif n.name == :respond_to? && args.size == 1 && (args[0].is_a?(Prism::SymbolNode) || args[0].is_a?(Prism::StringNode) || args[0].is_a?(Prism::InterpolatedStringNode))
@@ -2637,6 +2665,8 @@ module Indus
         base = case r.name when :each_char, :chars then emit(:mcall, [:chars, expr(r.receiver)]) when :each_byte then emit(:mcall, [:bytes, expr(r.receiver)]) else expr(r.receiver) end
         args[0] ? emit(:call, [demand(:__arr_each_with_index_pairs_from), base, expr(args[0])]) : emit(:mcall, [:each_with_index_pairs, base])
       elsif n.name == :times && args.empty? && n.receiver && !n.block then range_array(n)                 # 3.times.to_a
+      elsif n.name == :upto && args.size == 1 && n.receiver && !n.block && (kind_of(n.receiver) == :str || n.receiver.is_a?(Prism::StringNode)) # "a".upto("e")
+        emit(:call, [demand(:__str_upto), expr(n.receiver), expr(args[0])])
       elsif %i[upto downto].include?(n.name) && args.size == 1 && n.receiver && !n.block # 1.upto(3).to_a, 10.downto(7).to_a
         emit(:call, [demand(n.name == :upto ? :__num_upto_a : :__num_downto_a), expr(n.receiver), expr(args[0])])
       elsif n.name == :=== && args.size == 1 && (r = n.receiver.is_a?(Prism::ParenthesesNode) ? n.receiver.body.body.last : n.receiver).is_a?(Prism::RangeNode)
@@ -3031,7 +3061,14 @@ module Indus
                    when :each_byte then emit(:mcall, [:bytes, expr(r.receiver)])
                    else expr(r.receiver) end
             pairs = args[0] ? emit(:call, [demand(:__arr_each_with_index_pairs_from), base, expr(args[0])]) : emit(:mcall, [:each_with_index_pairs, base]) # with_index(1)
-            return iterate_array_value(n.copy(name: r.name == :map ? :map : r.name == :each || r.name == :each_char || r.name == :each_byte ? :each : r.name), [], pairs)
+            res = iterate_array_value(n.copy(name: r.name == :map ? :map : r.name == :each || r.name == :each_char || r.name == :each_byte ? :each : r.name), [], pairs)
+            res = emit(:call, [demand(:__arr_firsts), res]) if %i[select reject].include?(r.name) # the selected pairs' elements
+            return res
+          end
+        when :with_object # xs.each.with_object(memo) { |x, m| }: each_with_object
+          r = n.receiver
+          if r.is_a?(Prism::CallNode) && r.name == :each && r.block.nil? && r.arguments.nil? && r.receiver
+            return block_call(Prism::CallNode.new(n.send(:source), 0, n.location, 0, r.receiver, nil, :each_with_object, n.location, nil, n.arguments, nil, nil, n.block), args)
           end
         end
       end
@@ -3129,6 +3166,8 @@ module Indus
           raise "a block inside a method cannot yet refer to self or @ivars" if @klass && refers_to_self?(blk.body)
           fparams, pre = flatten_params(blk.parameters&.parameters) # |a, (b, c)|
           fparams = params if blk.parameters.is_a?(Prism::NumberedParametersNode) || blk.parameters.nil?
+          bps = blk.parameters.is_a?(Prism::BlockParametersNode) ? blk.parameters.parameters : nil
+          @pending_arity = { required: bps&.requireds&.size || 0, optional: bps&.optionals&.size || 0 } if bps
           c = closure_value(fparams, free_locals(blk.body, fparams).select { |nm| @locals.key?(lname(nm)) }, pre + (body.is_a?(Array) ? body : []))
           @deferred_lambdas.last[1].strict_arity = true if n.name == :lambda && @deferred_lambdas.last[0].equal?(c.args[0]) # lambda {} checks its argument count like ->
           return c

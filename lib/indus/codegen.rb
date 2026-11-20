@@ -630,7 +630,7 @@ module Indus
           @asm.mov(0, reg(i.args[0], 0)); @asm.bl(kt == :str || kt == :dyn ? :rt_hash_keys : :rt_hash_keys_w); @asm.mov(d, 0)
         when :ssub
           @asm.mov(1, reg(i.args[1], 1)); @asm.mov(2, reg(i.args[2], 2)); @asm.mov(0, reg(i.args[0], 0))
-          @asm.bl(:rt_str_sub); @asm.mov(d, 0)
+          @asm.bl(i.single ? :rt_str_at : :rt_str_sub); @asm.mov(d, 0) # s[i]: nil at i == len (rt_str_sub gives "" there)
         when :puts_bool
           @asm.str_data(:__true, "true"); @asm.str_data(:__false, "false")
           f_ = @asm.uniq; dn = @asm.uniq

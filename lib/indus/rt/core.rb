@@ -265,6 +265,9 @@ def __dyn_mul(a, b)
   if __dyn_both_int(a, b)
     return __box_int(__unbox_int(a) * __unbox_int(b))
   end
+  return __box_str(__str_times(__unbox_str(a), __unbox_int(b))) if __tag(a) == 2 && __tag(b) & 1 == 1 # "s" * n
+  return __box_str(__arr_join(__unbox_arr(a), __unbox_str(b))) if __tag(a) == 4 && __tag(b) == 2 # arr * sep
+  return __box_arr(__arr_times(__unbox_arr(a), __unbox_int(b))) if __tag(a) == 4 && __tag(b) & 1 == 1 # arr * n
   return __box_big(__big_mul(__dyn_to_big(a), __dyn_to_big(b))) if __dyn_intish(a) && __dyn_intish(b)
   __box_float(__dyn_num(a) * __dyn_num(b))
 end
@@ -1232,19 +1235,47 @@ def __str_rjust(s, w, pad)
   out
 end
 
+# center: total padding split left/right (left gets the smaller half), each side cycles through pad
 def __str_center(s, w, pad)
-  out = __sdup(s)
-  left = true
-  while out.length < w
-    out = left ? out + pad : pad + out
-    left = !left
+  return __sdup(s) if w <= s.length || pad.length == 0
+  total = w - s.length
+  left = total / 2
+  right = total - left
+  __str_pad_n(pad, left) + s + __str_pad_n(pad, right)
+end
+def __str_pad_n(pad, n)
+  out = ""
+  i = 0
+  while out.length < n
+    out = out + pad[i % pad.length]
+    i = i + 1
   end
   out
 end
 
 # Symbols are small integers at run time; SYMBOL_NAMES (built at the top of main) has their names
 def __sym_name(id) = SYMBOL_NAMES[id]
-def __sym_inspect(id) = ":" + SYMBOL_NAMES[id]
+def __sym_inspect(id) = __sym_plain_p(SYMBOL_NAMES[id]) ? ":" + SYMBOL_NAMES[id] : ":" + __quote(SYMBOL_NAMES[id])
+# a symbol name that prints bare: an identifier (with ? ! = suffix), an operator, or an ivar/global/const
+def __sym_plain_p(s)
+  return false if s.length == 0
+  return true if s == "+" || s == "-" || s == "*" || s == "/" || s == "%" || s == "**" || s == "==" || s == "!=" || s == "<" || s == "<=" || s == ">" || s == ">=" || s == "<=>" || s == "<<" || s == ">>" || s == "[]" || s == "[]=" || s == "!" || s == "=~" || s == "&" || s == "|" || s == "^" || s == "~" || s == "+@" || s == "-@" || s == "==="
+  i = 0
+  i = i + 1 if __ld8(s, 0) == 36 # $
+  i = i + 1 if __ld8(s, i) == 64 # @
+  i = i + 1 if __ld8(s, i) == 64
+  return false if i >= s.length
+  c = __ld8(s, i)
+  return false unless (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c >= 128
+  i = i + 1
+  while i < s.length
+    c = __ld8(s, i)
+    if (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c >= 128 then i = i + 1
+    elsif (c == 63 || c == 33 || c == 61) && i == s.length - 1 then return true
+    else return false end
+  end
+  true
+end
 # a symbol as a hash key: `name:` when it is a plain identifier (optionally ending in ? or !), else `"name":`
 def __sym_key(id)
   s = SYMBOL_NAMES[id]
@@ -1328,7 +1359,7 @@ end
 def __dyn_class_name(v)
   t = __tag(v)
   return "Integer" if t & 1 == 1
-  return "NilClass" if v == 0
+  return "NilClass" if __same(v, 0)
   return "String" if t == 2
   return "Array" if t == 4
   return "Hash" if t == 6
@@ -1444,7 +1475,7 @@ def __dyn_to_i(v)
   return __unbox_str(v).to_i if t == 2
   __trap if t == 14 && __big_p(v) # RangeError in Ruby: bignum too big to convert into 'long'
   return __unbox_float(v).to_i if t == 14
-  return 0 if v == 0
+  return 0 if __same(v, 0)
   __trap
   0
 end

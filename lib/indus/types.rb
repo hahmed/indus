@@ -372,8 +372,11 @@ module Indus
                   raise "respond_to?(:#{nm}) on a tagged value: not supported" if !ids.empty? || !fams.empty? && fams.size != 4
                   i.op = :const; i.args = [fams.empty? ? 0 : 1]; i.ty = :bool
                 else
-                  fm = t == :str ? "str" : arr(t) ? "arr" : hsh(t) ? "hash" : %i[int float].include?(t) ? "num" : nil
-                  i.op = :const; i.args = [fm && builtin.(fm) ? 1 : 0]; i.ty = :bool
+                  fm = t == :str ? "str" : arr(t) ? "arr" : hsh(t) ? "hash" : %i[int float int?].include?(t) ? "num" : t == :sym ? "sym" : t == :nil ? "nil" : t == :bool ? "bool" : nil
+                  common = %i[to_s inspect class nil? == != hash dup clone freeze frozen? is_a? kind_of? instance_of? respond_to? send object_id equal? eql? tap then itself methods instance_variables display === =~ !~ instance_variable_get instance_variable_set].include?(nm)
+                  extra = (fm == "sym" && %i[to_sym to_proc length size upcase downcase capitalize succ <=> [] start_with? end_with? empty?].include?(nm)) ||
+                          (fm == "nil" && %i[to_a to_i to_f to_h & | ^].include?(nm)) || (fm == "bool" && %i[& | ^ !].include?(nm))
+                  i.op = :const; i.args = [common || extra || (fm && builtin.(fm)) ? 1 : 0]; i.ty = :bool
                 end
                 changed = true
               end
@@ -774,7 +777,7 @@ module Indus
         end
         if cname == :Numeric && !t.nil? && t != :dyn && !poly?(t) then i.op = :const; i.args = [%i[int int? float].include?(t) ? 1 : 0]; i.ty = :bool; next end
         if cname == :Comparable && !t.nil? && t != :dyn && !poly?(t) then i.op = :const; i.args = [%i[int int? float str].include?(t) || (t.is_a?(Symbol) && @classes[t] && @classes[t].mixins.include?(:Comparable)) ? 1 : 0]; i.ty = :bool; next end
-        if cname == :Object && !t.nil? && t != :dyn then i.op = :const; i.args = [1]; i.ty = :bool; next end
+        if %i[Object BasicObject Kernel].include?(cname) && !t.nil? then i.op = :const; i.args = [1]; i.ty = :bool; next end # everything is one
         if t == :dyn
           i.op = :isa_dyn; i.args = [v, cname] # tag test, or class id for user classes
         elsif poly?(t) && (@classes[cname] || @lower.modules.include?(cname))
@@ -826,6 +829,8 @@ module Indus
             if cs.any? { @classes[_1].find_method(:to_s) } then i.op = :mcall; i.args = [:to_s, i.args[0]]; bind(f, i); i.ty = :str; changed = true
             else i.op = :sconst; i.args = ["#<#{cs.first}>"] end
           elsif t == :str then i.op = :str_or_empty
+          elsif t == :dyn then i.op = :call; i.args = [fn(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true # (dyn is final: nothing widens past it)
+          elsif !@settled && t == :sym && %i[aget hget hval_at idx phi param fld_get call apop].include?(i.args[0].op) then nil # a Symbol element may still widen to dyn: wait
           elsif t == :sym then i.op = :call; i.args = [fn(:__sym_name), i.args[0]]; i.ty = :str; changed = true
           elsif t == :dyn then i.op = :call; i.args = [fn(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true
           elsif arr(t) || hsh(t) # a container's to_s is its inspect: through the tagged printer (boxing first)
@@ -995,6 +1000,21 @@ module Indus
       callee.rtype = nil
       funcs.each { |g| g.all.each { |u| u.ty = nil if u.op == :call && u.args[0].equal?(callee) } }
       callee.all.each { |u| forget_params(u.args[0], funcs, seen) if u.op == :call && u.args[0].is_a?(Func) } # what it calls was typed from its parameters
+    end
+
+    # a container literal (anew/hnew + stores) whose stored values are of more than one kind
+    def self.mixed_literal?(v)
+      kinds = []
+      loop do
+        case v.op
+        when :aset then kinds << (v.args[2].ty || v.args[2].op); v = v.args[0]
+        when :hset then kinds << (v.args[2].ty || v.args[2].op); v = v.args[0]
+        when :anew, :hnew then break
+        else return false
+        end
+        return false unless v.is_a?(Inst)
+      end
+      kinds.map { |k| k.is_a?(Array) ? k[0] : k }.uniq.size > 1
     end
 
     def self.literal_origin?(v, seen = {})
@@ -1468,6 +1488,9 @@ module Indus
     def self.bind(f, i)
       name, recv, *args = i.args
       t = of(f, recv)
+      # an element read whose container is still being typed: a scalar type now may widen to dyn (a mixed array);
+      # binding to the scalar's method would be irreversible, so wait (the settled round decides)
+      return if !@settled && %i[aget hget hval_at apop].include?(recv.op) && %i[sym bool nil float].include?(t) && (ct = of(f, recv.args[0])) && (arr(ct) || hsh(ct)) && !prelude?(f)
       if %i[int int?].include?(t) && args.size == 1 && big?(of(f, args[0])) && %i[gcd lcm fdiv divmod remainder div modulo pow eql? coerce].include?(name) # 6.lcm(bignum): the receiver lifted
         recv = coerce(f, i.block, i, recv, BIG); i.args[1] = recv; t = BIG
       end
@@ -1577,7 +1600,11 @@ module Indus
       if (k = @classes[t]) && k.closure && k.method_of && name == :bind && args.size == 1 then i.op = :nop; i.args = [recv]; i.ty = t; return end # unbind.bind(obj): the object is the captured receiver already
       if (k = @classes[t]) && k.closure && args.empty? && %i[arity lambda? parameters curry].include?(name) && (cf = k.methods[:call])
         case name
-        when :arity then i.op = :const; i.args = [cf.rest || (k.arity_info && k.arity_info[:optional] > 0) ? -(k.arity_info ? k.arity_info[:required] : cf.params.size - 1 - (cf.rest ? 1 : 0)) - 1 : cf.params.size - 1]; i.ty = :int; return
+        when :arity # a lambda: -(required+1) with optionals or *rest; a proc: -(required+1) only with *rest, else the required count
+          req = k.arity_info ? k.arity_info[:required] : cf.params.size - 1 - (cf.rest ? 1 : 0)
+          opt = k.arity_info ? k.arity_info[:optional] : 0
+          neg = cf.rest || (cf.strict_arity && opt > 0)
+          i.op = :const; i.args = [neg ? -req - 1 : (cf.strict_arity ? req : (k.arity_info ? req : cf.params.size - 1))]; i.ty = :int; return
         when :lambda? then i.op = :const; i.args = [cf.strict_arity ? 1 : 0]; i.ty = :bool; return
         else return
         end
@@ -1917,12 +1944,20 @@ module Indus
       # a container whose elements are still unknown may yet turn out to be something else entirely
       # (a tagged value, a string): wait, unless it is our own fresh literal
       return if partial?(t) && !@settled && !(r.is_a?(Inst) && (literal_origin?(r)))
+      # an element read out of a container still being typed (x[6][0]): its type may widen to dyn; the by-type rewrite waits
+      # an element read whose container holds several kinds (x[6][0] on a mixed literal): the element is tagged, decided at run time
+      if r.is_a?(Inst) && %i[aget hget hval_at apop].include?(r.op) && (ct = of(f, r.args[0])) && ((arr(ct) && ct[1] == :dyn) || (hsh(ct) && ct[2] == :dyn)) && t != :dyn
+        return # the element's own type is provisional; the container says dyn -- the dyn path takes it once the read is typed dyn
+      end
+      if !@settled && r.is_a?(Inst) && %i[aget hget hval_at apop].include?(r.op) && r.args[0].is_a?(Inst) && mixed_literal?(r.args[0]) && (arr(t) || hsh(t) || t == :str)
+        return # an element of a literal that stores several kinds ([1, {a: 1}, [1]]): the element will be tagged; wait for the container to say so
+      end
       if arr(t) && i.op == :idx && i.args.size == 3 then i.op = :call; i.args = [fn(:__arr_slice), *i.args]; i.ty = nil # a[start, len]
       elsif arr(t) then i.op = i.op == :idx ? :aget : :aset; i.assumed = [r, :arr]
       elsif hsh(t) then i.op = i.op == :idx ? :hget : :hset; i.assumed = [r, :hash]
       elsif t == :str && !@settled && r.is_a?(Inst) && %i[aget hget apop idx phi cell_get].include?(r.op) then nil # an element read as a string may still turn out tagged: wait
       elsif t == :str && i.op == :idx_set then i.op = :call; i.args = [fn(:__str_set_at), *i.args]; i.ty = :str # s[i] = "c"
-      elsif t == :str && i.op == :idx then i.assumed = [r, :str]; i.op = :ssub; i.args << (c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); c) if i.args.size == 2
+      elsif t == :str && i.op == :idx then i.assumed = [r, :str]; i.op = :ssub; i.single = (i.args.size == 2); i.args << (c = Inst.new(:const, [1]); c.ty = :int; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c); c) if i.args.size == 2
       elsif classes_of(t) # an object: its own [] / []= method
         i.args = [i.op == :idx ? :[] : :[]=, *i.args]; i.op = :mcall; i.ty = nil; bind(f, i)
       elsif t == :nil && @settled # indexing nil: dead code behind a nil? guard, or a NoMethodError at run time: trap, and the value is a constant
@@ -2033,7 +2068,7 @@ module Indus
         l, r = of(f, a[0]), of(f, a[1])
         return nil if classes_of(l) # an object's operator: the method call the rewrite makes decides (joining would say dyn)
         l && r ? join(narrow(l), narrow(r)) : nil # both sides known, or no guess: a str * n is not an int
-      when :and, :or then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int # nil is the word 0, false: nil & x, nil | x are booleans
+      when :and, :or then (lt = of(f, a[0]); rt = of(f, a[1]); [lt, rt].all? { %i[bool nil].include?(_1) } || (%i[bool nil].include?(lt) && a[1].is_a?(Inst) && a[1].truthed) ? :bool : :int) # nil is the word 0, false: nil & x, nil | x are booleans
       when :xor then [of(f, a[0]), of(f, a[1])].all? { %i[bool nil].include?(_1) } ? :bool : :int
       when :mod then i.args.any? { of(f, _1) == :float } ? :float : :int
       when :fld_get_i then :dyn
@@ -2223,6 +2258,7 @@ module Indus
       t = of(f, v)
       return v if t.nil? || dest.nil? || t == dest
       c = case
+          when dest == :int? && t == :nil then Inst.new(:const, [INT_NIL]).tap { _1.ty = :int } # nil into a nullable-int slot: the sentinel
           when dest == :float && (t == :int || t == :int?) then Inst.new(:itof, [v]).tap { _1.ty = :float } # a nil here would have raised already
           when dest == :dyn && t != :dyn then Inst.new(:box, [v, t]).tap { _1.ty = :dyn }
           when big?(dest) && t == :dyn then Inst.new(:call, [fn(:__dyn_to_big), v]).tap { _1.ty = BIG } # a Bignum that travelled boxed (an ivar, a container): tag 4 as its limbs, a fixnum lifted

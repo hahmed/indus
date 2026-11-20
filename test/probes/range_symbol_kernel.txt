@@ -1,0 +1,361 @@
+(1..5).to_a
+(1...5).to_a
+(1..5).size
+(1...5).count
+(1..5).sum
+(1..5).reduce(:*)
+(1..5).include?(3)
+(1..5).cover?(3)
+(1..5) === 3
+(1..5).member?(6)
+(1..5).min
+(1..5).max
+(1..5).minmax
+(1..5).first
+(1..5).first(2)
+(1..5).last
+(1..5).last(2)
+(1..5).step(2).to_a
+(1..5).each_slice(2).to_a
+(1..5).each_cons(2).to_a
+(1..5).map { |x| x * 2 }
+(1..5).select(&:even?)
+(1..5).reject(&:even?)
+(1..5).find { |x| x > 2 }
+(1..5).each_with_index.to_a
+(1..5).each_with_object([]) { |x, a| a << x }
+(1..5).inject(:+)
+(1..5).to_a.reverse
+(1..5).reverse_each.to_a
+(1..5).zip(6..10)
+(1..5).partition(&:odd?)
+(1..5).group_by { |x| x % 2 }
+(1..5).tally
+(1..5).each_entry.to_a
+(1..5).lazy.map { |x| x * 2 }.first(2)
+(1..).first(3)
+(1..nil).first(2)
+(..5).include?(3)
+(1..5).begin
+(1..5).end
+(1...5).end
+(1...5).exclude_end?
+(1..5).exclude_end?
+(1..5).to_s
+(1...5).inspect
+(1..5) == (1..5)
+(1..5).eql?(1..5)
+(1..5).hash == (1..5).hash
+(1..5).dup
+("a".."e").to_a
+("a".."e").include?("c")
+("a".."e").map(&:upcase)
+("aa".."ad").to_a
+(1.0..2.0).include?(1.5)
+(1.0..2.0).step(0.5).to_a
+(1..10) % 3 rescue 0
+Range.new(1, 3).to_a
+Range.new(1, 3, true).to_a
+(1..3).entries
+(3..1).to_a
+(1..3).sum { |x| x * 10 }
+(1..3).flat_map { |x| [x, x] }
+(1..3).each_slice(2).map(&:sum)
+(1..3).min_by { |x| -x }
+(1..3).max(2)
+(1..3).sort_by { |x| -x }
+(1..3).take(2)
+(1..3).drop(1)
+(1..3).take_while { |x| x < 3 }
+(1..3).none? { |x| x > 5 }
+(1..3).all?(Integer)
+(1..3).any? { |x| x == 2 }
+(1..3).count(&:odd?)
+(1..3).cycle.first(5)
+(1..3).to_set.size rescue 3
+(1..3).filter_map { |x| x if x.odd? }
+(1..3).chunk_while { |a, b| b == a + 1 }.to_a
+(1..3).step(1).map { |x| x }
+1.step(3).to_a
+(1..3).%(2).to_a rescue 0
+:sym.to_s
+:sym.to_sym
+:sym.inspect
+:sym.length
+:sym.size
+:sym.upcase
+:sym.downcase
+:sym.capitalize
+:sym.succ
+:sym <=> :syn
+:sym == :sym
+:sym.to_proc.call("x") rescue "x"
+:a.hash == :a.hash
+:sym.start_with?("sy")
+:sym.end_with?("m")
+:sym[0]
+:sym[1..]
+:sym.empty?
+:"".empty?
+:sym.frozen?
+:"with space".to_s
+:sym.class
+:sym.is_a?(Symbol)
+:sym.respond_to?(:to_s)
+%i[a b c].map(&:to_s)
+%i[a b].include?(:a)
+%i[b a].sort
+%i[b a].min
+:a.between?(:a, :b)
+Symbol === :a
+:sym.to_proc.arity
+[:b, :a].sort_by(&:to_s)
+:sym.object_id == :sym.object_id
+"sym".to_sym.equal?(:sym)
+nil.to_a
+nil.to_s
+nil.to_i
+nil.to_f
+nil.inspect
+nil.nil?
+nil & true
+nil | 1
+nil == false
+nil.class
+nil.frozen?
+nil.hash.class
+nil.to_h
+nil.dup
+nil.respond_to?(:nil?)
+nil.instance_of?(NilClass)
+nil & nil
+nil ^ true
+true & false
+true | false
+true ^ true
+true.to_s
+true.inspect
+true.class
+true == true
+true.frozen?
+!true
+!!nil
+true & 1
+false | nil
+true.hash.class
+true.respond_to?(:&)
+TrueClass === true
+false.to_s
+Integer === 1
+String === "s"
+Array === []
+Hash === {}
+NilClass === nil
+Symbol === :s
+Float === 1.0
+Numeric === 1.0
+Comparable === "a"
+Enumerable === []
+Object === 1
+BasicObject === 1
+Kernel === 1
+Regexp === /a/
+Range === (1..2)
+Proc === proc {}
+Method === 1.method(:+)
+1.class.name
+"".class.name
+nil.class.name
+[].class.name
+1.class.to_s
+1.class.inspect
+1.class == Integer
+1.class.ancestors.include?(Comparable)
+Integer.name
+Integer.to_s
+Integer.class
+Integer.superclass.name
+String.superclass
+Array.ancestors.first(3).map(&:to_s)
+Integer.instance_methods.include?(:+)
+Integer.respond_to?(:sqrt)
+Integer.method_defined?(:times)
+Object.new.class
+Object.new.to_s.start_with?("#<Object")
+Object.new.inspect.start_with?("#<Object")
+Object.new == Object.new
+Object.new.equal?(Object.new)
+Object.new.frozen?
+Object.new.nil?
+Object.new.respond_to?(:to_s)
+Object.new.is_a?(Object)
+Object.new.instance_variables
+Object.new.methods.size > 10
+Object.new.tap { |o| }.class
+Object.new.then { 1 }
+Object.new.dup.class
+Object.new.hash.class
+Object.new.itself.class
+Object.new.display rescue 0
+Object.new.singleton_methods
+Object.new.instance_of?(Object)
+Object.new.kind_of?(BasicObject)
+Object.new.freeze.frozen?
+Object.new.send(:class)
+Object.new.public_send(:class)
+Object.new.__send__(:class)
+Object.new.method(:to_s).arity
+Object.new.object_id.class
+Object.new.instance_variable_get(:@x)
+Object.new.instance_variable_set(:@x, 1)
+Object.new.instance_variable_defined?(:@x)
+Object.new.extend(Comparable).is_a?(Comparable)
+Object.new.define_singleton_method(:f) { 1 }
+Object.new.singleton_class.class
+format("%05d", 42)
+sprintf("%.1f", 3.14159)
+Integer("42")
+Integer("0x2A", 16)
+Integer("0b101", 2)
+Integer("abc") rescue "err"
+Integer(nil) rescue "err"
+Integer(3.99)
+Integer("  42  ")
+Float("3.5")
+Float("1e3")
+Float("x") rescue "err"
+String(42)
+String(nil)
+Array(nil)
+Array([1])
+Array(1)
+Array(1..3)
+Array({a: 1})
+Hash([[1, 2]])
+Hash(nil)
+Rational(1, 2) rescue 0
+Complex(1, 2) rescue 0
+rand(10).between?(0, 9)
+rand(1..6).between?(1, 6)
+rand.between?(0, 1)
+srand(1); rand(100)
+[1, 2, 3].shuffle(random: Random.new(1)).size
+Random.new(42).rand(10).class
+Random.rand(5).class
+loop { break 1 }
+loop.class rescue 0
+catch { |tag| throw tag, 5 }
+catch(:x) { 10 }
+throw :y rescue p $!.class
+caller.class
+__method__
+__FILE__.end_with?(".rb")
+__LINE__
+__dir__.class
+binding.class rescue 0
+block_given?
+proc { |x| x }.call(1)
+lambda { |x| x }.call(1)
+proc { |x| x }.lambda?
+->(x) { x }.lambda?
+proc { |x, y| [x, y] }.call(1)
+proc { |x, y| [x, y] }.call([1, 2])
+lambda { |x, y| [x, y] }.call(1) rescue "ArgumentError"
+proc { |x| x }.arity
+proc { |*x| x }.arity
+proc { |x, y| }.arity
+lambda { |x, y = 1| }.arity
+proc { }.arity
+proc { |x| }.parameters
+->(a, b = 1, *c, d:, e: 2, **f, &g) {}.parameters
+method(:puts).arity
+method(:p).owner
+method(:print).name
+1.method(:+).call(2)
+1.method(:+).to_proc.call(3)
+[1, 2].method(:push).call(3)
+"s".method(:upcase).unbind.class
+1.method(:+).receiver
+1.method(:+).owner
+1.method(:+).arity
+[1, 2].map(&1.method(:+))
+%w[a b].map(&:upcase)
+%w[a b].each_with_index.map { |s, i| s * (i + 1) }
+[[1, 2], [3, 4]].map { |a, b| a + b }
+[[1, 2], [3, 4]].to_h { |a, b| [b, a] }
+[[1, [2, 3]]].map { |a, (b, c)| a + b + c }
+{a: 1}.map { |k, v| [k, v] }
+{a: 1}.each_pair.map { |k, v| v }
+[1, 2, 3].each_slice(2).to_a
+[1, 2, 3].each_cons(2).to_a
+[1, 2, 3].each_with_index.select { |x, i| i > 0 }
+[1, 2, 3].select.with_index { |x, i| i > 0 }
+[1, 2, 3].map.with_index(1) { |x, i| x * i }
+[1, 2, 3].each.with_object([]) { |x, a| a << x }
+[1, 2, 3].each_entry.to_a
+[3, 1, 2].sort.first
+[3, 1, 2].max(2)
+[3, 1, 2].min(2)
+[3, 1, 2].sort!.first
+[3, 1, 2].sort_by! { |x| -x }.first
+[[2, "b"], [1, "a"]].sort.first
+[[2, "b"], [1, "a"]].min
+[[2, "b"], [1, "a"]].sort_by(&:first).map(&:last)
+["b", "a"].sort
+["b", "A"].sort_by(&:downcase)
+["bb", "a"].sort_by(&:size)
+["bb", "a"].max_by(&:size)
+["bb", "a"].sum("")
+["bb", "a"].inject(:+)
+["bb", "a"].join
+["bb", "a"].reverse
+["a", "b"].cycle.first(3)
+["a", "b"].product([1, 2])
+["a", "b"].zip([1, 2]).to_h
+["a", "b"].each_with_index.to_h
+["a", "b"].to_h { |s| [s, s.upcase] }
+["a", nil, "b"].compact
+["a", 1, :b].map(&:to_s)
+["a", 1, :b].map(&:class)
+["a", 1, :b].group_by(&:class)
+["a", 1, :b].partition { |x| x.is_a?(String) }
+["a", 1, :b].select { |x| x.is_a?(Integer) }
+["a", 1, :b].find { |x| x.is_a?(Symbol) }
+["a", 1, :b].index(1)
+["a", 1, :b].include?(:b)
+["a", 1, :b] == ["a", 1, :b]
+["a", 1, :b].inspect
+["a", 1, :b].to_s
+["a", 1, :b].join("-")
+["a", 1, :b].sort_by(&:to_s)
+["a", 1, :b].count { |x| x.is_a?(Integer) }
+["a", 1, :b].first.class
+["a", 1, :b].last.class
+["a", 1, :b][1] + 1
+["a", 1, :b][0] + "!"
+["a", 1, :b].reverse
+["a", 1, :b].rotate
+["a", 1, :b].sample.class.class
+["a", 1, :b].shuffle.size
+["a", 1, :b].each_slice(2).to_a
+["a", 1, :b].zip([1, 2, 3])
+["a", 1, :b].flatten
+[["a", 1], [:b, 2.5]].flatten
+[["a", 1], [:b, 2.5]].to_h
+[["a", 1], [:b, 2.5]].transpose
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].map(&:class)
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].inspect
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].map(&:to_s)
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].compact.size
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].select { |x| x }
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].map { |x| x.nil? }
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].count(nil)
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].index(nil)
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].last[:a]
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}][6][0]
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}][4] * 2
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].frozen?
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].hash.class
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}] == [1, "a", nil, true, 2.5, :s, [1], {a: 1}]
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].sort_by(&:to_s)
+[1, "a", nil, true, 2.5, :s, [1], {a: 1}].group_by(&:class).keys.size

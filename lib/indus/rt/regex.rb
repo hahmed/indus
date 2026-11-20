@@ -377,6 +377,7 @@ class MatchData
   def regexp = @re
   def string = @s
   def __group(g)
+    g = @caps.length / 2 + g if g < 0 # m[-1]: the last group
     return nil if g < 0 || g * 2 + 1 >= @caps.length
     gs = @caps[g * 2]
     return nil if gs < 0
@@ -391,7 +392,8 @@ class MatchData
     end
     raise IndexError, "undefined group name reference: " + name
   end
-  def [](k) = k.is_a?(Integer) ? __group(k.to_i) : __group(__index_of(k.to_s))
+  def [](k) = __group(k)
+  def named(name) = __group(__index_of(name))
   def to_a = __re_groups(@s, @caps, @caps.length)
   def captures = to_a.drop(1)
   def named_captures

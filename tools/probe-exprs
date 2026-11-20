@@ -1,0 +1,23 @@
+#!/bin/bash
+# tools/probe-exprs FILE [SETUP]   -- one expression per line in FILE; each is run as `SETUP; p(EXPR)` under
+# CRuby and under Indus; mismatches are printed (expression, got, want). Lines starting with # are skipped.
+# SETUP defaults to nothing. Example: tools/probe-exprs test/probes/array.txt 'a = [1, 2, 3, 4]'
+cd "$(dirname "$0")/.."
+trap 'pkill -9 -P $$ 2>/dev/null' EXIT INT TERM
+file=$1; setup=${2:-}
+tmp=$(mktemp -d)
+n=0; bad=0
+while IFS= read -r e; do
+  [ -z "$e" ] && continue; [[ "$e" == \#* ]] && continue
+  n=$((n+1))
+  printf '%s\np(%s)\n' "$setup" "$e" > "$tmp/p.rb"
+  want=$(ruby --disable-gems "$tmp/p.rb" 2>&1 | head -3 | tr '\n' '|' | cut -c1-80)
+  got=$(INDUS_HEAP_MB=32 timeout -k 1 10 bin/indus "$tmp/p.rb" 2>&1 | grep -av '^indus:\|^\s*from' | head -3 | tr '\n' '|' | cut -c1-80)
+  if [ "$got" != "$want" ]; then
+    bad=$((bad+1))
+    kind="WRONG"; [[ "$got" == *lib/indus/* ]] && kind="REFUSE"; [[ "$got" == *"Trace/BPT"* || -z "$got" ]] && kind="TRAP"
+    printf '%-6s %s\n       got  %s\n       want %s\n' "$kind" "$e" "$got" "$want"
+  fi
+done < "$file"
+rm -rf "$tmp"
+echo "$n expressions, $bad mismatches"

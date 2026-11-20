@@ -795,6 +795,16 @@ rt_hash_keys_0:
         ret
 
 // rt_str_sub(x0 s, x1 start, x2 len) -> new string, or 0 if start is out of range
+// rt_str_at(x0 s, x1 i, x2 1) -> the one-byte string at i, or nil (0) when i is out of range (i == len included)
+rt_str_at:
+        ldur    x3, [x0, #-8]
+        tbz     x1, #63, 0f
+        add     x1, x1, x3
+0:      cmp     x1, x3
+        b.hs    9f
+        b       rt_str_sub
+9:      mov     x0, #0
+        ret
 rt_str_sub:
         ldur    x3, [x0, #-8]
         tbz     x1, #63, 0f

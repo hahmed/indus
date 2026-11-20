@@ -1124,6 +1124,7 @@ def __str_rindex(s, pat)
 end
 
 # "az".succ == "ba": the rightmost alphanumeric run carries
+def __alnum_p(c) = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9")
 def __str_succ(s)
   return "" if s.length == 0
   chars = s.chars
@@ -1137,7 +1138,10 @@ def __str_succ(s)
       chars[i] = (c.ord + 1).chr
       return chars.join("")
     else
-      return chars.join("") # not alphanumeric: Ruby carries past it only when there is something alnum to the left; close enough here
+      # not alphanumeric: skip it when an alphanumeric sits further left (the carry passes over it), else done
+      j = i - 1
+      j = j - 1 while j >= 0 && !__alnum_p(chars[j])
+      return chars.join("") if j < 0
     end
     i = i - 1
   end
@@ -1149,6 +1153,19 @@ end
 
 # parse an integer in a base, stopping at the first bad digit (Ruby's lenient to_i)
 def __str_to_i_base(s, base)
+  if base == 0 # the prefix decides: 0x 0b 0o / leading 0 octal / else decimal
+    t = s
+    sign = ""
+    if t.length > 0 && (t[0] == "-" || t[0] == "+")
+      sign = t[0]
+      t = t[1, t.length - 1]
+    end
+    return __str_to_i_base(sign + t, 16) if t.length > 1 && t[0] == "0" && (t[1] == "x" || t[1] == "X")
+    return __str_to_i_base(sign + t, 2) if t.length > 1 && t[0] == "0" && (t[1] == "b" || t[1] == "B")
+    return __str_to_i_base(sign + t, 8) if t.length > 1 && t[0] == "0" && (t[1] == "o" || t[1] == "O")
+    return __str_to_i_base(sign + t[1, t.length - 1], 8) if t.length > 1 && t[0] == "0"
+    return __str_to_i_base(sign + t, 10)
+  end
   i = 0
   neg = false
   if s.length > 0 && (s[0] == "-" || s[0] == "+")
@@ -2185,3 +2202,37 @@ def __hash_uniq(h) = __hash_to_a(h)
 def __hash_to_h(h) = h
 def __hash_each_cons1(h, n) = __arr_each_cons1(__hash_to_a(h), n)
 def __hash_find_index(h, pair) = __arr_index(__hash_to_a(h), pair)
+def __str_to_str(s) = s
+def __str_intern(s) = __str_to_sym(s)
+def __str_dump(s) = __quote(s)
+def __str_each_grapheme_cluster(s) = __str_chars(s)
+def __str_upto(a, b)
+  out = []
+  cur = __sdup(a)
+  n = 0
+  while n < 100000
+    out.push(cur)
+    break if cur == b || cur.length > b.length
+    cur = __str_succ(cur)
+    n = n + 1
+  end
+  out
+end
+def __str_lines_chomp(s)
+  ls = __str_lines(s)
+  i = 0
+  while i < ls.length
+    ls[i] = __str_chomp(ls[i])
+    i = i + 1
+  end
+  ls
+end
+def __arr_firsts(pairs)
+  out = []
+  i = 0
+  while i < pairs.length
+    out.push(pairs[i][0])
+    i = i + 1
+  end
+  out
+end
