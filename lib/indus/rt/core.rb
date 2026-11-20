@@ -1636,6 +1636,7 @@ def __raise_type_error(msg) = raise(TypeError, msg)
 def __raise_no_method(msg) = raise(NoMethodError, msg)
 def __raise_index_error(msg) = raise(IndexError, msg)
 def __raise_arg_error(msg) = raise(ArgumentError, msg)
+def __raise_frozen(msg) = raise(FrozenError, msg)
 def __raise_name_error(msg)
   raise NameError, msg
 end

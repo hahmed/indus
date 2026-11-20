@@ -1515,6 +1515,8 @@ module Indus
         elsif shared?(n.name) then emit(:cell_get, [@locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" }])
         else @locals.fetch(lname(n.name)) { raise "undefined local #{n.name}" } end
       when Prism::LocalVariableWriteNode
+        if n.value.is_a?(Prism::CallNode) && n.value.name == :freeze && n.value.arguments.nil? then (@frozen_locals ||= {})[lname(n.name)] = true
+        elsif @frozen_locals then @frozen_locals.delete(lname(n.name)) end
         if n.value.is_a?(Prism::LambdaNode) # inlined at `x.call(...)` sites; a value wherever else x is used
           (@lambdas ||= {})[lname(n.name)] = n.value
           return (@locals[lname(n.name)] = lambda_value(n.value))
@@ -1871,8 +1873,28 @@ module Indus
       Prism::CallNode.new(n.send(:source), 0, n.location, 0, src, nil, :to_a, nil, nil, nil, nil, nil, nil)
     end
 
+    MUTATORS = %i[<< concat push append prepend insert unshift replace clear fill map! select! reject! sort! sort_by! reverse! uniq! compact! flatten! shuffle! rotate! upcase! downcase! capitalize! swapcase! chomp! chop! strip! lstrip! rstrip! squeeze! delete! tr! tr_s! sub! gsub! slice! succ! next! delete_prefix! delete_suffix! []= pop shift delete delete_at delete_if keep_if store merge! update transform_keys! transform_values! filter! collect! setbyte bytesplice force_encoding encode! unicode_normalize! scrub! squeeze! << ].freeze
+    # a receiver known frozen (x = "s".freeze / x.freeze earlier / "lit".freeze): mutators raise FrozenError (no frozen bit at run time; this is the static part)
+    def frozen_receiver?(r)
+      return false unless r
+      return true if r.is_a?(Prism::CallNode) && r.name == :freeze && r.arguments.nil? && (r.receiver.is_a?(Prism::StringNode) || r.receiver.is_a?(Prism::ArrayNode) || r.receiver.is_a?(Prism::HashNode) || r.receiver.is_a?(Prism::InterpolatedStringNode))
+      return true if r.is_a?(Prism::LocalVariableReadNode) && @frozen_locals&.include?(lname(r.name))
+      return true if r.is_a?(Prism::InstanceVariableReadNode) && @frozen_locals&.include?(r.name)
+      false
+    end
+
     def call(n)
       args = n.arguments&.arguments || []
+      if n.receiver && MUTATORS.include?(n.name) && frozen_receiver?(n.receiver) && !((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd])
+        what = kind_of(n.receiver) == :array || n.receiver.is_a?(Prism::ArrayNode) ? "Array" : kind_of(n.receiver) == :hash ? "Hash" : "String"
+        args.each { expr(_1) }
+        rn = n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :freeze ? n.receiver.receiver : n.receiver
+        return emit(:call, [demand(:__raise_frozen), emit(:scat, [emit(:sconst, ["can't modify frozen #{what}: "]), inspect_str(rn)])])
+      end
+      if n.name == :frozen? && args.empty? && frozen_receiver?(n.receiver) then (c = const(1); c.ty = :bool; return c) end
+      if n.name == :freeze && args.empty? && n.receiver # x.freeze as a statement / value: x is frozen from here on
+        (@frozen_locals ||= {})[n.receiver.is_a?(Prism::LocalVariableReadNode) ? lname(n.receiver.name) : n.receiver.name] = true if n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode)
+      end
       # self.m(...) where self is main (top level or a top-level def): main has no object; the call is a bare call
       if n.receiver.is_a?(Prism::SelfNode) && ivar_owner == :main && (f0 = @funcs[n.name]) && (n.name.to_s.end_with?("=") || n.name == :[]) && !%i[== != <= >= ===].include?(n.name)
         return emit(:call, [f0, *args.map { expr(_1) }]) # self.a = v / self[k] = v / self[k] at main: main's own def
