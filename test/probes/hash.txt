@@ -1,0 +1,294 @@
+h.sort_by { |k, v| v }.to_h
+h.min_by { |k, v| v }.first
+h.sum { |k, v| v }
+h.to_a.transpose
+h.keys.zip(h.values)
+h.map { |k, v| v }.sum
+h.each_with_index.map { |(k, v), i| [k, i] }
+h.find { |k, v| v == 2 }&.first
+h.count
+h.size
+h.length
+h.dig(:a)
+h.fetch(:a)
+h.fetch(:z, 0)
+h.fetch(:z) { |k| k.to_s }
+h.key?(:a)
+h.value?(1)
+h.values_at(:a, :b)
+h.invert
+h.any?
+h.empty?
+h.each_pair.to_a
+h.each_key.to_a
+h.each_value.to_a
+h.reject { |k, v| v == 1 }
+h.select { |k, v| v == 1 }
+h.filter_map { |k, v| k if v == 1 }
+h.transform_values(&:to_s)
+h.transform_keys(&:to_s)
+h.group_by { |k, v| v.odd? }
+h.partition { |k, v| v.odd? }
+h.min_by { |k, v| -v }
+h.sort
+h.sort { |a, b| b[1] <=> a[1] }
+h.max_by { |k, v| v }
+h.sum { |k, v| v * 2 }
+h.inject(0) { |s, (k, v)| s + v }
+h.reduce(0) { |s, kv| s + kv[1] }
+h.each_with_object([]) { |(k, v), a| a << v }
+h.to_a.flatten
+h.flat_map { |k, v| [k] * v }
+h.first
+h.first(1)
+h.take(1)
+h.drop(1)
+h.keys.first
+h.default
+h.merge({c: 3})
+h.merge({a: 9}) { |k, a, b| a + b }
+h.update(c: 3)
+h.compact
+h.filter { |k, v| v > 1 }
+h.delete_if { |k, v| v > 1 }
+h.keep_if { |k, v| v > 1 }
+h.clear
+h.store(:z, 26)
+h.key(1)
+h.rassoc(1)
+h.assoc(:a)
+h.to_s
+h.inspect
+h == {a: 1, b: 2}
+h.eql?({a: 1, b: 2})
+h.equal?(h)
+h.hash == h.hash
+h.frozen?
+h.dup == h
+h.dup.equal?(h)
+h.clone == h
+h.slice(:a)
+h.except(:a)
+h.filter_map { |k, v| v }
+h.sum { |k, v| 1 }
+h.map(&:first)
+h.map(&:last)
+h.each_slice(1).to_a
+h.each_cons(2).to_a
+h.zip(h)
+h.cycle.first(3)
+h.lazy.map { |k, v| v }.to_a
+h.each_entry.to_a
+h.tally
+h.uniq
+h.include?(:a)
+h.member?(:a)
+h.has_value?(2)
+h.compare_by_identity.size
+h.default_proc
+h.to_h
+h.to_h { |k, v| [v, k] }
+h.entries
+h.find_all { |k, v| v }
+h.detect { |k, v| v == 2 }
+h.find_index([:b, 2])
+h.minmax_by { |k, v| v }
+h.sum([]) { |k, v| [v] }
+h.chunk_while { |a, b| true }.to_a
+h.none? { |k, v| v > 5 }
+h.all? { |k, v| v > 0 }
+h.one? { |k, v| v > 1 }
+h.count { |k, v| v > 0 }
+h.each.next
+h.values.sum
+h.keys.sort
+h.sort_by { |k, v| -v }.first
+h.min_by(2) { |k, v| v }
+h.max(1)
+h.min
+h.max
+h.fetch(:z) rescue "KeyError"
+h.dig(:a, :b) rescue "TypeError"
+h.to_a.to_h == h
+h.sum { |k, v| v }
+h.each_with_index.to_a
+h.map { |k, v| k }.sort
+h.keys.map(&:to_s)
+h.values.sum
+h.any? { |k, v| v > 1 }
+h.all? { |(k, v)| v > 0 }
+h.each { |pair| p pair }.class
+h.each_pair { |k, v| }.class
+h.select { |k, v| v > 1 }.class
+h.filter_map { |k, v| k if v > 1 }
+h.min_by { |k, v| v }
+h.sort_by { |k, v| -v }.first
+h.sort_by { |k, v| -v }.to_h
+h.group_by { |k, v| v.odd? }.keys
+h.partition { |k, v| v > 1 }.map(&:to_h)
+h.each_with_object({}) { |(k, v), acc| acc[v] = k }
+h.reduce(0) { |s, (k, v)| s + v }
+h.inject { |a, b| a }
+h.map { |k, v| [k.to_s, v] }.to_h
+h.transform_keys(&:to_s)
+h.transform_keys { |k| k.to_s.upcase }
+h.transform_values { |v| v * 10 }
+h.to_h { |k, v| [v, k] }
+h.invert
+h.key(1)
+h.rassoc(2)
+h.assoc(:a)
+h.dig(:a)
+h.values_at(:a, :b, :c)
+h.fetch_values(:a, :b)
+h.slice(:a, :c)
+h.except(:a)
+h.filter_map { |k, v| v }
+h.compact
+h.merge({c: 3}) { |k, a, b| a }
+h.merge(h) { |k, a, b| a + b }
+h.update(c: 3)
+h.merge!(d: 4) { |k, a, b| a }
+h.store(:e, 5)
+h[:f] = 6
+h.delete(:a)
+h.delete(:zz)
+h.delete(:zz) { |k| "nope" }
+h.delete_if { |k, v| v == 1 }
+h.reject! { |k, v| v == 1 }
+h.reject! { |k, v| v == 99 }
+h.select! { |k, v| v == 1 }
+h.keep_if { |k, v| v == 1 }
+h.clear
+h.replace({x: 1})
+h.shift
+h.default
+h.default = 5
+h.default_proc
+h.compare_by_identity.class
+h.to_proc.call(:a)
+h.key?(:a)
+h.has_key?(:a)
+h.include?(:a)
+h.member?(:a)
+h.value?(1)
+h.has_value?(1)
+h.length
+h.size
+h.count
+h.count { |k, v| v > 1 }
+h.empty?
+h.any?
+h.none?
+h.sum { |k, v| 1 }
+h.first
+h.first(1)
+h.min_by(1) { |k, v| v }
+h.max_by { |k, v| v }
+h.sort
+h.sort { |a, b| b[1] <=> a[1] }
+h.to_a.sort_by(&:last)
+h.find { |k, v| v == 2 }
+h.detect { |k, v| v == 2 }
+h.find_all { |k, v| v }
+h.each_slice(1).to_a
+h.each_cons(2).to_a
+h.zip([1, 2])
+h.flat_map { |k, v| [k] * v }
+h.each_entry.to_a
+h.lazy.map { |k, v| v }.to_a
+h.chunk_while { |a, b| true }.to_a
+h.tally
+h.uniq
+h.cycle.first(3)
+h.take(1)
+h.drop(1)
+h.take_while { |k, v| v < 2 }
+h.drop_while { |k, v| v < 2 }
+h.min
+h.max
+h.minmax
+h.sum([]) { |k, v| [v] }
+h.inspect
+h.to_s
+h == {a: 1, b: 2}
+h == {b: 2, a: 1}
+h.eql?({a: 1, b: 2})
+h.equal?(h)
+h.hash == {a: 1, b: 2}.hash
+h.frozen?
+h.freeze.frozen?
+h.dup == h
+h.dup.equal?(h)
+h.clone.size
+h.class
+h.is_a?(Hash)
+h.is_a?(Enumerable)
+h.respond_to?(:each)
+h.respond_to?(:zzz)
+h.each.next
+h.keys.frozen?
+h.to_a.flatten
+h.flatten
+h.flatten(2)
+h.filter_map { |k, v| [k, v] if v > 1 }.to_h
+h.deconstruct_keys([:a]) rescue 0
+h.each_key.to_a
+h.each_value.map { |v| v * 2 }
+h.then { |x| x.size }
+h.tap { |x| }.size
+h.object_id == h.object_id
+h.send(:size)
+h.public_send(:keys)
+h.method(:size).call
+h.instance_of?(Hash)
+h.kind_of?(Object)
+h.nil?
+h.itself.equal?(h)
+h.entries
+h.to_h
+h.to_a
+h.to_set.size rescue 2
+h.sum { |k, v| v.to_f }
+h.map(&:first)
+h.map(&:last)
+h.map(&:size)
+h.each_with_index.map { |(k, v), i| i }
+h.each.with_index(1).map { |(k, v), i| i }
+h.each.with_object([]) { |(k, v), a| a << k }
+h.keys.each_slice(1).to_a
+h.values.each_cons(2).to_a
+h.sort_by { |k, v| k }.map(&:first)
+h.max_by(2) { |k, v| v }
+h.sum { |k, v| v }.fdiv(h.size)
+h.group_by { |k, v| v }.transform_values(&:size)
+h.each_with_object(Hash.new(0)) { |(k, v), c| c[v] += 1 }
+h.select { |k, v| v.even? }.keys
+h.reject { |k, v| v.even? }.values
+h.find_index { |k, v| v == 2 }
+h.find_index([:b, 2])
+h.one? { |k, v| v > 1 }
+h.none? { |k, v| v > 5 }
+h.all? { |k, v| v > 0 }
+h.any? { |k, v| v > 1 }
+h.count { |k, v| v > 0 }
+h.filter { |k, v| v > 1 }
+h.map { |k, v| v }.max
+h.values.minmax
+h.keys.first.class
+h.first.class
+h.first.first.class
+h.dig(:b).class
+h[:zz].class
+h.fetch(:zz, "d").class
+h[:a] += 1
+h[:b] -= 1
+h[:a] *= 2
+h[:c] ||= 9
+h[:a] &&= 0
+h[:a] = h[:b] = 7
+h.size.times.map { |i| i }
+h.keys.zip(h.values).to_h == h
+h.each_with_index.select { |(k, v), i| i.zero? }.size
+h.each.with_index.to_a.size
+h.lazy.select { |k, v| v > 1 }.map { |k, v| k }.first(1)

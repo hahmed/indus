@@ -274,6 +274,11 @@ module Indus
               z = Inst.new(:const, [0]); z.ty = :int; z.block = i.block; i.block.insts.insert(i.block.insts.index(i), z)
               i.args = [c, z]; changed = true
             end
+            if i.op == :call && i.args[0].is_a?(Func) && %w[__arr_sort_by __arr_min_by __arr_max_by __arr_minmax_by].include?(i.args[0].name.to_s.sub(/\$.*/, "")) && i.args.size == 3 && (kt = of(f, i.args[2])) && arr(kt) && kt[1] == :sym && !i.args[2].keyed_by_name
+              # keys that are Symbols order by name
+              c = Inst.new(:call, [fn(:__arr_sym_names), i.args[2]]); c.ty = [:arr, :str]; c.keyed_by_name = true; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
+              i.args[2] = c; changed = true
+            end
             if @settled && i.op == :call && i.args[0].is_a?(Func) && %w[__arr_join __arr_flatten __arr_flatten1].include?(i.args[0].name.to_s.sub(/\$.*/, "")) && (at = of(f, i.args[1])) && arr(at) && arr(at[1]) && at[1][1] != :dyn && !(i.args[1].is_a?(Inst) && mixed_literal?(i.args[1]))
               # a typed nested array into flatten/join: flatten its typed levels first (the prelude's versions see tagged elements)
               c = Inst.new(:call, [fn(:__arr_flat1_typed), i.args[1]]); c.ty = nil; c.block = i.block; i.block.insts.insert(i.block.insts.index(i), c)
@@ -783,6 +788,7 @@ module Indus
         if cname == :Numeric && !t.nil? && t != :dyn && !poly?(t) then i.op = :const; i.args = [%i[int int? float].include?(t) ? 1 : 0]; i.ty = :bool; next end
         if cname == :Comparable && !t.nil? && t != :dyn && !poly?(t) then i.op = :const; i.args = [%i[int int? float str].include?(t) || (t.is_a?(Symbol) && @classes[t] && @classes[t].mixins.include?(:Comparable)) ? 1 : 0]; i.ty = :bool; next end
         if %i[Object BasicObject Kernel].include?(cname) && !t.nil? then i.op = :const; i.args = [1]; i.ty = :bool; next end # everything is one
+        if cname == :Enumerable && t && (arr(t) || hsh(t)) then i.op = :const; i.args = [1]; i.ty = :bool; next end
         if t == :dyn
           i.op = :isa_dyn; i.args = [v, cname] # tag test, or class id for user classes
         elsif poly?(t) && (@classes[cname] || @lower.modules.include?(cname))

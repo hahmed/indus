@@ -344,6 +344,8 @@ def __dyn_lt(a, b)
   if __tag(a) == 2 && __tag(b) == 2
     return __unbox_str(a) < __unbox_str(b)
   end
+  return __sym_name(__unbox_sym(a)) < __sym_name(__unbox_sym(b)) if __tag(a) == 12 && __tag(b) == 12 # Symbols order by name
+  return __arr_cmp(__unbox_arr(a), __unbox_arr(b)) < 0 if __tag(a) == 4 && __tag(b) == 4 # arrays lexicographically
   __dyn_num(a) < __dyn_num(b)
 end
 
@@ -354,6 +356,9 @@ def __dyn_le(a, b)
   if __tag(a) == 2 && __tag(b) == 2
     return __unbox_str(a) <= __unbox_str(b)
   end
+  return __sym_name(__unbox_sym(a)) <= __sym_name(__unbox_sym(b)) if __tag(a) == 12 && __tag(b) == 12
+  return __arr_cmp(__unbox_arr(a), __unbox_arr(b)) <= 0 if __tag(a) == 4 && __tag(b) == 4
+  return __big_cmp(__dyn_to_big(a), __dyn_to_big(b)) <= 0 if __dyn_intish(a) && __dyn_intish(b)
   __dyn_num(a) <= __dyn_num(b)
 end
 

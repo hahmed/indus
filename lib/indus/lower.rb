@@ -2967,7 +2967,7 @@ module Indus
         @locals.delete_if { |k, _| k.to_s.start_with?(pfx.to_s) }
         return n.name == :tap ? v : (r || v)
       end
-      if %i[map! collect! select! reject! sort_by!].include?(n.name) && n.receiver && !@recv_value # in place: compute, then write back into the same handle
+      if %i[map! collect! select! reject! sort_by!].include?(n.name) && n.receiver && !@recv_value && kind_of(n.receiver) != :hash # in place: compute, then write back into the same handle
         fresh = block_call(n.copy(name: n.name.to_s.chomp("!").to_sym), args)
         return emit(:call, [demand(:__arr_replace), expr(n.receiver), fresh])
       end
@@ -3500,7 +3500,7 @@ module Indus
         end
         @map_target = [outv, i] if map
       end
-      map ? @locals.delete(outv) : const(0)
+      map ? @locals.delete(outv) : h # each returns the hash itself
     end
 
     # a hash as an array of [key, value] pairs (Ruby's to_a / sort_by / each over pairs)
