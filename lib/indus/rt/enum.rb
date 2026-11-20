@@ -1981,3 +1981,133 @@ end
 def __hash_fetch_values1(h, k) = __hash_fetch_values(h, [k])
 def __hash_fetch_values2(h, a, b) = __hash_fetch_values(h, [a, b])
 def __hash_fetch_values3(h, a, b, c) = __hash_fetch_values(h, [a, b, c])
+
+def __arr_spaceship(a, b) = __arr_cmp(a, b)
+def __arr_union(a, b) = __arr_or(a, b)
+def __arr_union2(a, b, c) = __arr_or(__arr_or(a, b), c)
+def __arr_union0(a) = __arr_uniq(a)
+def __arr_intersect_p(a, b) = __arr_and(a, b).length > 0
+def __arr_intersection(a, b) = __arr_and(a, b)
+def __arr_intersection2(a, b, c) = __arr_and(__arr_and(a, b), c)
+def __arr_difference(a, b) = __arr_minus(a, b)
+def __arr_difference2(a, b, c) = __arr_minus(__arr_minus(a, b), c)
+def __arr_product2(a, b, c)
+  out = []
+  ab = __arr_product(a, b)
+  i = 0
+  while i < ab.length
+    j = 0
+    while j < c.length
+      out.push(ab[i] + [c[j]])
+      j = j + 1
+    end
+    i = i + 1
+  end
+  out
+end
+def __arr_product0(a)
+  out = []
+  i = 0
+  while i < a.length
+    out.push([a[i]])
+    i = i + 1
+  end
+  out
+end
+def __arr_find_index(a, x) = __arr_index(a, x)
+def __arr_fetch(a, i)
+  j = i < 0 ? a.length + i : i
+  raise(IndexError, "index " + i.to_s + " outside of array bounds: " + (0 - a.length).to_s + "..." + a.length.to_s) if j < 0 || j >= a.length
+  a[j]
+end
+def __arr_fetch2(a, i, default)
+  j = i < 0 ? a.length + i : i
+  return default if j < 0 || j >= a.length
+  a[j]
+end
+def __arr_dig2(a, i, j)
+  x = a[i]
+  return nil if x == nil
+  x[j]
+end
+# flatten! as a value: nil when nothing was nested (a statement form is rewritten to a reassignment by the compiler);
+# growth in place through this handle is not possible here
+def __arr_flatten_bang(a)
+  return nil if __arr_flatten(a).length == a.length
+  __trap
+  a
+end
+def __arr_flatten_bang1(a, depth)
+  return nil if __arr_flatten1(a, depth).length == a.length
+  __trap
+  a
+end
+def __arr_values_at3(a, i, j, k) = __arr_values_at(a, [i, j, k])
+def __arr_values_at4(a, i, j, k, l) = __arr_values_at(a, [i, j, k, l])
+def __arr_sum0(a) = __arr_sum(a)
+def __arr_none_p0(a) = __arr_none_p(a)
+def __str_codepoints(s)
+  out = []
+  i = 0
+  while i < s.length
+    n = __utf8_len(__ld8(s, i))
+    n = s.length - i if i + n > s.length
+    out.push(__str_ord(s[i, n]))
+    i = i + n
+  end
+  out
+end
+def __str_grapheme_clusters(s) = __str_chars(s)
+def __str_lines1(s, sep)
+  return [__sdup(s)] if sep == "" || s.length == 0
+  out = []
+  from = 0
+  at = __str_index(s, sep, from)
+  while at >= 0
+    out.push(s[from, at + sep.length - from])
+    from = at + sep.length
+    at = from < s.length ? __str_index(s, sep, from) : -1
+  end
+  out.push(s[from, s.length - from]) if from < s.length
+  out
+end
+def __str_prepend2(s, a, b) = a + b + s
+def __str_prepend3(s, a, b, c) = a + b + c + s
+# Integer#floor(-n) / ceil(-n) / round(-n) to a power of ten; a non-negative digit count is the integer itself
+def __num_floor1(n, d)
+  return n if d >= 0
+  m = __num_pow10(0 - d)
+  n - (n % m)
+end
+def __num_ceil1(n, d)
+  return n if d >= 0
+  m = __num_pow10(0 - d)
+  r = n % m
+  r == 0 ? n : n - r + m
+end
+def __num_pow10(k)
+  m = 1
+  i = 0
+  while i < k
+    m = m * 10
+    i = i + 1
+  end
+  m
+end
+def __num_allbits_p(n, mask) = (n & mask) == mask
+def __num_anybits_p(n, mask) = (n & mask) != 0
+def __num_nobits_p(n, mask) = (n & mask) == 0
+def __num_ceildiv(a, b) = 0 - ((0 - a) / b)
+# n[lo..hi]: the bits lo..hi as an integer
+def __num_slice_range(n, lo, hi, excl)
+  hi = hi - 1 if excl == 1
+  return n >> lo if hi < 0
+  width = hi - lo + 1
+  return 0 if width <= 0
+  (n >> lo) & ((1 << width) - 1)
+end
+def __hash_member_p(h, k) = __hkey_p(h, k)
+def __hash_entries(h) = __hash_to_a(h)
+def __hash_zip1(h, other) = __arr_zip(__hash_to_a(h), other)
+def __hash_each_slice1(h, n) = __arr_each_slice1(__hash_to_a(h), n)
+def __hash_sum0(h) = __arr_sum(__hash_to_a(h))

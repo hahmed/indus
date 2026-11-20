@@ -1,0 +1,1 @@
+p Integer.sqrt(17), 3.pow(4, 5), 1234.digits, 1234.digits(100), 1234.round(-2), 1250.round(-2), 1234.floor(-2), 1234.ceil(-2), 255.bit_length, -1.bit_length, 10.remainder(3), -10.remainder(3), 10.pred, 7.allbits?(3), 6.anybits?(1), 6.nobits?(1), 5[0], 5[1], 0b1010[1..2], 5.ceildiv(2), 10.fdiv(4), 3.zero?, 10.lcm(4), 2.integer?

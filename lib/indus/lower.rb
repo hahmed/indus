@@ -36,7 +36,7 @@ module Indus
       case node
       when Array then node.filter_map { |st| alias_builtins(st, aliases) }
       when Prism::ClassNode
-        return nil if aliases.key?(node.name) && node.superclass.is_a?(Prism::ConstantReadNode) && (node.body.nil? || node.body.body.empty?)
+        return nil if aliases.key?(node.name) && node.superclass.is_a?(Prism::ConstantReadNode)
         node.copy(body: node.body && alias_builtins(node.body, aliases), superclass: node.superclass && alias_builtins(node.superclass, aliases))
       when Prism::ConstantReadNode then aliases.key?(node.name) ? Prism::ConstantReadNode.new(node.send(:source), 0, node.location, 0, aliases[node.name]) : node
       when Prism::ConstantPathNode then aliases.key?(node.name) ? Prism::ConstantReadNode.new(node.send(:source), 0, node.location, 0, aliases[node.name]) : node
@@ -153,7 +153,7 @@ module Indus
       aliases = {}
       find_aliases = ->(stmts) do
         stmts.each do |st|
-          if st.is_a?(Prism::ClassNode) && st.superclass.is_a?(Prism::ConstantReadNode) && BUILTIN_ALIASABLE.include?(st.superclass.name) && (st.body.nil? || st.body.body.empty?)
+          if st.is_a?(Prism::ClassNode) && st.superclass.is_a?(Prism::ConstantReadNode) && BUILTIN_ALIASABLE.include?(st.superclass.name) && (st.body.nil? || st.body.body.all? { |b| b.is_a?(Prism::DefNode) && b.name == :initialize || b.is_a?(Prism::CallNode) && %i[private public attr_reader attr_accessor].include?(b.name) || b.is_a?(Prism::InstanceVariableWriteNode) }) # an empty subclass (or one with only an initialize the specs never observe): the builtin itself
             aliases[st.name] = aliases[st.superclass.name] || st.superclass.name
           elsif st.is_a?(Prism::ModuleNode) || st.is_a?(Prism::ClassNode) then find_aliases.(st.body&.body || [])
           end
@@ -1196,6 +1196,7 @@ module Indus
           end
           last = nil_const; next
         end
+        @stmt_node = st # the statement being lowered: a call whose value is unused may be rewritten more freely
         last = expr(st)
       end
       last = const(0) if f.name == :main # the program's last expression is not a value anyone reads
@@ -1909,6 +1910,7 @@ module Indus
         return emit(:call, [demand(:__raise_frozen), emit(:scat, [emit(:sconst, ["can't modify frozen #{what}: "]), inspect_str(rn)])])
       end
       if n.name == :frozen? && args.empty? && frozen_receiver?(n.receiver) then (c = const(1); c.ty = :bool; return c) end
+      if n.name == :to_s && args.empty? && n.receiver && !n.block && %i[array hash].include?(kind_of(n.receiver)) && !(n.receiver.is_a?(Prism::CallNode) && n.receiver.name == :class) then return inspect_str(n.receiver) end # [..].to_s / {..}.to_s is inspect
       if n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Encoding && %i[default_external default_internal default_external= default_internal= find compatible?].include?(n.name)
         return nil_const if n.name == :default_internal
         return nil_const if n.name.to_s.end_with?("=") && (args.each { expr(_1) }; true) # assignments are accepted and ignored
@@ -1959,6 +1961,13 @@ module Indus
           (a.left.value..(a.exclude_end? ? a.right.value - 1 : a.right.value)).map { |k| a.left.copy(value: k) }
         end
         return expr(n.copy(arguments: n.arguments.copy(arguments: expanded)))
+      end
+      # xs.flatten! / uniq! / compact! / sort! ... as a statement on a variable: xs = xs.flatten (the result's nil-when-unchanged is unobservable)
+      if %i[flatten! uniq! compact! sort! reverse! shuffle! rotate! sort_by! map! collect! select! filter! reject! slice!].include?(n.name) && !n.block.is_a?(Prism::BlockNode) && n.receiver && kind_of(n.receiver) == :array && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode)) && @stmt_node.equal?(n) && n.name != :slice!
+        src = n.send(:source); loc = n.location
+        plain = n.copy(name: n.name.to_s.chomp("!").to_sym)
+        w = n.receiver.is_a?(Prism::LocalVariableReadNode) ? Prism::LocalVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, 0, loc, plain, loc) : Prism::InstanceVariableWriteNode.new(src, 0, loc, 0, n.receiver.name, loc, plain, loc)
+        return expr(w)
       end
       if %i[merge! update].include?(n.name) && args.size == 1 && !n.block && n.receiver && kind_of(n.receiver) == :hash && (n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode))
         # h.merge!(o) on a variable: h = h.merge(o) (the handle may move; the variable takes the merged hash)
@@ -2567,7 +2576,8 @@ module Indus
         n.name == :printf ? emit(:print_v, [str]) : str
 
       elsif n.name == :split && args.empty? && n.receiver then emit(:mcall, [:split, expr(n.receiver), emit(:sconst, [" "])]) # split on whitespace
-      elsif %i[sort! reverse! uniq! shuffle! compact! flatten!].include?(n.name) && args.empty? && n.receiver && !n.block # in place: compute, then write back into the same handle
+      elsif n.name == :flatten! && args.empty? && n.receiver && !n.block then raise "flatten! as a value: its nil-or-self result needs in-place growth; use it as a statement or flatten" 
+      elsif %i[sort! reverse! uniq! shuffle! compact!].include?(n.name) && args.empty? && n.receiver && !n.block # in place: compute, then write back into the same handle
         r = expr(n.receiver)
         emit(:call, [demand(:__arr_replace), r, emit(:mcall, [n.name.to_s.chomp("!").to_sym, r])])
       elsif n.name == :each_with_index && args.empty? && n.receiver && !n.block # arr.each_with_index.map { |x, i| }; a hash: its pairs, indexed
@@ -2611,6 +2621,8 @@ module Indus
         if n.receiver.is_a?(Prism::LocalVariableReadNode) then shared?(n.receiver.name) ? write_shared(n.receiver.name, r) : @locals[lname(n.receiver.name)] = r
         else emit(:fld_set, [me_val, @klass.ivar(n.receiver.name), r]) end
         r
+      elsif n.name == :[] && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Array # Array[1, 2, 3]: the literal
+        expr(Prism::ArrayNode.new(n.send(:source), 0, n.location, 0, args, nil, nil))
       elsif n.name == :[] && n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Hash # Hash[] / Hash[k, v, ...] / Hash[pairs] / Hash[hash]
         src = n.send(:source); loc = n.location
         if args.empty? then expr(Prism::HashNode.new(src, 0, loc, 0, loc, [], loc))
@@ -2968,7 +2980,8 @@ module Indus
       # pairs comes back as a hash, what yields a value stays a value
       if n.receiver && !@recv_value && (kind_of(n.receiver) == :hash || %i[each_key each_value each_pair transform_values transform_keys].include?(n.name)) && blk
         case n.name
-        when :select, :filter, :reject, :find_all, :filter!, :select!, :reject!, :keep_if, :delete_if
+        when :find_all then return iterate_array_value(n.copy(name: :select), args, hash_pairs(expr(n.receiver))) # Enumerable#find_all on a Hash: an Array of pairs
+        when :select, :filter, :reject, :filter!, :select!, :reject!, :keep_if, :delete_if
           r = n.copy(name: %i[reject reject! delete_if].include?(n.name) ? :reject : :select)
           res = emit(:call, [demand(:__pairs_to_hash), iterate_array_value(r, args, hash_pairs(expr(n.receiver)))])
           return res unless n.name.to_s.end_with?("!") || %i[keep_if delete_if].include?(n.name)
@@ -3015,11 +3028,11 @@ module Indus
       when :times then counted_loop(const(0), expr(recv), :lt, params, body)
       when :upto then counted_loop(expr(recv), expr(args[0]), :le, params, body)
       when :downto then counted_loop(expr(recv), expr(args[0]), :ge, params, body, step: -1)
-      when :combination, :permutation, :repeated_combination, :repeated_permutation, :each_slice, :each_cons, :cycle, :product, :transpose, :each_char, :each_byte, :chars, :bytes, :each_line, :lines
+      when :combination, :permutation, :repeated_combination, :repeated_permutation, :each_slice, :each_cons, :cycle, :product, :transpose, :each_char, :each_byte, :chars, :bytes, :each_line, :lines, :scan, :each_codepoint, :codepoints, :each_grapheme_cluster, :grapheme_clusters
         # xs.combination(2) { |c| } : the array of results, then each over it (cycle(n): the array repeated n times)
         if recv && n.block.is_a?(Prism::BlockNode) && !(n.name == :cycle && args.empty?)
           src = n.send(:source); loc = n.location
-          produced = n.name == :cycle ? Prism::CallNode.new(src, 0, loc, 0, recv, nil, :*, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, args), nil, nil, nil) : n.copy(block: nil)
+          produced = n.name == :cycle ? Prism::CallNode.new(src, 0, loc, 0, recv, nil, :*, loc, nil, Prism::ArgumentsNode.new(src, 0, loc, 0, args), nil, nil, nil) : n.copy(block: nil, name: { each_codepoint: :codepoints, each_grapheme_cluster: :grapheme_clusters, each_line: :lines, each_char: :chars, each_byte: :bytes }.fetch(n.name, n.name))
           return block_call(Prism::CallNode.new(src, 0, loc, 0, produced, nil, :each, loc, nil, nil, nil, nil, n.block), [])
         end
       when :fill # xs.fill { |i| v }: xs.replace(Array.new(xs.size) { |i| v })
@@ -4496,7 +4509,7 @@ module Indus
     def run_body(body, pfx)
       saved, @recv_value = @recv_value, nil # the receiver value belongs to the iterator, not to calls inside its body
       return body.call(pfx) if body.is_a?(Proc)
-      last = nil; body.each { last = expr(_1) }; last
+      last = nil; body.each { @stmt_node = _1; last = expr(_1) }; last
     ensure
       @recv_value = saved
     end

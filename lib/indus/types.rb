@@ -817,6 +817,11 @@ module Indus
             if cs.any? { @classes[_1].find_method(:to_s) } then i.op = :mcall; i.args = [:to_s, i.args[0]]; bind(f, i); i.ty = :str; changed = true
             else i.op = :sconst; i.args = ["#<#{cs.first}>"] end
           elsif t == :str then i.op = :str_or_empty
+          elsif t == :sym then i.op = :call; i.args = [fn(:__sym_name), i.args[0]]; i.ty = :str; changed = true
+          elsif t == :dyn then i.op = :call; i.args = [fn(:__dyn_to_s), i.args[0]]; i.ty = :str; changed = true
+          elsif arr(t) || hsh(t) # a container's to_s is its inspect: through the tagged printer (boxing first)
+            bx = Inst.new(:box, [i.args[0], t]); bx.ty = :dyn; bx.block = i.block; i.block.insts.insert(i.block.insts.index(i), bx)
+            i.op = :call; i.args = [fn(:__dyn_to_s), bx]; i.ty = :str; changed = true
           else i.op = :itos end
         when :to_i
           if of(f, i.args[0]) == :str then i.op = :stoi
@@ -1487,6 +1492,19 @@ module Indus
         return
       end
       if name == :class && args.empty? && t == :dyn then i.op = :call; i.args = [fn(:__dyn_class_name), recv]; i.ty = :str; return end
+      if %i[object_id __id__].include?(name) && args.empty? && t && !(classes_of(t) && classes_of(t).any? { @classes[_1].find_method(name) }) # identity: the word itself (a fixnum's value doubled plus one, as CRuby)
+        if %i[int int?].include?(t) then one = Inst.new(:const, [1]).tap { _1.ty = :int; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) }
+          dbl = Inst.new(:add, [recv, recv]).tap { _1.ty = :int; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) }
+          i.op = :add; i.args = [dbl, one]; i.ty = :int; return end
+        i.op = :handle; i.args = [recv]; i.ty = :int; return
+      end
+      if name == :equal? && args.size == 1 && t && !(classes_of(t) && classes_of(t).any? { @classes[_1].find_method(name) }) # the same object: the same word
+        at = of(f, args[0]); return unless at
+        if %i[int int? float str sym nil bool].include?(t) && t != at && at != :dyn then i.op = :const; i.args = [0]; i.ty = :bool; return end
+        l = Inst.new(:handle, [recv]).tap { _1.ty = :int; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) }
+        r = Inst.new(:handle, [args[0]]).tap { _1.ty = :int; _1.block = i.block; i.block.insts.insert(i.block.insts.index(i), _1) }
+        i.op = :cmp; i.args = [l, r]; i.cond = :eq; i.ty = :bool; return
+      end
       if %i[=~ match match? !~].include?(name) && args.size == 1 && of(f, args[0]) == :nil && @settled # `s =~ nil` in a branch the guard rules out: nil (never a match)
         i.op = :const; i.args = [0]; i.ty = name == :!~ ? :bool : :nil; return
       end
@@ -1601,6 +1619,11 @@ module Indus
       end
       if t == :int && (fn = fnq(:"__fd_#{name}")) # a file descriptor is an Integer: fd.puts, fd.write, fd.close
         i.op = :call; i.args = [fn, recv, *args]; return
+      end
+      if name == :<=> && arr(t) && args.size == 1 && !big?(t) # [1, 2] <=> [1, 3]: element-wise, nil for unlike shapes
+        at = of(f, args[0]); return unless at
+        if arr(at) then i.op = :call; i.args = [fn(:__arr_spaceship), recv, args[0]]; i.ty = :int?; return
+        elsif at != :dyn then i.op = :const; i.args = [0]; i.ty = :nil; return end
       end
       if name == :<=> && (t == :int || t == :str || t == :float)
         at = of(f, args[0])
