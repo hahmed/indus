@@ -1324,6 +1324,13 @@ module Indus
       Prism::ArrayNode.new(src, 0, loc, 0, args, nil, nil)
     end
 
+    # an already-lowered value as an AST node: a hidden local bound to it
+    def hidden_value_node(v)
+      nm = :"__hv#{@f.blocks.size}_#{v.id}"
+      @locals[lname(nm)] = v
+      Prism::LocalVariableReadNode.new(nil, 0, Prism::Location.new(nil, 0, 0), 0, nm, 0)
+    end
+
     def attr_assign(recv_node, rv, writer, v)
       emit(:mcall, [writer, rv, v])
       v
@@ -1556,6 +1563,11 @@ module Indus
           when Prism::InstanceVariableTargetNode
             if (ow = ivar_owner) then emit(:gset, [:"#{ow}#{t.name}", v])
             else emit(:fld_set, [me_val, @klass.ivar(t.name), v]) end
+          when Prism::GlobalVariableTargetNode then emit(:gset, [t.name, v])
+          when Prism::ConstantTargetNode then emit(:gset, [t.name, v])
+          when Prism::CallTargetNode then emit(:mcall, [t.name, expr(t.receiver), v]) # a.b, c = ... (name is b=)
+          when Prism::IndexTargetNode then emit(:idx_set, [expr(t.receiver), expr(t.arguments.arguments[0]), v]) # a[i], b = ...
+          when Prism::MultiTargetNode then expr(Prism::MultiWriteNode.new(t.send(:source), 0, t.location, 0, t.lefts, t.rest, t.rights, nil, nil, t.location, (c = v; hidden_value_node(v)))) # (a, b), c = ...
           else raise "unsupported assignment target #{t.class}"
           end
         end
@@ -1885,6 +1897,11 @@ module Indus
 
     def call(n)
       args = n.arguments&.arguments || []
+      # a[(1..)] / s[(..2)]: the parentheses around a range argument mean nothing
+      if %i[[] slice []= byteslice values_at].include?(n.name) && args.any? { |a| a.is_a?(Prism::ParenthesesNode) && a.body.is_a?(Prism::StatementsNode) && a.body.body.size == 1 && a.body.body[0].is_a?(Prism::RangeNode) }
+        args = args.map { |a| a.is_a?(Prism::ParenthesesNode) && a.body.is_a?(Prism::StatementsNode) && a.body.body.size == 1 && a.body.body[0].is_a?(Prism::RangeNode) ? a.body.body[0] : a }
+        return call(n.copy(arguments: n.arguments.copy(arguments: args)))
+      end
       if n.receiver && MUTATORS.include?(n.name) && frozen_receiver?(n.receiver) && !((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd])
         what = kind_of(n.receiver) == :array || n.receiver.is_a?(Prism::ArrayNode) ? "Array" : kind_of(n.receiver) == :hash ? "Hash" : "String"
         args.each { expr(_1) }
@@ -1892,6 +1909,11 @@ module Indus
         return emit(:call, [demand(:__raise_frozen), emit(:scat, [emit(:sconst, ["can't modify frozen #{what}: "]), inspect_str(rn)])])
       end
       if n.name == :frozen? && args.empty? && frozen_receiver?(n.receiver) then (c = const(1); c.ty = :bool; return c) end
+      if n.receiver.is_a?(Prism::ConstantReadNode) && n.receiver.name == :Encoding && %i[default_external default_internal default_external= default_internal= find compatible?].include?(n.name)
+        return nil_const if n.name == :default_internal
+        return nil_const if n.name.to_s.end_with?("=") && (args.each { expr(_1) }; true) # assignments are accepted and ignored
+        return emit(:call, [demand(:__encoding_of), args[0] ? emit(:mcall, [:to_s, expr(args[0])]) : emit(:sconst, ["UTF-8"])]) if n.name != :compatible?
+      end
       if n.name == :freeze && args.empty? && n.receiver # x.freeze as a statement / value: x is frozen from here on
         (@frozen_locals ||= {})[n.receiver.is_a?(Prism::LocalVariableReadNode) ? lname(n.receiver.name) : n.receiver.name] = true if n.receiver.is_a?(Prism::LocalVariableReadNode) || n.receiver.is_a?(Prism::InstanceVariableReadNode)
       end
