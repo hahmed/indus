@@ -384,6 +384,7 @@ end
 
 # the first character's codepoint (UTF-8 decoded)
 def __str_ord(s)
+  raise(ArgumentError, "empty string") if s.length == 0
   b = __ld8(s, 0)
   return b if b < 128
   n = __utf8_len(b)

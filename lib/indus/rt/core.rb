@@ -1735,3 +1735,25 @@ def __str_bytesplice(s, start, len, v)
   s
 end
 def __str_append_as_bytes(s, v) = (s << v; s)
+# case methods with an option (:ascii, :fold, :turkic, :lithuanian): the mapping here is ASCII, the option is accepted
+def __str_downcase1(s, opt) = __str_downcase(s)
+def __str_upcase1(s, opt) = __str_upcase(s)
+def __str_swapcase1(s, opt) = __str_swapcase(s)
+def __str_capitalize1(s, opt) = __str_capitalize(s)
+def __str_downcase_bang1(s, opt) = __str_downcase_bang(s)
+def __str_upcase_bang1(s, opt) = __str_upcase_bang(s)
+def __str_swapcase_bang1(s, opt) = __str_swapcase_bang(s)
+def __str_capitalize_bang1(s, opt) = __str_capitalize_bang(s)
+def __str_scrub_bang(s) = nil
+def __str_scrub1(s, rep) = s
+def __str_getbyte(s, i)
+  i = s.length + i if i < 0
+  return nil if i < 0 || i >= s.length
+  __ld8(s, i)
+end
+def __str_setbyte(s, i, b)
+  i = s.length + i if i < 0
+  raise(IndexError, "index out of string") if i < 0 || i >= s.length
+  __st8(s, i, b & 255)
+  b
+end
