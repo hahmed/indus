@@ -1,0 +1,1 @@
+p "blaxbla".byteindex(/..x/, 2), "ruby".byteindex(//, 12), "hello".index(/l/), "hello".index(/l/, 3), "hello".rindex(/l/), "hello".rindex(/l/, 2), "hello".start_with?(/he/), "hello".start_with?(/el/), "string".match?(/str/i, 1), "hello".byterindex(/l/)

@@ -2291,6 +2291,10 @@ module Indus
         @cur = mb2; inner = mb2.phi; inner.args = [[tb2, hi], [eb2, x]]; emit(:br, [mb])
         @cur = mb; p = mb.phi; p.args = [[tb, lo], [mb2, inner]]; p
       elsif n.name == :~ && args.empty? && n.receiver then emit(:xor, [expr(n.receiver), const(-1)]) # bitwise not
+      elsif %i[index rindex byteindex byterindex start_with? match?].include?(n.name) && args.size.between?(1, 2) && (args[0].is_a?(Prism::RegularExpressionNode) || kind_of(args[0]) == :Regexp) && n.receiver && !(n.name == :match? && args.size == 1)
+        re = expr(args[0]); sv = expr(n.receiver)
+        base = n.name == :start_with? ? :__str_start_with_re : :"__str_#{n.name.to_s.sub("?", "_p")}_re"
+        emit(:call, [demand(args.size == 2 ? :"#{base}1" : base), sv, re, *args[1..].map { expr(_1) }])
       elsif %i[match match? scan sub gsub split =~ !~].include?(n.name) && args.size >= 1 && (args[0].is_a?(Prism::RegularExpressionNode) || (kind_of(args[0]) == :Regexp && !%i[scan].include?(n.name))) && n.receiver && !((kd = kind_of(n.receiver)).is_a?(Symbol) && @classes[kd])
         re = expr(args[0]); sv = expr(n.receiver)
         case n.name

@@ -420,10 +420,22 @@ def __str_chop(s) = s.length > 0 ? s[0, s.length - 1] : ""
 
 def __str_chomp(s)
   return s[0, s.length - 2] if s.length >= 2 && __ld8(s, s.length - 1) == 10 && __ld8(s, s.length - 2) == 13
-  return s[0, s.length - 1] if s.length >= 1 && __ld8(s, s.length - 1) == 10
+  return s[0, s.length - 1] if s.length >= 1 && (__ld8(s, s.length - 1) == 10 || __ld8(s, s.length - 1) == 13)
   __sdup(s)
 end
-def __str_chomp1(s, suffix) = __str_end_with_p(s, suffix) ? s[0, s.length - suffix.length] : __sdup(s)
+# chomp(suffix): "\n" also takes "\r\n"; "" takes every trailing newline run; else the suffix
+def __str_chomp1(s, suffix)
+  return __str_chomp(s) if suffix == "\n"
+  if suffix == ""
+    out = s
+    while out.length > 0 && (__ld8(out, out.length - 1) == 10)
+      out = out[0, out.length - 1]
+      out = out[0, out.length - 1] if out.length > 0 && __ld8(out, out.length - 1) == 13
+    end
+    return out.equal?(s) ? __sdup(s) : out
+  end
+  __str_end_with_p(s, suffix) ? s[0, s.length - suffix.length] : __sdup(s)
+end
 def __str_chars_utf8(s) = __str_chars(s)
 
 # "0.75".to_f: the digits as one integer mantissa, scaled once (digit-by-digit scaling

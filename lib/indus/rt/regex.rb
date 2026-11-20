@@ -494,3 +494,39 @@ def __re_groups_array
   return nil if caps.nil?
   __re_groups($__re_last_str, caps, caps.length)
 end
+
+# s.index(re, from) / s.rindex(re[, from]) / byte variants (positions are bytes here)
+def __str_index_re1(s, re, from)
+  from = s.length + from if from < 0
+  return nil if from < 0 || from > s.length
+  caps = __re_caps(re.ncap)
+  at = __re_search(re.prog, s, from, caps, re.ncap)
+  at < 0 ? nil : at
+end
+def __str_rindex_re(s, re) = __str_rindex_re1(s, re, s.length)
+def __str_rindex_re1(s, re, from)
+  from = s.length + from if from < 0
+  return nil if from < 0
+  from = s.length if from > s.length
+  caps = __re_caps(re.ncap)
+  at = from
+  while at >= 0
+    return at if __re_try(re.prog, s, at, caps, re.ncap)
+    at = at - 1
+  end
+  nil
+end
+def __str_byteindex_re(s, re) = __str_index_re(s, re)
+def __str_byteindex_re1(s, re, from) = __str_index_re1(s, re, from)
+def __str_byterindex_re(s, re) = __str_rindex_re(s, re)
+def __str_byterindex_re1(s, re, from) = __str_rindex_re1(s, re, from)
+def __str_start_with_re(s, re)
+  caps = __re_caps(re.ncap)
+  __re_try(re.prog, s, 0, caps, re.ncap)
+end
+def __str_match_p_re1(s, re, from)
+  from = s.length + from if from < 0
+  return false if from < 0 || from > s.length
+  caps = __re_caps(re.ncap)
+  __re_search(re.prog, s, from, caps, re.ncap) >= 0
+end
